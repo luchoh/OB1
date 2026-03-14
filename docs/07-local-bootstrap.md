@@ -11,6 +11,7 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 - Local MCP service: [`local/open-brain-mcp`](/Users/luchoh/Dev/OB1/local/open-brain-mcp)
 - Product spec: [`docs/05-local-network-prd.md`](/Users/luchoh/Dev/OB1/docs/05-local-network-prd.md)
 - Verification script: [`scripts/verify-open-brain-local.sh`](/Users/luchoh/Dev/OB1/scripts/verify-open-brain-local.sh)
+- End-to-end smoke test: [`scripts/smoke-open-brain-local-mcp.sh`](/Users/luchoh/Dev/OB1/scripts/smoke-open-brain-local-mcp.sh)
 
 ## Canonical Services
 
@@ -35,8 +36,9 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 2. Run [`scripts/apply-open-brain-local-migrations.sh`](/Users/luchoh/Dev/OB1/scripts/apply-open-brain-local-migrations.sh) to apply the canonical SQL from [`local/open-brain-mcp/migrations`](/Users/luchoh/Dev/OB1/local/open-brain-mcp/migrations).
 3. Install and run the local MCP service from [`local/open-brain-mcp`](/Users/luchoh/Dev/OB1/local/open-brain-mcp).
 4. Run [`scripts/verify-open-brain-local.sh`](/Users/luchoh/Dev/OB1/scripts/verify-open-brain-local.sh) to confirm Consul registration, health, model IDs, the embedding contract, and PostgreSQL schema shape.
-5. Only change embedding dimensionality if you are prepared to regenerate all embeddings and adjust the schema.
-6. Keep client-side dimensionality reduction disabled unless the canonical service contract changes.
+5. Run [`scripts/smoke-open-brain-local-mcp.sh`](/Users/luchoh/Dev/OB1/scripts/smoke-open-brain-local-mcp.sh) to verify the local server itself end to end.
+6. Only change embedding dimensionality if you are prepared to regenerate all embeddings and adjust the schema.
+7. Keep client-side dimensionality reduction disabled unless the canonical service contract changes.
 
 ## Notes
 

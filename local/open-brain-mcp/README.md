@@ -53,6 +53,20 @@ Default bind:
 - `http://127.0.0.1:8787/health`
 - `http://127.0.0.1:8787/mcp`
 
+## Smoke Test
+
+From the repo root:
+
+```bash
+./scripts/smoke-open-brain-local-mcp.sh
+```
+
+This verifies:
+- upstream model services and PostgreSQL
+- local migrations
+- local MCP server boot
+- MCP tool calls for capture, search, list, and stats
+
 ## Auth
 
 The MCP endpoint accepts:
@@ -67,3 +81,4 @@ The MCP endpoint accepts:
 - The canonical embedding contract is `1536` dimensions, owned by `ob1-embedding`.
 - The schema migration is idempotent at the SQL object level, and the migration runner records applied filenames in `open_brain_schema_migrations`.
 - In the current shared `ob1` environment, reads against `thoughts` can hang unless index-driven scan types are disabled. Set `OPEN_BRAIN_FORCE_SEQSCAN=true` until the underlying index issue is fixed or the indexes are rebuilt.
+- The real runtime env file is `.env.open-brain-local` and should remain untracked.
