@@ -1,7 +1,7 @@
 # PRD: Open Brain Local on M3 Ultra
 
 Date: 2026-03-14
-Status: Draft
+Status: Validated v1 direction
 Owner: Platform / AI Infrastructure
 
 ## Summary
@@ -20,6 +20,7 @@ The validated v1 operating assumption is now:
 
 - use `Qwen3.5-397B-A17B` on MLX for chat, reasoning, and metadata extraction
 - use `Qwen3-Embedding-8B` on the dedicated `ob1-embedding` MLX service for vector generation
+- keep `llama-cpp-embedding` only as rollback
 - use PostgreSQL + `pgvector` as the primary store and vector index
 
 ## Problem
@@ -82,13 +83,27 @@ From `.env` and Consul:
 - The currently exposed MLX model is `mlx-community/Qwen3.5-397B-A17B-nvfp4`
 - `ob1-embedding` is registered at `10.10.10.101:8082` and responds to OpenAI-compatible `embeddings`
 - The canonical embedding model now exposed there is `mlx-community/Qwen3-Embedding-8B-mxfp8`
-- The current `ob1-embedding` service returns 4096-dimensional embeddings and currently ignores the OpenAI-style `dimensions` parameter
-- A live smoke test succeeded by truncating the returned Qwen embedding client-side to 1536 dimensions before insert and query
+- The `ob1-embedding` service now returns `1536`-dimensional embeddings server-side by default
+- It accepts either no `dimensions` field or `dimensions = 1536`
+- It returns `400` for unsupported dimensions such as `3072`
+- The embedding runtime is now pinned to a local artifact path at `/Volumes/llama-models/mlx-embedding/.cache/huggingface/hub/models--mlx-community--Qwen3-Embedding-8B-mxfp8/snapshots/51c773b7464b630a6c67b4f75dbd796b658d6236`
 - The earlier `llama-cpp-embedding` endpoint at `10.10.10.101:8081` remains available as a fallback path and serves the Nomic embedding model
 - The MLX model does not support `/v1/embeddings`, so generation and embedding must remain separate services
-- Some Consul health registrations for AI services are still inconsistent with direct endpoint reachability and should not be treated as authoritative until fixed
+- Offline startup semantics are enabled for both inference and embeddings
+- `ob1-embedding` now loads from a local artifact path on disk
+- Consul registration for `ob1-embedding` is now gated on successful readiness and a passing `/health` check
 
 Implication: the network now has a validated end-to-end local path for PostgreSQL, vector search, generation, and embeddings, but the architecture must explicitly separate generation models from embedding models.
+
+### Accepted Serving Decision (March 2026)
+
+- Keep `mlx-server` as the canonical inference service
+- Keep `ob1-embedding` as the canonical embedding contract
+- Keep `llama-cpp-embedding` only as rollback
+- Do not move embeddings back behind generic `vllm-mlx serve`
+- Standardize v1 production embeddings on `1536` dimensions
+- Put dimensionality control in the `ob1-embedding` service
+- Keep offline startup semantics enabled for both model services
 
 ### Model Research Findings (March 2026)
 
@@ -128,8 +143,8 @@ Any MCP-capable AI client on the LAN can capture, search, browse, and summarize 
 Use a local-first stack on the M3 Ultra:
 
 - PostgreSQL 16 + `pgvector` for the system of record and primary vector search
-- Local MLX model gateway for chat, reasoning, and metadata extraction
-- Separate local embedding gateway for vector generation
+- `mlx-server` for chat, reasoning, and metadata extraction
+- `ob1-embedding` for vector generation
 - A self-hosted MCP application server
 - MinIO for object/file storage
 - Docling for document parsing
@@ -278,8 +293,9 @@ Vector strategy:
 - The recommended canonical embedding model is `Qwen3-Embedding-8B`
 - Because pgvector approximate indexes support `vector` up to 2,000 dimensions and `halfvec` up to 4,000 dimensions, the full 4,096-dim output of Qwen cannot be indexed directly with the default `vector` path
 - v1 default should be `Qwen3-Embedding-8B` with a reduced output dimension that fits indexed PostgreSQL storage
-- Recommended v1 default: store `1536` dimensions in `vector(1536)` for the simplest operational path
-- Because the current `ob1-embedding` service ignores the `dimensions` request parameter and always returns 4096 values, the application must currently apply client-side prefix truncation from 4096 to 1536 before inserts and queries
+- Accepted v1 production contract: store `1536` dimensions in `vector(1536)`
+- The embedding service, not application clients, should own the dimensionality contract
+- The service-side fix is now the expected production path; client-side truncation should be removed from application code
 - Higher-recall experimental path: request `3072` output dimensions and store/index as `halfvec(3072)` after a dedicated retrieval benchmark
 - Do not mix embeddings from different models in the same vector column or ANN index
 - If multiple embedding models are supported later, version them explicitly with either separate columns or separate embedding tables/indexes
@@ -299,15 +315,23 @@ Preferred operating model:
 Validated current endpoints:
 
 - Generation:
-  - Base URL: `http://10.10.10.101:8035`
+  - Base URL: `http://10.10.10.101:8035/v1`
+  - Health: `http://10.10.10.101:8035/health`
+  - Service: `mlx-server`
   - Model: `mlx-community/Qwen3.5-397B-A17B-nvfp4`
   - Role: chat, reasoning, metadata extraction
 - Embeddings:
-  - Base URL: `http://10.10.10.101:8082`
+  - Base URL: `http://10.10.10.101:8082/v1`
+  - Health: `http://10.10.10.101:8082/health`
   - Service: `ob1-embedding`
   - Model: `mlx-community/Qwen3-Embedding-8B-mxfp8`
-  - Raw output dimension today: `4096`
+  - Production output dimension: `1536`
   - Role: vector generation only
+- Rollback embeddings:
+  - Base URL: `http://10.10.10.101:8081/v1`
+  - Service: `llama-cpp-embedding`
+  - Model: `nomic-ai/nomic-embed-text-v1.5-GGUF:nomic-embed-text-v1.5.Q8_0.gguf`
+  - Role: rollback only
 
 Recommended canonical v1 models:
 
@@ -331,9 +355,27 @@ Implementation note:
 - v1 should explicitly lock chat and metadata extraction to `Qwen3.5-397B-A17B`
 - v1 should explicitly lock embeddings to `Qwen3-Embedding-8B`
 - If additional embedding models are introduced later, they must be added through a versioned embedding strategy rather than silently swapped in place
-- Consul registration should be retained, but direct readiness checks against the actual inference endpoints are required until Consul health reporting is corrected
+- Consul registration should be retained, and clients should continue direct readiness checks against the actual inference endpoints during startup and diagnostics
 - The old Nomic embedding endpoint should be treated as a rollback path, not the target long-term model choice
-- Until the `ob1-embedding` service supports server-side dimension selection, the application should explicitly truncate the returned embedding to the configured storage dimension
+- Production requirement: dimensionality control must live in the `ob1-embedding` service, not in application clients
+- Target steady state: `ob1-embedding` now honors a fixed production dimension of `1536` for the canonical API response
+- Allowed v1 production behavior: `dimensions = null` or `dimensions = 1536`
+- Recommended v1 failure mode: return `400` for unsupported dimensions until retrieval versioning is introduced
+- Use model-native Matryoshka-style truncation, not PCA or a separate reducer
+- Re-normalize server-side after truncation so cosine similarity remains stable
+
+### Operational Defaults
+
+- Run one worker process per model service
+- Do not scale MLX services by adding multiple Uvicorn workers, because that duplicates model memory
+- Scale embeddings with intra-request batching, not worker count
+- Keep inference and embeddings in separate daemons so readiness, restart behavior, and memory pressure are isolated
+- Only register Consul services after the model is actually loaded and `/health` returns `200`
+- Tighten the registration helper so readiness failure prevents registration
+- Pre-stage model artifacts locally and run with offline semantics
+- Keep public API model names stable even if the on-disk artifact paths differ
+- Do not silently inject embedding instructions in v1; if query/document instruction behavior is added later, version it explicitly
+- Confirm startup paths use local artifacts and offline flags rather than hub metadata fetches
 
 ### 3. MCP Application Server
 
@@ -427,6 +469,7 @@ Preserve the repo's flexible metadata style:
 - Stand up or re-home `Qwen3.5-397B-A17B` serving on the M3 Ultra if the current MLX endpoint is only temporary
 - Keep `Qwen3-Embedding-8B` on the dedicated `ob1-embedding` service as the canonical embedding endpoint
 - Retain the earlier Nomic service only as a rollback path until the new embedding stack proves stable
+- Pre-stage model artifacts locally and force offline startup semantics where supported
 - Register services in Consul
 - Stand up MinIO and document parsing dependencies if they are not already assigned to the M3 Ultra
 
@@ -436,9 +479,9 @@ Preserve the repo's flexible metadata style:
 - Implement the `thoughts` schema and vector indexes using the selected embedding dimension
 - Implement capture, search, browse, and stats
 - Lock generation to `Qwen3.5-397B-A17B` and embeddings to `Qwen3-Embedding-8B`
-- Apply client-side embedding truncation to the configured storage dimension until the embedding service supports server-side dimension control
 - Validate no-egress behavior
 - Benchmark `Qwen3-Embedding-8B` at `1536` versus `3072` output dimensions before freezing the production schema
+- Keep client-side dimensionality reduction disabled in steady state
 
 ### Phase 2: Imports
 
@@ -463,13 +506,23 @@ Preserve the repo's flexible metadata style:
 
 ### Risk 1: Model Serving Instability
 
-Current AI services are reachable directly, but Consul health reporting is inconsistent and the current hosting may still be migration-era infrastructure.
+The core AI services are stable today, but model-serving remains the most operationally sensitive part of the system because startup time, memory pressure, and readiness gates are tightly coupled.
 
 Mitigation:
 
 - Make the M3 Ultra the primary inference host
-- Avoid treating the current M2-hosted services as long-term production dependencies unless ownership is explicit
+- Keep Consul registration gated on successful readiness and a passing `/health` check
 - Add direct application-level readiness checks for both generation and embedding endpoints
+
+### Risk 5: Hidden Runtime Egress
+
+Model runtimes may still perform metadata lookups or remote fetches if configured with remote-style model identifiers only.
+
+Mitigation:
+
+- Pre-stage model artifacts locally
+- Prefer local artifact paths or explicit offline mode such as `HF_HUB_OFFLINE=1`
+- Validate cold-start behavior with network egress blocked
 
 ### Risk 4: Frontier Model Drift
 
@@ -502,7 +555,6 @@ Mitigation:
 ## Open Questions
 
 - Should the initial deployment reuse the shared PostgreSQL service or create a dedicated PostgreSQL instance on the M3 Ultra?
-- Should `Qwen3-Embedding-8B` ship at `1536` dimensions in `vector`, or do we want to absorb the complexity of `halfvec(3072)` for higher recall in v1?
 - Is user-facing auth required in v1, or is LAN boundary + access key sufficient?
 - Should Qdrant remain a hot standby path for vector search, or be excluded from v1 entirely?
 

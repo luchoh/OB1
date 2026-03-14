@@ -8,9 +8,8 @@
 --   Qwen3-Embedding-8B reduced to 1536 dimensions
 --
 -- Runtime note:
---   The current ob1-embedding service returns 4096 values and ignores the
---   `dimensions` request parameter. The application should currently truncate
---   to the first 1536 dimensions before insert and search.
+--   The canonical ob1-embedding service now returns 1536-dimensional
+--   embeddings server-side for the production contract.
 --
 -- If you change embedding dimensionality, update:
 --   1. the embedding column type
