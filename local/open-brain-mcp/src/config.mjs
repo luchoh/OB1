@@ -41,15 +41,6 @@ function envOptionalNumber(name, fallback) {
   return parsed;
 }
 
-function envBoolean(name, fallback = false) {
-  const value = process.env[name];
-  if (value === undefined || value === "") {
-    return fallback;
-  }
-
-  return value.toLowerCase() === "true";
-}
-
 function pgConfig() {
   const connectionString =
     process.env.OPEN_BRAIN_DATABASE_URL ?? process.env.DATABASE_URL ?? undefined;
@@ -81,6 +72,5 @@ export const config = {
   embeddingDimensions: envOptionalNumber("EMBEDDING_DIMENSIONS_PARAMETER", 1536) ?? 1536,
   expectedEmbeddingDimension: envOptionalNumber("EMBEDDING_STORE_DIMENSION", 1536) ?? 1536,
   metadataMaxTokens: envOptionalNumber("OPEN_BRAIN_METADATA_MAX_TOKENS", 400) ?? 400,
-  forceSeqscan: envBoolean("OPEN_BRAIN_FORCE_SEQSCAN", false),
   postgres: pgConfig(),
 };

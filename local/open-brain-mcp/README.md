@@ -80,5 +80,4 @@ The MCP endpoint accepts:
 - The service loads the repo root `.env` first and then `.env.open-brain-local` so app-specific values win.
 - The canonical embedding contract is `1536` dimensions, owned by `ob1-embedding`.
 - The schema migration is idempotent at the SQL object level, and the migration runner records applied filenames in `open_brain_schema_migrations`.
-- In the current shared `ob1` environment, reads against `thoughts` can hang unless index-driven scan types are disabled. Set `OPEN_BRAIN_FORCE_SEQSCAN=true` until the underlying index issue is fixed or the indexes are rebuilt.
 - The real runtime env file is `.env.open-brain-local` and should remain untracked.

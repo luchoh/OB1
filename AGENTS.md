@@ -49,8 +49,7 @@ Local MCP runtime:
 2. If you touch the local runtime, verify with:
    - `cd local/open-brain-mcp && npm run check`
    - `./scripts/verify-open-brain-local.sh`
-3. If you use the shared `ob1` database, assume `OPEN_BRAIN_FORCE_SEQSCAN=true` may be required until the current `thoughts` index issue is fixed.
-4. Do not assume old Supabase-only guidance is still the only valid deployment path in this repo.
+3. Do not assume old Supabase-only guidance is still the only valid deployment path in this repo.
 
 ## Repo Shape
 

@@ -46,7 +46,6 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 - The accepted long-term design is server-side dimensionality control in `ob1-embedding`.
 - The service now serves the production embedding dimension directly, so clients should not perform their own truncation in steady state.
 - The canonical runtime scaffold now lives in [`local/open-brain-mcp`](/Users/luchoh/Dev/OB1/local/open-brain-mcp) and mirrors the Hono/MCP pattern used by the extension examples.
-- The current shared `ob1` database may require `OPEN_BRAIN_FORCE_SEQSCAN=true` for the local MCP service because index-driven reads against `thoughts` are presently hanging.
 - Run one worker per model service and scale embeddings with batching, not worker duplication.
 - Pre-stage model artifacts locally and prefer offline startup semantics.
 - If later testing proves that `halfvec(3072)` materially improves retrieval quality, that should be treated as an explicit schema migration rather than an in-place tweak.
