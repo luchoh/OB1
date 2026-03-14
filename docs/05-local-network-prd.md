@@ -19,7 +19,7 @@ This PRD defines a new deployment target, "Open Brain Local", that preserves the
 The validated v1 operating assumption is now:
 
 - use `Qwen3.5-397B-A17B` on MLX for chat, reasoning, and metadata extraction
-- use `Qwen3-Embedding-8B` on MLX for vector generation
+- use `Qwen3-Embedding-8B` on the dedicated `ob1-embedding` MLX service for vector generation
 - use PostgreSQL + `pgvector` as the primary store and vector index
 
 ## Problem
@@ -80,9 +80,11 @@ From `.env` and Consul:
   - Docling
 - `mlx-server` is registered at `10.10.10.101:8035` and responds to OpenAI-compatible `chat/completions`
 - The currently exposed MLX model is `mlx-community/Qwen3.5-397B-A17B-nvfp4`
-- `llama-cpp-embedding` is registered at `10.10.10.101:8081` and responds to OpenAI-compatible `embeddings`
-- The currently exposed embedding model is `nomic-ai/nomic-embed-text-v1.5-GGUF:nomic-embed-text-v1.5.Q8_0.gguf`
-- The current embedding endpoint returns 768-dimensional vectors
+- `ob1-embedding` is registered at `10.10.10.101:8082` and responds to OpenAI-compatible `embeddings`
+- The canonical embedding model now exposed there is `mlx-community/Qwen3-Embedding-8B-mxfp8`
+- The current `ob1-embedding` service returns 4096-dimensional embeddings and currently ignores the OpenAI-style `dimensions` parameter
+- A live smoke test succeeded by truncating the returned Qwen embedding client-side to 1536 dimensions before insert and query
+- The earlier `llama-cpp-embedding` endpoint at `10.10.10.101:8081` remains available as a fallback path and serves the Nomic embedding model
 - The MLX model does not support `/v1/embeddings`, so generation and embedding must remain separate services
 - Some Consul health registrations for AI services are still inconsistent with direct endpoint reachability and should not be treated as authoritative until fixed
 
@@ -94,6 +96,8 @@ Implication: the network now has a validated end-to-end local path for PostgreSQ
 - For local Apple Silicon serving, a direct MLX port exists as `mlx-community/Qwen3-Embedding-8B-mxfp8`
 - Qwen reports that `Qwen3-Embedding-8B` ranks No. 1 on the multilingual MTEB leaderboard in its official evaluation set, with strong English performance as well
 - `Qwen3-Embedding-8B` is Apache 2.0 licensed, supports 100+ languages, supports instructions, and supports user-defined output dimensions
+- That embedding model is now confirmed live locally on the dedicated `ob1-embedding` service at `10.10.10.101:8082`
+- The official model card marks the model as MRL-capable, which means reduced-dimension outputs are a supported part of the model design
 - A strong smaller alternative exists in `jinaai/jina-embeddings-v5-text-small`, but it is not the best absolute model for this hardware budget and uses a non-commercial license
 - For inference, the strongest model that cleanly fits the current deployment direction is `Qwen/Qwen3.5-397B-A17B`, already validated locally as `mlx-community/Qwen3.5-397B-A17B-nvfp4`
 - `Qwen3.5-397B-A17B` is especially attractive for this project because its official evaluation includes strong MCP, tool-use, and search-agent results, which map directly to the "brain" workflow
@@ -274,7 +278,8 @@ Vector strategy:
 - The recommended canonical embedding model is `Qwen3-Embedding-8B`
 - Because pgvector approximate indexes support `vector` up to 2,000 dimensions and `halfvec` up to 4,000 dimensions, the full 4,096-dim output of Qwen cannot be indexed directly with the default `vector` path
 - v1 default should be `Qwen3-Embedding-8B` with a reduced output dimension that fits indexed PostgreSQL storage
-- Recommended v1 default: request `1536` output dimensions and store in `vector(1536)` for the simplest operational path
+- Recommended v1 default: store `1536` dimensions in `vector(1536)` for the simplest operational path
+- Because the current `ob1-embedding` service ignores the `dimensions` request parameter and always returns 4096 values, the application must currently apply client-side prefix truncation from 4096 to 1536 before inserts and queries
 - Higher-recall experimental path: request `3072` output dimensions and store/index as `halfvec(3072)` after a dedicated retrieval benchmark
 - Do not mix embeddings from different models in the same vector column or ANN index
 - If multiple embedding models are supported later, version them explicitly with either separate columns or separate embedding tables/indexes
@@ -298,9 +303,10 @@ Validated current endpoints:
   - Model: `mlx-community/Qwen3.5-397B-A17B-nvfp4`
   - Role: chat, reasoning, metadata extraction
 - Embeddings:
-  - Base URL: `http://10.10.10.101:8081`
-  - Model: `nomic-ai/nomic-embed-text-v1.5-GGUF:nomic-embed-text-v1.5.Q8_0.gguf`
-  - Dimension: `768`
+  - Base URL: `http://10.10.10.101:8082`
+  - Service: `ob1-embedding`
+  - Model: `mlx-community/Qwen3-Embedding-8B-mxfp8`
+  - Raw output dimension today: `4096`
   - Role: vector generation only
 
 Recommended canonical v1 models:
@@ -312,10 +318,11 @@ Recommended canonical v1 models:
 - Embeddings:
   - Canonical model: `Qwen/Qwen3-Embedding-8B`
   - Local serving format: `mlx-community/Qwen3-Embedding-8B-mxfp8`
-  - Why: best overall fit for a private knowledge base on this hardware budget, permissive license, multilingual, instruction-aware, and stronger than the currently validated Nomic endpoint
+  - Why: best overall fit for a private knowledge base on this hardware budget, permissive license, multilingual, instruction-aware, stronger than the earlier Nomic bootstrap endpoint, and now already live locally on the dedicated embedding service
 
 Recommended fallback models:
 
+- Operational embedding fallback: keep `llama-cpp-embedding` on `10.10.10.101:8081` with the Nomic model available as a temporary rollback path
 - Fast embedding fallback: `jinaai/jina-embeddings-v5-text-small-retrieval-mlx`
 - Experimental frontier inference fallback: `moonshotai/Kimi-K2.5` only after explicit validation on the target host with a quantization known to fit 512 GB
 
@@ -325,7 +332,8 @@ Implementation note:
 - v1 should explicitly lock embeddings to `Qwen3-Embedding-8B`
 - If additional embedding models are introduced later, they must be added through a versioned embedding strategy rather than silently swapped in place
 - Consul registration should be retained, but direct readiness checks against the actual inference endpoints are required until Consul health reporting is corrected
-- The current Nomic embedding endpoint should be treated as a temporary bootstrap path, not the target long-term model choice
+- The old Nomic embedding endpoint should be treated as a rollback path, not the target long-term model choice
+- Until the `ob1-embedding` service supports server-side dimension selection, the application should explicitly truncate the returned embedding to the configured storage dimension
 
 ### 3. MCP Application Server
 
@@ -417,7 +425,8 @@ Preserve the repo's flexible metadata style:
 - Confirm whether bootstrap will use the shared `ob1` database or a dedicated PostgreSQL instance on the M3 Ultra
 - Keep `pgvector` enabled on the chosen PostgreSQL target
 - Stand up or re-home `Qwen3.5-397B-A17B` serving on the M3 Ultra if the current MLX endpoint is only temporary
-- Stand up `Qwen3-Embedding-8B` serving on the M3 Ultra and retire the Nomic bootstrap endpoint once validated
+- Keep `Qwen3-Embedding-8B` on the dedicated `ob1-embedding` service as the canonical embedding endpoint
+- Retain the earlier Nomic service only as a rollback path until the new embedding stack proves stable
 - Register services in Consul
 - Stand up MinIO and document parsing dependencies if they are not already assigned to the M3 Ultra
 
@@ -427,6 +436,7 @@ Preserve the repo's flexible metadata style:
 - Implement the `thoughts` schema and vector indexes using the selected embedding dimension
 - Implement capture, search, browse, and stats
 - Lock generation to `Qwen3.5-397B-A17B` and embeddings to `Qwen3-Embedding-8B`
+- Apply client-side embedding truncation to the configured storage dimension until the embedding service supports server-side dimension control
 - Validate no-egress behavior
 - Benchmark `Qwen3-Embedding-8B` at `1536` versus `3072` output dimensions before freezing the production schema
 
