@@ -1,0 +1,69 @@
+# Open Brain Local MCP
+
+This is the runnable local core service for the Open Brain Local design.
+
+## What It Does
+
+- exposes a local MCP endpoint at `/mcp`
+- authenticates with the same access key model used elsewhere in the repo
+- writes and reads directly from PostgreSQL
+- calls the local embedding and inference services on the LAN
+- provides the four core tools:
+  - `capture_thought`
+  - `search_thoughts`
+  - `list_thoughts`
+  - `stats`
+
+## Prerequisites
+
+- Node.js 20+
+- PostgreSQL reachable with the `ob1` database
+- `pgvector` enabled in that database
+- `ob1-embedding` healthy at `EMBEDDING_BASE_URL`
+- `mlx-server` healthy at `LLM_BASE_URL`
+- `.env.open-brain-local` populated from [`.env.open-brain-local.example`](/Users/luchoh/Dev/OB1/.env.open-brain-local.example)
+
+## Install
+
+```bash
+cd local/open-brain-mcp
+npm install
+```
+
+## Apply Migrations
+
+From the repo root:
+
+```bash
+./scripts/apply-open-brain-local-migrations.sh
+```
+
+This applies the SQL files in [`local/open-brain-mcp/migrations`](/Users/luchoh/Dev/OB1/local/open-brain-mcp/migrations).
+
+## Run
+
+```bash
+cd local/open-brain-mcp
+npm start
+```
+
+Default bind:
+
+- `http://127.0.0.1:8787/`
+- `http://127.0.0.1:8787/health`
+- `http://127.0.0.1:8787/mcp`
+
+## Auth
+
+The MCP endpoint accepts:
+
+- `?key=$MCP_ACCESS_KEY`
+- `x-access-key: $MCP_ACCESS_KEY`
+- `x-brain-key: $MCP_ACCESS_KEY`
+
+## Notes
+
+- The service loads the repo root `.env` first and then `.env.open-brain-local` so app-specific values win.
+- The canonical embedding contract is `1536` dimensions, owned by `ob1-embedding`.
+- The schema migration is idempotent at the SQL object level, and the migration runner records applied filenames in `open_brain_schema_migrations`.
+- In the current shared `ob1` environment, reads against `thoughts` can hang unless index-driven scan types are disabled. Set `OPEN_BRAIN_FORCE_SEQSCAN=true` until the underlying index issue is fixed or the indexes are rebuilt.

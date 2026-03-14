@@ -1,19 +1,7 @@
--- Open Brain Local bootstrap schema
+-- Open Brain Local core schema migration
 --
--- Canonical migration note:
---   The tracked migration copy of this schema now lives at
---   local/open-brain-mcp/migrations/001_ob1_core.sql
---
--- Target:
---   PostgreSQL 16 + pgvector
---   ob1 database
---
--- Default embedding shape:
---   Qwen3-Embedding-8B reduced to 1536 dimensions
---
--- Runtime note:
---   The canonical ob1-embedding service now returns 1536-dimensional
---   embeddings server-side for the production contract.
+-- Canonical production embedding contract:
+--   1536 dimensions from ob1-embedding
 --
 -- If you change embedding dimensionality, update:
 --   1. the embedding column type

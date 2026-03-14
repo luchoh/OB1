@@ -1,0 +1,24 @@
+{
+  "name": "open-brain-local-mcp",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Local-network-only Open Brain MCP server",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "dev": "node --watch src/index.mjs",
+    "check": "node --check src/index.mjs && node --check src/server.mjs && node --check src/models.mjs && node --check src/db.mjs && node --check src/config.mjs"
+  },
+  "dependencies": {
+    "@hono/mcp": "0.2.4",
+    "@hono/node-server": "1.19.11",
+    "@modelcontextprotocol/sdk": "1.27.1",
+    "dotenv": "17.3.1",
+    "hono": "4.12.8",
+    "pg": "8.20.0",
+    "zod": "4.3.6"
+  }
+}
