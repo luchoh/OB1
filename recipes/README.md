@@ -8,6 +8,7 @@ Step-by-step builds that add a new capability to your Open Brain. Follow the ins
 | ------ | ------------ |
 | [Email History Import](email-history-import/) | Pull your Gmail archive into searchable thoughts |
 | [ChatGPT Conversation Import](chatgpt-conversation-import/) | Ingest your ChatGPT data export |
+| [Document Import](document-import/) | Convert local documents with Docling and ingest searchable chunks into OB1 |
 | [Daily Digest](daily-digest/) | Automated summary of recent thoughts via email or Slack |
 
 ## Contributing

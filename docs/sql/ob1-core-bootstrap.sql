@@ -30,6 +30,7 @@ create table if not exists thoughts (
   embedding vector(1536),
   embedding_model text not null default 'mlx-community/Qwen3-Embedding-8B-mxfp8',
   embedding_dimension integer not null default 1536,
+  dedupe_key text not null,
   metadata jsonb not null default '{}'::jsonb,
   content_hash text generated always as (encode(digest(content, 'sha256'), 'hex')) stored,
   created_at timestamptz not null default now(),
@@ -37,7 +38,10 @@ create table if not exists thoughts (
   constraint thoughts_embedding_dimension_check check (embedding_dimension = 1536)
 );
 
-create unique index if not exists thoughts_content_hash_idx
+create unique index if not exists thoughts_dedupe_key_idx
+  on thoughts (dedupe_key);
+
+create index if not exists thoughts_content_hash_idx
   on thoughts (content_hash);
 
 create index if not exists thoughts_metadata_gin_idx

@@ -18,6 +18,8 @@ const captureThoughtSchema = {
   type: z.string().optional().describe("Optional type override for the thought."),
   tags: z.array(z.string()).optional().describe("Optional tags to merge into the thought metadata."),
   occurred_at: z.string().optional().describe("Optional source timestamp in ISO 8601 format."),
+  dedupe_key: z.string().min(1).optional().describe("Optional stable key for idempotent imports."),
+  extract_metadata: z.boolean().optional().describe("Whether to run LLM metadata extraction before storing."),
 };
 const captureThoughtInput = z.object(captureThoughtSchema);
 
@@ -69,7 +71,7 @@ function errorToolResult(error) {
   };
 }
 
-async function upsertThought({ content, embedding, metadata }) {
+async function upsertThought({ content, embedding, metadata, dedupeKey }) {
   const result = await query(
     `
       insert into thoughts (
@@ -77,6 +79,7 @@ async function upsertThought({ content, embedding, metadata }) {
         embedding,
         embedding_model,
         embedding_dimension,
+        dedupe_key,
         metadata
       )
       values (
@@ -84,10 +87,12 @@ async function upsertThought({ content, embedding, metadata }) {
         $2::vector,
         $3,
         $4,
-        $5::jsonb
+        coalesce($5, encode(digest($1, 'sha256'), 'hex')),
+        $6::jsonb
       )
-      on conflict (content_hash)
+      on conflict (dedupe_key)
       do update set
+        content = excluded.content,
         embedding = excluded.embedding,
         embedding_model = excluded.embedding_model,
         embedding_dimension = excluded.embedding_dimension,
@@ -96,6 +101,8 @@ async function upsertThought({ content, embedding, metadata }) {
       returning
         id,
         content,
+        dedupe_key,
+        content_hash,
         embedding_model,
         embedding_dimension,
         metadata,
@@ -107,6 +114,7 @@ async function upsertThought({ content, embedding, metadata }) {
       formatVector(embedding),
       config.embeddingModel,
       embedding.length,
+      dedupeKey ?? null,
       JSON.stringify(metadata),
     ],
   );
@@ -117,10 +125,14 @@ async function upsertThought({ content, embedding, metadata }) {
 async function handleCaptureThought(args) {
   const content = args.content.trim();
   const metadata = args.metadata ?? {};
+  const shouldExtractMetadata = args.extract_metadata ?? true;
+  const extractionPromise = shouldExtractMetadata
+    ? extractMetadata(content, args.source)
+    : Promise.resolve({});
 
   const [embeddingResult, extractionResult] = await Promise.allSettled([
     createEmbedding(content),
-    extractMetadata(content, args.source),
+    extractionPromise,
   ]);
 
   if (embeddingResult.status !== "fulfilled") {
@@ -146,11 +158,13 @@ async function handleCaptureThought(args) {
     content,
     embedding: embeddingResult.value,
     metadata: normalizedMetadata,
+    dedupeKey: args.dedupe_key,
   });
 
   return {
     success: true,
     message: "Thought captured",
+    metadata_extraction_enabled: shouldExtractMetadata,
     thought,
   };
 }

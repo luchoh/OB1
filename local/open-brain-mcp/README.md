@@ -93,7 +93,9 @@ Request body:
   "source": "chatgpt",
   "type": "chatgpt_conversation",
   "tags": ["chatgpt", "import"],
-  "occurred_at": "2026-03-14"
+  "occurred_at": "2026-03-14",
+  "dedupe_key": "chatgpt:1234:thought:0",
+  "extract_metadata": false
 }
 ```
 
@@ -103,5 +105,7 @@ Request body:
 - `LLM_ENABLE_THINKING=false` is the intended default for structured local LLM calls.
 - Structured extraction uses Qwen tool calling rather than `response_format`.
 - The canonical embedding contract is `1536` dimensions, owned by `ob1-embedding`.
+- Importers should supply `dedupe_key` for idempotent writes when identical text can appear in different sources.
+- Importers can set `extract_metadata=false` when they already have structured metadata and only need embeddings plus storage.
 - The schema migration is idempotent at the SQL object level, and the migration runner records applied filenames in `open_brain_schema_migrations`.
 - The real runtime env file is `.env.open-brain-local` and should remain untracked.

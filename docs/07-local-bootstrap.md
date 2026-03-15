@@ -20,6 +20,8 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 - Inference health: `http://10.10.10.101:8035/health`
 - Embeddings: `http://10.10.10.101:8082/v1` using `mlx-community/Qwen3-Embedding-8B-mxfp8`
 - Embedding health: `http://10.10.10.101:8082/health`
+- Document parsing: `http://10.10.10.100:5001` via the `docling` Consul service
+- Document parsing health: `http://10.10.10.100:5001/health`
 - Rollback embedding path: `http://10.10.10.101:8081/v1` using the Nomic model
 
 ## Embedding Contract
@@ -46,6 +48,7 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 - The accepted long-term design is server-side dimensionality control in `ob1-embedding`.
 - The service now serves the production embedding dimension directly, so clients should not perform their own truncation in steady state.
 - The canonical runtime scaffold now lives in [`local/open-brain-mcp`](/Users/luchoh/Dev/OB1/local/open-brain-mcp) and mirrors the Hono/MCP pattern used by the extension examples.
+- The canonical document-ingest path is now the live Docling service plus [recipes/document-import](/Users/luchoh/Dev/OB1/recipes/document-import#L1).
 - Run one worker per model service and scale embeddings with batching, not worker duplication.
 - Pre-stage model artifacts locally and prefer offline startup semantics.
 - If later testing proves that `halfvec(3072)` materially improves retrieval quality, that should be treated as an explicit schema migration rather than an in-place tweak.

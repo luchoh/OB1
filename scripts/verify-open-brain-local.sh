@@ -27,10 +27,13 @@ EMBEDDING_HEALTH_URL="${EMBEDDING_HEALTH_URL:-http://10.10.10.101:8082/health}"
 EMBEDDING_MODEL="${EMBEDDING_MODEL:-mlx-community/Qwen3-Embedding-8B-mxfp8}"
 EXPECTED_EMBEDDING_DIMENSION="${EXPECTED_EMBEDDING_DIMENSION:-1536}"
 UNSUPPORTED_EMBEDDING_DIMENSION="${UNSUPPORTED_EMBEDDING_DIMENSION:-3072}"
+DOCLING_BASE_URL="${DOCLING_BASE_URL:-http://10.10.10.100:5001}"
+DOCLING_HEALTH_URL="${DOCLING_HEALTH_URL:-http://10.10.10.100:5001/health}"
 CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-http://127.0.0.1:8500}"
 CONSUL_HTTP_TOKEN="${CONSUL_HTTP_TOKEN:-}"
 LLM_SERVICE_NAME="${OPEN_BRAIN_LLM_SERVICE_NAME:-mlx-server}"
 EMBEDDING_SERVICE_NAME="${OPEN_BRAIN_EMBEDDING_SERVICE_NAME:-ob1-embedding}"
+DOCLING_SERVICE_NAME="${DOCLING_SERVICE_NAME:-docling}"
 
 PGHOST="${PGHOST:-10.10.10.100}"
 PGPORT="${PGPORT:-5432}"
@@ -44,15 +47,19 @@ export EMBEDDING_BASE_URL
 export EMBEDDING_MODEL
 export EXPECTED_EMBEDDING_DIMENSION
 export UNSUPPORTED_EMBEDDING_DIMENSION
+export DOCLING_BASE_URL
 export CONSUL_HTTP_ADDR
 export CONSUL_HTTP_TOKEN
 export LLM_SERVICE_NAME
 export EMBEDDING_SERVICE_NAME
+export DOCLING_SERVICE_NAME
 
 echo "== Health =="
 curl -fsS "$LLM_HEALTH_URL"
 echo
 curl -fsS "$EMBEDDING_HEALTH_URL"
+echo
+curl -fsS "$DOCLING_HEALTH_URL"
 echo
 
 echo "== Model IDs =="
@@ -153,6 +160,7 @@ consul_addr = os.environ["CONSUL_HTTP_ADDR"].rstrip("/")
 consul_token = os.environ.get("CONSUL_HTTP_TOKEN", "")
 llm_service_name = os.environ["LLM_SERVICE_NAME"]
 embedding_service_name = os.environ["EMBEDDING_SERVICE_NAME"]
+docling_service_name = os.environ["DOCLING_SERVICE_NAME"]
 
 def consul_get(path):
     headers = {}
@@ -162,7 +170,7 @@ def consul_get(path):
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
 
-for service_name in (llm_service_name, embedding_service_name):
+for service_name in (llm_service_name, embedding_service_name, docling_service_name):
     checks = consul_get(f"/v1/health/service/{service_name}?passing=1")
     if not checks:
         raise SystemExit(f"Consul has no passing instances for {service_name}")
@@ -181,6 +189,8 @@ psql "host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER" -Atc \
   "select extname || ':' || extversion from pg_extension where extname = 'vector';"
 psql "host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER" -Atc \
   "select attname || ':' || format_type(atttypid, atttypmod) from pg_attribute where attrelid = 'thoughts'::regclass and attname = 'embedding';"
+psql "host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER" -Atc \
+  "select attname || ':' || format_type(atttypid, atttypmod) from pg_attribute where attrelid = 'thoughts'::regclass and attname = 'dedupe_key';"
 
 echo
 echo "Verification passed."
