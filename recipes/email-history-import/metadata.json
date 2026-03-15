@@ -1,20 +1,19 @@
 {
   "name": "Email History Import",
-  "description": "Import your Gmail email history into Open Brain as searchable thoughts with sender, subject, and date metadata.",
+  "description": "Import a standard IMAP mailbox into the local Open Brain service as searchable email thoughts with sender, subject, mailbox, flag, and date metadata.",
   "category": "recipes",
   "author": {
-    "name": "Matt Hallett",
-    "github": "matthallett"
+    "name": "OB1 Team"
   },
   "version": "1.0.0",
   "requires": {
     "open_brain": true,
-    "services": ["Gmail API"],
-    "tools": ["Node.js 18+"]
+    "services": ["IMAP account"],
+    "tools": ["Python 3.10+"]
   },
-  "tags": ["email", "gmail", "import", "history"],
+  "tags": ["email", "imap", "import", "history"],
   "difficulty": "intermediate",
-  "estimated_time": "30 minutes",
+  "estimated_time": "20 minutes",
   "created": "2026-03-10",
-  "updated": "2026-03-10"
+  "updated": "2026-03-14"
 }

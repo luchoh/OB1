@@ -1,18 +1,30 @@
 # Email History Import
 
-> Import your Gmail email history into Open Brain as searchable, embedded thoughts.
+Import a standard IMAP mailbox into the local Open Brain service as searchable email thoughts.
 
 ## What It Does
 
-Pulls your Gmail history via the Gmail API and loads each email into Open Brain as a thought. Emails are embedded and stored with sender, subject, date, and label metadata — making your entire email archive searchable through your brain's semantic search.
+Connects to a standard IMAP mailbox, fetches each RFC 822 message, parses it locally, and ingests each email into OB1 through the local `/ingest/thought` contract.
+
+Each imported email is stored with:
+- sender metadata
+- subject
+- date
+- mailbox
+- IMAP flags
+- RFC 822 message ID when present
+
+The importer is idempotent:
+- each message writes with a stable mailbox/UID-based `dedupe_key`
+- successful runs are also recorded in `imap-sync-log.json`
 
 ## Prerequisites
 
-- Working Open Brain setup ([guide](../../docs/01-getting-started.md))
-- Google Cloud project with Gmail API enabled
-- Gmail API OAuth credentials (Client ID + Client Secret)
-- Node.js 18+
-- Your Supabase project URL and service role key
+- working local OB1 setup
+- a reachable IMAP account
+- Python 3.10+
+- the local OB1 service running
+- your real `.env.open-brain-local`
 
 ## Credential Tracker
 
@@ -22,48 +34,98 @@ Copy this block into a text editor and fill it in as you go.
 EMAIL HISTORY IMPORT -- CREDENTIAL TRACKER
 --------------------------------------
 
-FROM YOUR OPEN BRAIN SETUP
-  Supabase Project URL:  ____________
-  Supabase Secret key:   ____________
+FROM YOUR LOCAL OPEN BRAIN SETUP
+  OB1 ingest URL:        ____________
+  MCP access key:        ____________
 
-GENERATED DURING SETUP
-  Google Cloud Project ID:     ____________
-  Gmail OAuth Client ID:       ____________.apps.googleusercontent.com
-  Gmail OAuth Client Secret:   ____________
+FROM YOUR IMAP ACCOUNT
+  IMAP host:             ____________
+  IMAP port:             ____________
+  IMAP username:         ____________
+  IMAP mailbox:          ____________
 
 --------------------------------------
 ```
 
 ## Steps
 
-<!-- TODO: Matt Hallett to fill in step-by-step instructions -->
+From the repo root:
 
-1. Set up Google Cloud project and enable the Gmail API
-2. Create OAuth 2.0 credentials
-3. Clone this folder and install dependencies
-4. Configure your environment variables
-5. Run the authentication flow
-6. Run the import script
-7. Verify thoughts were created in your Supabase database
+```bash
+cd recipes/email-history-import
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+set -a
+source ../../.env.open-brain-local
+set +a
+python import-imap.py \
+  --host imap.example.com \
+  --username you@example.com \
+  --mailbox INBOX \
+  --dry-run \
+  --limit 25
+```
+
+If you omit `--password`, the importer prompts for it securely.
+
+If the dry run looks right:
+
+```bash
+python import-imap.py \
+  --host imap.example.com \
+  --username you@example.com \
+  --mailbox INBOX
+```
+
+Useful examples:
+
+```bash
+# only import mail since January 1, 2025
+python import-imap.py --host imap.example.com --username you@example.com --since 2025-01-01
+
+# only import unseen mail from a specific sender
+python import-imap.py --host imap.example.com --username you@example.com --unseen --from alice@example.com
+
+# strip quoted reply blocks before ingest
+python import-imap.py --host imap.example.com --username you@example.com --strip-quotes
+```
 
 ## Expected Outcome
 
-After running the import, you should see your emails as rows in the `thoughts` table. Each thought's `content` field contains the email body, and the `metadata` jsonb field includes:
-- `source`: `"gmail"`
+After running the import, you should see your emails as rows in the `thoughts` table. Each thought's `content` field contains a structured email snapshot and the `metadata` jsonb field includes:
+- `source`: `"imap"`
 - `sender`: sender email address
 - `subject`: email subject line
 - `date`: original send date
-- `labels`: Gmail labels
+- `mailbox`
+- `flags`
+- `imap_uid`
+- `rfc822_message_id`
 
-You can search for any email content using your Open Brain MCP server's `search_thoughts` tool.
+You can search for any email content using the local OB1 MCP server's `search_thoughts` tool.
+
+## Runtime Notes
+
+- The importer uses IMAP `SEARCH` with the explicit filters you provide.
+- `--since` and `--before` are applied through IMAP search and re-checked locally after parsing.
+- The importer writes with `extract_metadata=false` because sender, subject, date, mailbox, and flags are already structured and large mailboxes should not pay an LLM extraction cost per message.
+- Attachments are ignored; the importer only ingests message body text.
+- The current search flags are `SINCE`, `BEFORE`, `UNSEEN`, `FROM`, `SUBJECT`, and `TEXT`.
 
 ## Troubleshooting
 
-**Issue: OAuth flow fails or redirects to an error page**
-Solution: Make sure your redirect URI in Google Cloud Console matches exactly what's in your config. For local development, use `http://localhost:3000/callback`.
+`Login failed`
+- Confirm the server host, port, username, and password. If the provider requires an app password, use that instead of your normal mailbox password.
 
-**Issue: Import runs but no thoughts appear in Supabase**
-Solution: Check that your `SUPABASE_SERVICE_ROLE_KEY` is set (not the anon key). RLS blocks anon inserts.
+`Import runs but no thoughts appear in OB1`
+- Check that `MCP_ACCESS_KEY` is loaded and the local OB1 service is healthy.
 
-**Issue: Rate limiting from Gmail API**
-Solution: The script includes built-in rate limiting, but if you have a very large mailbox, you may need to import in batches. Use the `--after` flag to set a start date.
+`Mailbox select failed`
+- Make sure the mailbox name is valid for that server. Common values are `INBOX`, `Archive`, or provider-specific folder names.
+
+`Large mailbox`
+- Import in batches with `--since`, `--before`, `--from`, `--subject`, or `--text`.
+
+`Need to re-run everything from scratch`
+- Remove `imap-sync-log.json` and rerun. The `dedupe_key` still protects the DB from duplicates.

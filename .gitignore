@@ -7,3 +7,4 @@ node_modules/
 chatgpt-sync-log.json
 __pycache__/
 *.pyc
+recipes/email-history-import/imap-sync-log.json
