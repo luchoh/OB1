@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import dotenv from "dotenv";
@@ -6,8 +7,31 @@ const currentDir = path.dirname(fileURLToPath(import.meta.url));
 export const serviceDir = path.resolve(currentDir, "..");
 export const repoRoot = path.resolve(serviceDir, "../..");
 
-dotenv.config({ path: path.join(repoRoot, ".env") });
-dotenv.config({ path: path.join(repoRoot, ".env.open-brain-local"), override: true });
+function parsedEnv(filepath) {
+  try {
+    return dotenv.parse(fs.readFileSync(filepath));
+  } catch {
+    return {};
+  }
+}
+
+function loadRepoEnv() {
+  const baseEnv = parsedEnv(path.join(repoRoot, ".env"));
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (process.env[key] === undefined) {
+      process.env[key] = value;
+    }
+  }
+
+  const localEnv = parsedEnv(path.join(repoRoot, ".env.open-brain-local"));
+  for (const [key, value] of Object.entries(localEnv)) {
+    if (process.env[key] === undefined || process.env[key] === baseEnv[key]) {
+      process.env[key] = value;
+    }
+  }
+}
+
+loadRepoEnv();
 
 function envString(name, fallback) {
   const value = process.env[name] ?? fallback;
@@ -41,6 +65,23 @@ function envOptionalNumber(name, fallback) {
   return parsed;
 }
 
+function envBoolean(name, fallback) {
+  const value = process.env[name];
+  if (value === undefined || value === "") {
+    return fallback;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) {
+    return true;
+  }
+  if (["0", "false", "no", "off"].includes(normalized)) {
+    return false;
+  }
+
+  throw new Error(`Environment variable ${name} must be a boolean`);
+}
+
 function pgConfig() {
   const connectionString =
     process.env.OPEN_BRAIN_DATABASE_URL ?? process.env.DATABASE_URL ?? undefined;
@@ -66,6 +107,7 @@ export const config = {
   llmBaseUrl: envString("LLM_BASE_URL", "http://10.10.10.101:8035/v1").replace(/\/$/, ""),
   llmHealthUrl: envString("LLM_HEALTH_URL", "http://10.10.10.101:8035/health"),
   llmModel: envString("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4"),
+  llmEnableThinking: envBoolean("LLM_ENABLE_THINKING", false),
   embeddingBaseUrl: envString("EMBEDDING_BASE_URL", "http://10.10.10.101:8082/v1").replace(/\/$/, ""),
   embeddingHealthUrl: envString("EMBEDDING_HEALTH_URL", "http://10.10.10.101:8082/health"),
   embeddingModel: envString("EMBEDDING_MODEL", "mlx-community/Qwen3-Embedding-8B-mxfp8"),

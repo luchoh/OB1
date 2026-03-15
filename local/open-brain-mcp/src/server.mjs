@@ -19,6 +19,7 @@ const captureThoughtSchema = {
   tags: z.array(z.string()).optional().describe("Optional tags to merge into the thought metadata."),
   occurred_at: z.string().optional().describe("Optional source timestamp in ISO 8601 format."),
 };
+const captureThoughtInput = z.object(captureThoughtSchema);
 
 const searchThoughtsSchema = {
   query: z.string().min(1).describe("Natural-language search query."),
@@ -328,6 +329,23 @@ app.get("/health", async (c) => {
       },
       503,
     );
+  }
+});
+
+app.post("/ingest/thought", async (c) => {
+  const key = authKey(c);
+  if (!key || key !== config.accessKey) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const payload = captureThoughtInput.parse(await c.req.json());
+    const result = await handleCaptureThought(payload);
+    return c.json(result, 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const status = error instanceof z.ZodError ? 400 : 500;
+    return c.json({ success: false, error: message }, status);
   }
 });
 

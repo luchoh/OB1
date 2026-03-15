@@ -4,3 +4,4 @@ node_modules/
 .env.open-brain-local
 .open-brain-local-smoke.log
 .mcp.json
+chatgpt-sync-log.json

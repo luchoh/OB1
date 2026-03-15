@@ -13,29 +13,25 @@ Usage:
     python import-chatgpt.py path/to/export.zip [options]
     python import-chatgpt.py path/to/extracted-dir/ [options]
 
-Ingestion modes:
-    Default:              Supabase direct insert (requires SUPABASE_URL,
-                          SUPABASE_SERVICE_ROLE_KEY, OPENROUTER_API_KEY)
-    --ingest-endpoint:    Custom endpoint (requires INGEST_URL, INGEST_KEY)
+Ingestion:
+    Default:              Local OB1 ingest endpoint
 
 Options:
     --dry-run              Parse, filter, summarize, but don't ingest
     --after YYYY-MM-DD     Only conversations created after this date
     --before YYYY-MM-DD    Only conversations created before this date
     --limit N              Max conversations to process
-    --model openrouter     LLM backend: openrouter (default) or ollama
+    --model local          LLM backend: local (default) or ollama
     --ollama-model NAME    Ollama model name (default: qwen3)
     --raw                  Skip summarization, ingest user messages directly
     --verbose              Show full summaries during processing
     --report FILE          Write a markdown report of everything imported
-    --ingest-endpoint      Use INGEST_URL/INGEST_KEY instead of Supabase direct insert
-
 Environment variables:
-    SUPABASE_URL               Supabase project URL (required for default mode)
-    SUPABASE_SERVICE_ROLE_KEY  Supabase service role key (required for default mode)
-    OPENROUTER_API_KEY         OpenRouter API key (required for summarization + embeddings)
-    INGEST_URL                 Custom ingest endpoint URL (required with --ingest-endpoint)
-    INGEST_KEY                 Custom ingest endpoint auth key (required with --ingest-endpoint)
+    LLM_BASE_URL               OpenAI-compatible local LLM endpoint
+    LLM_MODEL                  Local LLM model id
+    OPEN_BRAIN_INGEST_URL      Local/custom ingest endpoint URL
+    OPEN_BRAIN_INGEST_KEY      Local/custom ingest endpoint auth key
+    MCP_ACCESS_KEY             Local OB1 access key alias
 """
 
 import argparse
@@ -53,14 +49,37 @@ from pathlib import Path
 
 SYNC_LOG_PATH = Path("chatgpt-sync-log.json")
 
-OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 OLLAMA_BASE = "http://localhost:11434"
+LOCAL_LLM_BASE = os.environ.get("LLM_BASE_URL", "http://10.10.10.101:8035/v1").rstrip("/")
+LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
+LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+LOCAL_INGEST_URL = os.environ.get("OPEN_BRAIN_INGEST_URL") or "http://127.0.0.1:8787/ingest/thought"
+LOCAL_INGEST_KEY = os.environ.get("OPEN_BRAIN_INGEST_KEY") or os.environ.get("MCP_ACCESS_KEY", "")
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
-OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
-INGEST_URL = os.environ.get("INGEST_URL", "")
-INGEST_KEY = os.environ.get("INGEST_KEY", "")
+THOUGHTS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_thoughts",
+        "description": "Return extracted durable thoughts from the conversation.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["thoughts"],
+            "properties": {
+                "thoughts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Up to 3 durable first-person thoughts worth keeping.",
+                }
+            },
+        },
+    },
+}
 
 # Filtering thresholds
 MIN_TOTAL_MESSAGES = 4
@@ -100,7 +119,9 @@ Each thought must be:
 - Anchored with names, dates, or project context when available
 - 1-3 sentences
 
-Return JSON: {"thoughts": ["thought1", "thought2"]}
+Return a JSON object with exactly one key: "thoughts".
+The value of "thoughts" must be an array of 0-3 real thought strings.
+Do not use placeholders such as "thought1", "thought2", or template labels.
 If the conversation has nothing worth capturing, return {"thoughts": []}
 Err on the side of returning empty — less is more."""
 
@@ -132,11 +153,11 @@ except ImportError:
     sys.exit(1)
 
 
-def http_post_with_retry(url, headers, body, retries=2):
+def http_post_with_retry(url, headers, body, retries=2, timeout=30):
     """POST with exponential backoff retry on transient failures."""
     for attempt in range(retries + 1):
         try:
-            resp = requests.post(url, headers=headers, json=body, timeout=30)
+            resp = requests.post(url, headers=headers, json=body, timeout=timeout)
             if resp.status_code >= 500 and attempt < retries:
                 time.sleep(1 * (attempt + 1))
                 continue
@@ -147,6 +168,48 @@ def http_post_with_retry(url, headers, body, retries=2):
                 continue
             raise
     return None  # unreachable
+
+
+def extract_json_payload(text):
+    """Extract a JSON object from plain text or fenced code output."""
+    trimmed = text.strip()
+    trimmed = re.sub(r"^```json\s*", "", trimmed, flags=re.IGNORECASE)
+    trimmed = re.sub(r"^```\s*", "", trimmed)
+    trimmed = re.sub(r"\s*```$", "", trimmed)
+
+    try:
+        return json.loads(trimmed)
+    except json.JSONDecodeError:
+        start = trimmed.find("{")
+        end = trimmed.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(trimmed[start : end + 1])
+
+
+def extract_tool_arguments(response_json, expected_name):
+    """Extract parsed arguments from a tool call response."""
+    try:
+        tool_calls = response_json["choices"][0]["message"]["tool_calls"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("Model did not return a tool call") from exc
+
+    if not isinstance(tool_calls, list) or not tool_calls:
+        raise ValueError("Model did not return a tool call")
+
+    call = None
+    for item in tool_calls:
+        if isinstance(item, dict) and item.get("function", {}).get("name") == expected_name:
+            call = item
+            break
+    if call is None:
+        call = tool_calls[0]
+
+    arguments = call.get("function", {}).get("arguments")
+    if not isinstance(arguments, str) or not arguments.strip():
+        raise ValueError("Tool call arguments were empty")
+
+    return extract_json_payload(arguments)
 
 
 # ─── ChatGPT Export Parsing ──────────────────────────────────────────────────
@@ -337,24 +400,22 @@ def should_skip(conv, user_text, message_count, sync_log, args):
 # ─── LLM Summarization ──────────────────────────────────────────────────────
 
 
-def summarize_openrouter(title, date_str, user_text):
-    """Summarize a conversation into thoughts using OpenRouter."""
-    if not OPENROUTER_API_KEY:
-        print("Error: OPENROUTER_API_KEY environment variable required for summarization.")
-        sys.exit(1)
-
-    # Truncate to ~6000 chars to stay within context limits
+def summarize_local(title, date_str, user_text):
+    """Summarize a conversation using the local OpenAI-compatible LLM endpoint."""
     truncated = user_text[:6000]
 
     resp = http_post_with_retry(
-        f"{OPENROUTER_BASE}/chat/completions",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
+        f"{LOCAL_LLM_BASE}/chat/completions",
+        headers={"Content-Type": "application/json"},
         body={
-            "model": "openai/gpt-4o-mini",
-            "response_format": {"type": "json_object"},
+            "model": LOCAL_LLM_MODEL,
+            "temperature": 0,
+            "max_tokens": 500,
+            "chat_template_kwargs": {
+                "enable_thinking": LOCAL_LLM_ENABLE_THINKING,
+            },
+            "tools": [THOUGHTS_TOOL],
+            "tool_choice": "required",
             "messages": [
                 {"role": "system", "content": SUMMARIZATION_PROMPT},
                 {
@@ -362,22 +423,22 @@ def summarize_openrouter(title, date_str, user_text):
                     "content": f"Conversation title: {title}\nDate: {date_str}\n\nUser messages:\n{truncated}",
                 },
             ],
-            "temperature": 0,
         },
+        timeout=180,
     )
 
     if not resp or resp.status_code != 200:
         status = resp.status_code if resp else "no response"
-        print(f"   Warning: Summarization failed ({status}), skipping conversation.")
+        print(f"   Warning: Local summarization failed ({status}), skipping conversation.")
         return []
 
     try:
         data = resp.json()
-        result = json.loads(data["choices"][0]["message"]["content"])
+        result = extract_tool_arguments(data, "submit_thoughts")
         thoughts = result.get("thoughts", [])
-        return [t for t in thoughts if isinstance(t, str) and t.strip()]
-    except (KeyError, json.JSONDecodeError, IndexError) as e:
-        print(f"   Warning: Failed to parse summarization response: {e}")
+        return [t.strip() for t in thoughts if isinstance(t, str) and t.strip()]
+    except (KeyError, json.JSONDecodeError, IndexError, ValueError) as e:
+        print(f"   Warning: Failed to parse local summarization response: {e}")
         return []
 
 
@@ -422,106 +483,51 @@ def summarize_ollama(title, date_str, user_text, model_name="qwen3"):
 
 def summarize(title, date_str, user_text, args):
     """Dispatch to the appropriate summarization backend."""
+    if args.model == "local":
+        return summarize_local(title, date_str, user_text)
     if args.model == "ollama":
         return summarize_ollama(title, date_str, user_text, args.ollama_model)
-    return summarize_openrouter(title, date_str, user_text)
-
-
-# ─── Embedding Generation ───────────────────────────────────────────────────
-
-
-def generate_embedding(text):
-    """Generate a 1536-dim embedding via OpenRouter (text-embedding-3-small)."""
-    truncated = text[:8000]
-
-    resp = http_post_with_retry(
-        f"{OPENROUTER_BASE}/embeddings",
-        headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        body={
-            "model": "openai/text-embedding-3-small",
-            "input": truncated,
-        },
-    )
-
-    if not resp or resp.status_code != 200:
-        status = resp.status_code if resp else "no response"
-        print(f"   Warning: Embedding generation failed ({status})")
-        return None
-
-    try:
-        data = resp.json()
-        return data["data"][0]["embedding"]
-    except (KeyError, IndexError) as e:
-        print(f"   Warning: Failed to parse embedding response: {e}")
-        return None
+    raise ValueError(f"Unsupported model backend: {args.model}")
 
 
 # ─── Ingestion ───────────────────────────────────────────────────────────────
 
 
-def ingest_thought_supabase(content, metadata_dict):
-    """Insert a thought directly into Supabase with a generated embedding."""
-    embedding = generate_embedding(content)
-    if not embedding:
-        return {"ok": False, "error": "Failed to generate embedding"}
-
+def ingest_thought_local(content, metadata_dict, occurred_at=None):
+    """POST a thought to the local Open Brain ingest endpoint."""
     resp = http_post_with_retry(
-        f"{SUPABASE_URL}/rest/v1/thoughts",
+        LOCAL_INGEST_URL,
         headers={
             "Content-Type": "application/json",
-            "apikey": SUPABASE_SERVICE_ROLE_KEY,
-            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            "Prefer": "return=minimal",
+            "x-access-key": LOCAL_INGEST_KEY,
+            "x-ingest-key": LOCAL_INGEST_KEY,
         },
         body={
             "content": content,
-            "embedding": embedding,
             "metadata": metadata_dict,
+            "source": "chatgpt",
+            "type": metadata_dict.get("type"),
+            "tags": metadata_dict.get("topics", []),
+            "occurred_at": occurred_at,
         },
+        timeout=180,
     )
 
     if not resp:
-        return {"ok": False, "error": "No response from Supabase"}
-
-    if resp.status_code not in (200, 201):
-        try:
-            error_detail = resp.json()
-        except ValueError:
-            error_detail = resp.text
-        return {"ok": False, "error": f"HTTP {resp.status_code}: {error_detail}"}
-
-    return {"ok": True}
-
-
-def ingest_thought_endpoint(content, extra_metadata, full_text=None):
-    """POST a thought to a custom ingest endpoint."""
-    body = {
-        "content": content,
-        "source": "chatgpt",
-        "extra_metadata": extra_metadata,
-    }
-    if full_text:
-        body["full_text"] = full_text
-
-    resp = http_post_with_retry(
-        INGEST_URL,
-        headers={
-            "Content-Type": "application/json",
-            "x-ingest-key": INGEST_KEY,
-        },
-        body=body,
-    )
-
-    if not resp:
-        return {"ok": False, "error": "No response from server"}
+        return {"ok": False, "error": "No response from local Open Brain"}
 
     try:
-        return resp.json()
+        payload = resp.json()
     except ValueError:
-        return {"ok": False, "error": f"Invalid JSON response: {resp.status_code}"}
+        payload = None
+
+    if resp.status_code not in (200, 201):
+        return {
+            "ok": False,
+            "error": payload or f"HTTP {resp.status_code}: {resp.text}",
+        }
+
+    return {"ok": True, "result": payload}
 
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -544,21 +550,25 @@ def parse_args():
 Examples:
   python import-chatgpt.py export.zip --dry-run --limit 10
   python import-chatgpt.py export.zip --after 2024-01-01
+  python import-chatgpt.py export.zip --model local
   python import-chatgpt.py export.zip --model ollama --ollama-model qwen3
-  python import-chatgpt.py export.zip --raw --limit 50
-  python import-chatgpt.py export.zip --ingest-endpoint""",
+  python import-chatgpt.py export.zip --raw --limit 50""",
     )
     parser.add_argument("zip_path", help="Path to ChatGPT data export zip file or extracted directory")
     parser.add_argument("--dry-run", action="store_true", help="Parse and summarize but don't ingest")
     parser.add_argument("--after", type=parse_date, help="Only conversations after YYYY-MM-DD")
     parser.add_argument("--before", type=parse_date, help="Only conversations before YYYY-MM-DD")
     parser.add_argument("--limit", type=int, default=0, help="Max conversations to process (0 = unlimited)")
-    parser.add_argument("--model", choices=["openrouter", "ollama"], default="openrouter", help="LLM backend (default: openrouter)")
+    parser.add_argument(
+        "--model",
+        choices=["local", "ollama"],
+        default="local",
+        help="LLM backend (default: local)",
+    )
     parser.add_argument("--ollama-model", default="qwen3", help="Ollama model name (default: qwen3)")
     parser.add_argument("--raw", action="store_true", help="Skip summarization, ingest user messages directly")
     parser.add_argument("--verbose", action="store_true", help="Show full summaries during processing")
     parser.add_argument("--report", type=str, metavar="FILE", help="Write a markdown report of everything imported")
-    parser.add_argument("--ingest-endpoint", action="store_true", help="Use INGEST_URL/INGEST_KEY instead of Supabase direct insert")
     return parser.parse_args()
 
 
@@ -574,30 +584,12 @@ def main():
 
     # Validate env vars for live mode
     if not args.dry_run:
-        if args.ingest_endpoint:
-            if not INGEST_URL:
-                print("Error: INGEST_URL environment variable required with --ingest-endpoint.")
-                sys.exit(1)
-            if not INGEST_KEY:
-                print("Error: INGEST_KEY environment variable required with --ingest-endpoint.")
-                sys.exit(1)
-        else:
-            if not SUPABASE_URL:
-                print("Error: SUPABASE_URL environment variable required.")
-                print("Set it to your Supabase project URL (e.g., https://xxxxx.supabase.co)")
-                sys.exit(1)
-            if not SUPABASE_SERVICE_ROLE_KEY:
-                print("Error: SUPABASE_SERVICE_ROLE_KEY environment variable required.")
-                sys.exit(1)
-            if not OPENROUTER_API_KEY:
-                print("Error: OPENROUTER_API_KEY required for embedding generation.")
-                print("Get one at https://openrouter.ai/keys")
-                sys.exit(1)
-
-    if not args.raw and args.model == "openrouter" and not OPENROUTER_API_KEY:
-        print("Error: OPENROUTER_API_KEY environment variable required for summarization.")
-        print("Use --raw to skip summarization, or --model ollama for local inference.")
-        sys.exit(1)
+        if not LOCAL_INGEST_URL:
+            print("Error: OPEN_BRAIN_INGEST_URL is not set.")
+            sys.exit(1)
+        if not LOCAL_INGEST_KEY:
+            print("Error: OPEN_BRAIN_INGEST_KEY or MCP_ACCESS_KEY is not set.")
+            sys.exit(1)
 
     print(f"\nExtracting conversations from {args.zip_path}...")
     conversations = extract_conversations(args.zip_path)
@@ -610,8 +602,10 @@ def main():
 
     # Display run configuration
     mode = "DRY RUN" if args.dry_run else "LIVE"
-    ingest_mode = "custom endpoint" if args.ingest_endpoint else "Supabase direct insert"
+    ingest_mode = f"local endpoint ({LOCAL_INGEST_URL})"
     summarize_mode = "raw (no summarization)" if args.raw else f"{args.model}"
+    if args.model == "local" and not args.raw:
+        summarize_mode += f" ({LOCAL_LLM_MODEL})"
     if args.model == "ollama" and not args.raw:
         summarize_mode += f" ({args.ollama_model})"
     print(f"  Mode:        {mode}")
@@ -725,16 +719,17 @@ def main():
         for i, thought in enumerate(thoughts):
             content = f"[ChatGPT: {title} | {date_str}] {thought}"
 
-            if args.ingest_endpoint:
-                extra_metadata = {
-                    "chatgpt_title": title,
-                    "chatgpt_create_time": date_str,
-                    "chatgpt_conversation_hash": conv_id,
-                    "source_ref": metadata,
-                }
-                result = ingest_thought_endpoint(content, extra_metadata, full_text=user_text)
-            else:
-                result = ingest_thought_supabase(content, metadata)
+            extra_metadata = {
+                "chatgpt_title": title,
+                "chatgpt_create_time": date_str,
+                "chatgpt_conversation_hash": conv_id,
+                "chatgpt_conversation_id": chatgpt_id,
+                "chatgpt_conversation_url": metadata.get("conversation_url"),
+                "full_text": user_text,
+                "type": "chatgpt_conversation",
+                "topics": ["chatgpt", "import"],
+            }
+            result = ingest_thought_local(content, extra_metadata, occurred_at=date_str)
 
             if result.get("ok"):
                 ingested += 1
@@ -771,23 +766,7 @@ def main():
         print(f"  Errors:                 {errors}")
 
     # Cost estimation
-    if not args.raw and processed > 0:
-        # gpt-4o-mini via OpenRouter: ~$0.15/1M input, ~$0.60/1M output
-        # Rough estimate: avg 800 tokens input per conv, 200 tokens output
-        est_input_tokens = processed * 800
-        est_output_tokens = processed * 200
-        summarize_cost = (est_input_tokens * 0.15 / 1_000_000) + (est_output_tokens * 0.60 / 1_000_000)
-    else:
-        summarize_cost = 0
-
-    # Embedding cost: $0.02/1M tokens, ~100 tokens per thought
-    embedding_cost = thoughts_generated * 100 * 0.02 / 1_000_000
-    total_cost = summarize_cost + embedding_cost
-    print(f"  Est. API cost:          ${total_cost:.4f}")
-    if summarize_cost > 0:
-        print(f"    Summarization:        ${summarize_cost:.4f}")
-    if embedding_cost > 0:
-        print(f"    Embeddings:           ${embedding_cost:.4f}")
+    print("  Est. external API cost: $0.0000")
     print("─" * 60)
 
     if args.report and report_entries:

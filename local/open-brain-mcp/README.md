@@ -52,6 +52,7 @@ Default bind:
 - `http://127.0.0.1:8787/`
 - `http://127.0.0.1:8787/health`
 - `http://127.0.0.1:8787/mcp`
+- `http://127.0.0.1:8787/ingest/thought`
 
 ## Smoke Test
 
@@ -69,15 +70,38 @@ This verifies:
 
 ## Auth
 
-The MCP endpoint accepts:
+The MCP and ingest endpoints accept:
 
 - `?key=$MCP_ACCESS_KEY`
 - `x-access-key: $MCP_ACCESS_KEY`
 - `x-brain-key: $MCP_ACCESS_KEY`
 
+## HTTP Ingest
+
+The importer-friendly ingest route is:
+
+```bash
+POST /ingest/thought
+```
+
+Request body:
+
+```json
+{
+  "content": "A thought to store",
+  "metadata": {"source": "chatgpt"},
+  "source": "chatgpt",
+  "type": "chatgpt_conversation",
+  "tags": ["chatgpt", "import"],
+  "occurred_at": "2026-03-14"
+}
+```
+
 ## Notes
 
 - The service loads the repo root `.env` first and then `.env.open-brain-local` so app-specific values win.
+- `LLM_ENABLE_THINKING=false` is the intended default for structured local LLM calls.
+- Structured extraction uses Qwen tool calling rather than `response_format`.
 - The canonical embedding contract is `1536` dimensions, owned by `ob1-embedding`.
 - The schema migration is idempotent at the SQL object level, and the migration runner records applied filenames in `open_brain_schema_migrations`.
 - The real runtime env file is `.env.open-brain-local` and should remain untracked.

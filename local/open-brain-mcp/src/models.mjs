@@ -1,5 +1,53 @@
 import { config } from "./config.mjs";
 
+const metadataTool = {
+  type: "function",
+  function: {
+    name: "submit_metadata",
+    description: "Return structured metadata for a note in the personal knowledge base.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "people",
+        "action_items",
+        "dates_mentioned",
+        "topics",
+        "type",
+        "summary",
+        "source",
+      ],
+      properties: {
+        people: {
+          type: "array",
+          items: { type: "string" },
+        },
+        action_items: {
+          type: "array",
+          items: { type: "string" },
+        },
+        dates_mentioned: {
+          type: "array",
+          items: { type: "string" },
+        },
+        topics: {
+          type: "array",
+          items: { type: "string" },
+        },
+        type: {
+          type: "string",
+        },
+        summary: {
+          type: "string",
+        },
+        source: {
+          type: ["string", "null"],
+        },
+      },
+    },
+  },
+};
+
 function truncateText(text, limit = 240) {
   if (text.length <= limit) {
     return text;
@@ -43,6 +91,21 @@ function extractJsonPayload(text) {
     }
     return JSON.parse(trimmed.slice(start, end + 1));
   }
+}
+
+function extractToolArguments(response, expectedName) {
+  const toolCalls = response?.choices?.[0]?.message?.tool_calls;
+  if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+    throw new Error("Model did not return a tool call");
+  }
+
+  const call = toolCalls.find((entry) => entry?.function?.name === expectedName) ?? toolCalls[0];
+  const raw = call?.function?.arguments;
+  if (typeof raw !== "string" || raw.trim() === "") {
+    throw new Error("Tool call arguments were empty");
+  }
+
+  return extractJsonPayload(raw);
 }
 
 function sanitizeStringList(values) {
@@ -123,18 +186,19 @@ export async function extractMetadata(content, source) {
     model: config.llmModel,
     temperature: 0,
     max_tokens: config.metadataMaxTokens,
+    chat_template_kwargs: {
+      enable_thinking: config.llmEnableThinking,
+    },
+    tools: [metadataTool],
+    tool_choice: "required",
     messages: [
       {
         role: "system",
         content: [
           "You extract structured metadata for a personal knowledge base.",
-          "Return only valid JSON.",
-          "The JSON object must contain exactly these keys:",
-          "people, action_items, dates_mentioned, topics, type, summary, source.",
-          "Use arrays of strings for people, action_items, dates_mentioned, and topics.",
-          "Use a short string for type and summary.",
+          "Use the provided tool to return structured metadata.",
+          "Prefer empty arrays over invented values.",
           "Use null for source if unknown.",
-          "Do not include markdown, commentary, or reasoning.",
         ].join(" "),
       },
       {
@@ -147,8 +211,7 @@ export async function extractMetadata(content, source) {
     ],
   });
 
-  const message = response?.choices?.[0]?.message?.content;
-  const parsed = extractJsonPayload(normalizeChatContent(message));
+  const parsed = extractToolArguments(response, "submit_metadata");
 
   return {
     people: sanitizeStringList(parsed.people),
