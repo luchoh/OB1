@@ -369,7 +369,6 @@ def docling_request(base_url, path, chunker, *, pipeline="standard", force_ocr=N
         "convert_ocr_engine": DOCLING_OCR_ENGINE,
         "convert_ocr_lang": DOCLING_OCR_LANG,
         "convert_pipeline": pipeline,
-        "include_converted_doc": "true",
         "target_type": "inbody",
     }
 
