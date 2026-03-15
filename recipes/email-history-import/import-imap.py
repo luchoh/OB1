@@ -564,6 +564,9 @@ def main():
                     print(f"ERROR UID {uid}: {result.get('error')}", file=sys.stderr)
                     continue
 
+                if args.dry_run:
+                    continue
+
                 imported += 1
                 sync_log["ingested_ids"][record["dedupe_key"]] = record["date_iso"] or ""
         finally:
@@ -575,8 +578,9 @@ def main():
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 
-    sync_log["last_sync"] = datetime.now(tz=timezone.utc).isoformat()
-    save_sync_log(sync_log)
+    if not args.dry_run:
+        sync_log["last_sync"] = datetime.now(tz=timezone.utc).isoformat()
+        save_sync_log(sync_log)
 
     print("\n== Result ==")
     print(f"processed={processed}")
