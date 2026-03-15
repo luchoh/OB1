@@ -35,6 +35,60 @@ SYNC_LOG_PATH = RECIPE_DIR / "imap-sync-log.json"
 
 LOCAL_INGEST_URL = os.environ.get("OPEN_BRAIN_INGEST_URL") or "http://127.0.0.1:8787/ingest/thought"
 LOCAL_INGEST_KEY = os.environ.get("OPEN_BRAIN_INGEST_KEY") or os.environ.get("MCP_ACCESS_KEY", "")
+LOCAL_LLM_BASE = os.environ.get("LLM_BASE_URL", "http://10.10.10.101:8035/v1").rstrip("/")
+LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
+LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+
+THOUGHTS_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_thoughts",
+        "description": "Return durable thoughts worth storing from this email.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["thoughts"],
+            "properties": {
+                "thoughts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Up to 3 durable standalone thought strings.",
+                }
+            },
+        },
+    },
+}
+
+EMAIL_THOUGHT_PROMPT = """\
+You are turning an email into durable memory items for a personal knowledge base.
+
+Capture only information that will matter later:
+- decisions, commitments, requests, deadlines, or next steps
+- important attachments or deliverables being sent
+- project context, names, systems, or relationships
+- facts that the user would want to retrieve later without reopening the email
+
+Skip:
+- routine acknowledgements
+- pure forwarding boilerplate
+- empty logistics with no lasting value
+- low-signal transactional notices
+
+Each thought must:
+- stand alone without the original email open
+- be concrete and specific
+- mention people, projects, or artifacts when available
+- be 1-3 sentences
+
+Return a JSON object with exactly one key: "thoughts".
+The value must be an array of 0-3 real thought strings.
+If the email has no durable value, return {"thoughts": []}.
+"""
 
 
 class HtmlToText(HTMLParser):
@@ -90,6 +144,49 @@ def http_post_with_retry(url, headers, body, retries=2, timeout=120):
                 continue
             raise
     return None
+
+
+def extract_json_payload(text):
+    trimmed = text.strip()
+    if trimmed.startswith("```json"):
+        trimmed = trimmed[7:].strip()
+    elif trimmed.startswith("```"):
+        trimmed = trimmed[3:].strip()
+    if trimmed.endswith("```"):
+        trimmed = trimmed[:-3].strip()
+
+    try:
+        return json.loads(trimmed)
+    except json.JSONDecodeError:
+        start = trimmed.find("{")
+        end = trimmed.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(trimmed[start : end + 1])
+
+
+def extract_tool_arguments(response_json, expected_name):
+    try:
+        tool_calls = response_json["choices"][0]["message"]["tool_calls"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("Model did not return a tool call") from exc
+
+    if not isinstance(tool_calls, list) or not tool_calls:
+        raise ValueError("Model did not return a tool call")
+
+    call = None
+    for item in tool_calls:
+        if isinstance(item, dict) and item.get("function", {}).get("name") == expected_name:
+            call = item
+            break
+    if call is None:
+        call = tool_calls[0]
+
+    arguments = call.get("function", {}).get("arguments")
+    if not isinstance(arguments, str) or not arguments.strip():
+        raise ValueError("Tool call arguments were empty")
+
+    return extract_json_payload(arguments)
 
 
 def normalize_text(text):
@@ -436,6 +533,96 @@ def ingest_email(record, dry_run=False):
     return {"ok": True, "payload": payload}
 
 
+def distill_email_thoughts(record):
+    body_preview = record["content"][:12000]
+    resp = http_post_with_retry(
+        f"{LOCAL_LLM_BASE}/chat/completions",
+        headers={"Content-Type": "application/json"},
+        body={
+            "model": LOCAL_LLM_MODEL,
+            "temperature": 0,
+            "max_tokens": 700,
+            "chat_template_kwargs": {
+                "enable_thinking": LOCAL_LLM_ENABLE_THINKING,
+            },
+            "tools": [THOUGHTS_TOOL],
+            "tool_choice": "required",
+            "messages": [
+                {"role": "system", "content": EMAIL_THOUGHT_PROMPT},
+                {
+                    "role": "user",
+                    "content": "\n".join([
+                        f"Mailbox: {record['metadata'].get('mailbox') or '(unknown)'}",
+                        f"Sender: {record['metadata'].get('sender') or '(unknown)'}",
+                        f"Subject: {record['subject'] or '(no subject)'}",
+                        f"Date: {record['date_iso'] or '(unknown)'}",
+                        "",
+                        "Email content:",
+                        body_preview,
+                    ]),
+                },
+            ],
+        },
+        timeout=240,
+    )
+
+    if not resp or resp.status_code != 200:
+        status = resp.status_code if resp else "no response"
+        raise RuntimeError(f"Local email distillation failed ({status})")
+
+    result = extract_tool_arguments(resp.json(), "submit_thoughts")
+    thoughts = result.get("thoughts", [])
+    return [item.strip() for item in thoughts if isinstance(item, str) and item.strip()][:3]
+
+
+def ingest_email_thought(record, thought_text, index, dry_run=False):
+    if dry_run:
+        return {"ok": True, "dry_run": True}
+
+    resp = http_post_with_retry(
+        LOCAL_INGEST_URL,
+        headers={
+            "Content-Type": "application/json",
+            "x-access-key": LOCAL_INGEST_KEY,
+            "x-ingest-key": LOCAL_INGEST_KEY,
+        },
+        body={
+            "content": thought_text,
+            "metadata": {
+                "source": "imap",
+                "type": "email_thought",
+                "summary": thought_text[:280],
+                "topics": [record["metadata"].get("mailbox", "INBOX")],
+                "sender": record["metadata"].get("sender"),
+                "subject": record["metadata"].get("subject"),
+                "mailbox": record["metadata"].get("mailbox"),
+                "imap_uid": record["metadata"].get("imap_uid"),
+                "email_dedupe_key": record["dedupe_key"],
+                "thought_index": index,
+            },
+            "source": "imap",
+            "type": "email_thought",
+            "occurred_at": record["date_iso"],
+            "dedupe_key": f"{record['dedupe_key']}:thought:{index}",
+            "extract_metadata": False,
+        },
+        timeout=240,
+    )
+
+    if not resp:
+        return {"ok": False, "error": "No response from local OB1"}
+
+    try:
+        payload = resp.json()
+    except json.JSONDecodeError:
+        payload = {"raw_response": resp.text[:500]}
+
+    if resp.status_code not in (200, 201):
+        return {"ok": False, "status": resp.status_code, "error": payload.get("error") or payload}
+
+    return {"ok": True, "payload": payload}
+
+
 def parse_date_arg(value):
     return datetime.strptime(value, "%Y-%m-%d").date()
 
@@ -480,6 +667,7 @@ def parse_args():
     parser.add_argument("--strip-quotes", action="store_true", help="Trim quoted reply sections from message bodies.")
     parser.add_argument("--ignore-sync-log", action="store_true", help="Process messages even if they appear in imap-sync-log.json.")
     parser.add_argument("--skip-empty", action="store_true", help="Skip messages with no extracted body text.")
+    parser.add_argument("--no-distill", action="store_true", help="Store raw email records only, without durable thought extraction.")
     parser.add_argument("--verbose", action="store_true", help="Print sender and subject for each imported message.")
     return parser.parse_args()
 
@@ -510,6 +698,7 @@ def main():
 
     processed = 0
     imported = 0
+    distilled = 0
     skipped = {}
     failures = 0
 
@@ -565,10 +754,43 @@ def main():
                     continue
 
                 if args.dry_run:
+                    if not args.no_distill:
+                        try:
+                            thoughts = distill_email_thoughts(record)
+                            print(f"  distilled_thoughts={len(thoughts)}")
+                            if args.verbose:
+                                for index, thought in enumerate(thoughts):
+                                    print(f"    thought[{index}] {thought}")
+                        except Exception as exc:
+                            failures += 1
+                            print(f"ERROR UID {uid}: distillation failed: {exc}", file=sys.stderr)
                     continue
 
                 imported += 1
                 sync_log["ingested_ids"][record["dedupe_key"]] = record["date_iso"] or ""
+
+                if args.no_distill:
+                    continue
+
+                try:
+                    thoughts = distill_email_thoughts(record)
+                except Exception as exc:
+                    failures += 1
+                    print(f"ERROR UID {uid}: distillation failed: {exc}", file=sys.stderr)
+                    continue
+
+                if args.verbose:
+                    print(f"  distilled_thoughts={len(thoughts)}")
+                    for index, thought in enumerate(thoughts):
+                        print(f"    thought[{index}] {thought}")
+
+                for index, thought in enumerate(thoughts):
+                    result = ingest_email_thought(record, thought, index, dry_run=False)
+                    if not result["ok"]:
+                        failures += 1
+                        print(f"ERROR UID {uid}: thought ingest failed: {result.get('error')}", file=sys.stderr)
+                        continue
+                    distilled += 1
         finally:
             try:
                 client.logout()
@@ -585,6 +807,7 @@ def main():
     print("\n== Result ==")
     print(f"processed={processed}")
     print(f"imported={imported}")
+    print(f"distilled={distilled}")
     print(f"failures={failures}")
     for key in sorted(skipped):
         print(f"skipped_{key}={skipped[key]}")

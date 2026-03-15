@@ -18,6 +18,9 @@ The importer is idempotent:
 - each message writes with a stable mailbox/UID-based `dedupe_key`
 - successful runs are also recorded in `imap-sync-log.json`
 
+By default the importer also distills each email into up to 3 durable `email_thought` entries using the local Qwen endpoint.
+Use `--no-distill` if you want raw email records only.
+
 ## Prerequisites
 
 - working local OB1 setup
@@ -110,6 +113,7 @@ You can search for any email content using the local OB1 MCP server's `search_th
 - The importer uses IMAP `SEARCH` with the explicit filters you provide.
 - `--since` and `--before` are applied through IMAP search and re-checked locally after parsing.
 - The importer writes with `extract_metadata=false` because sender, subject, date, mailbox, and flags are already structured and large mailboxes should not pay an LLM extraction cost per message.
+- Distillation is enabled by default and creates separate `email_thought` rows linked back to the source email with stable dedupe keys.
 - Attachments are ignored; the importer only ingests message body text.
 - The current search flags are `SINCE`, `BEFORE`, `UNSEEN`, `FROM`, `SUBJECT`, and `TEXT`.
 
