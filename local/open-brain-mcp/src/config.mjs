@@ -128,34 +128,17 @@ async function discoverConsulService(consul, serviceName) {
   const payload = await response.json();
   const entry = payload?.[0];
   const service = entry?.Service ?? {};
-  const node = entry?.Node ?? {};
-  const address = service.Address || node.Address;
+  const address = service.Address || entry?.Node?.Address;
   const port = service.Port;
 
   if (!address || !port) {
     throw new Error(`Consul service ${serviceName} is missing address/port`);
   }
 
-  const traefikHost = (service.Tags ?? [])
-    .map((tag) => tag.match(/Host\(`([^`]+)`\)/)?.[1] ?? null)
-    .find(Boolean);
-
-  const consulHost = consul.addr ? new URL(consul.addr).hostname : "";
-  const consulParts = consulHost.split(".");
-  const nodeName = node.Node;
-  const preferredHost = traefikHost
-    ?? (
-      nodeName
-      && !nodeName.includes(".")
-      && consulParts.length > 1
-        ? `${nodeName}.${consulParts.slice(1).join(".")}`
-        : address
-    );
-
   return {
-    address: preferredHost,
+    address,
     port,
-    rootUrl: traefikHost ? `https://${traefikHost}` : `http://${preferredHost}:${port}`,
+    rootUrl: `http://${address}:${port}`,
   };
 }
 

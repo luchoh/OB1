@@ -18,10 +18,7 @@ consul_service_address_port() {
   SERVICE_NAME="$service_name" python3 - <<'PY'
 import json
 import os
-import re
 import ssl
-import sys
-import urllib.parse
 import urllib.request
 
 consul_addr = os.environ["CONSUL_HTTP_ADDR"].rstrip("/")
@@ -56,28 +53,13 @@ if not payload:
     raise SystemExit(f"No passing Consul instances for {service_name}")
 
 service = payload[0].get("Service", {})
-node = payload[0].get("Node", {})
-address = service.get("Address") or node.get("Address")
+address = service.get("Address") or payload[0].get("Node", {}).get("Address")
 port = service.get("Port")
 
 if not address or not port:
     raise SystemExit(f"Consul service {service_name} is missing address/port")
 
-preferred_host = None
-for tag in service.get("Tags") or []:
-    match = re.search(r"Host\\(`([^`]+)`\\)", tag)
-    if match:
-        preferred_host = match.group(1)
-        break
-
-if not preferred_host:
-    consul_host = urllib.parse.urlparse(consul_addr).hostname or ""
-    parts = consul_host.split(".")
-    node_name = node.get("Node")
-    if node_name and "." not in node_name and len(parts) > 1:
-        preferred_host = f"{node_name}.{'.'.join(parts[1:])}"
-
-print(f"{preferred_host or address}:{port}")
+print(f"{address}:{port}")
 PY
 }
 
@@ -92,9 +74,7 @@ consul_service_root_url() {
   SERVICE_NAME="$service_name" python3 - <<'PY'
 import json
 import os
-import re
 import ssl
-import urllib.parse
 import urllib.request
 
 consul_addr = os.environ["CONSUL_HTTP_ADDR"].rstrip("/")
@@ -129,27 +109,13 @@ if not payload:
     raise SystemExit(f"No passing Consul instances for {service_name}")
 
 service = payload[0].get("Service", {})
-node = payload[0].get("Node", {})
-address = service.get("Address") or node.get("Address")
+address = service.get("Address") or payload[0].get("Node", {}).get("Address")
 port = service.get("Port")
 
 if not address or not port:
     raise SystemExit(f"Consul service {service_name} is missing address/port")
 
-for tag in service.get("Tags") or []:
-    match = re.search(r"Host\\(`([^`]+)`\\)", tag)
-    if match:
-        print(f"https://{match.group(1)}")
-        raise SystemExit(0)
-
-consul_host = urllib.parse.urlparse(consul_addr).hostname or ""
-parts = consul_host.split(".")
-node_name = node.get("Node")
-preferred_host = address
-if node_name and "." not in node_name and len(parts) > 1:
-    preferred_host = f"{node_name}.{'.'.join(parts[1:])}"
-
-print(f"http://{preferred_host}:{port}")
+print(f"http://{address}:{port}")
 PY
 }
 

@@ -10,9 +10,7 @@ import hashlib
 import json
 import mimetypes
 import os
-import re
 import time
-from urllib.parse import urlparse
 from functools import lru_cache
 from pathlib import Path
 
@@ -200,27 +198,13 @@ def discover_consul_service_base_url(service_name):
     if not payload:
         raise RuntimeError(f"Could not discover a passing Consul service: {service_name}")
 
-    entry = payload[0]
-    service = entry.get("Service", {})
-    node = entry.get("Node", {})
-    address = service.get("Address") or node.get("Address")
+    service = payload[0].get("Service", {})
+    address = service.get("Address") or payload[0].get("Node", {}).get("Address")
     port = service.get("Port")
     if not address or not port:
         raise RuntimeError(f"Consul service {service_name} is missing address/port")
 
-    for tag in service.get("Tags") or []:
-        match = re.search(r"Host\(`([^`]+)`\)", tag)
-        if match:
-            return f"https://{match.group(1)}"
-
-    consul_host = urlparse(CONSUL_HTTP_ADDR).hostname or ""
-    parts = consul_host.split(".")
-    node_name = node.get("Node")
-    preferred_host = address
-    if node_name and "." not in node_name and len(parts) > 1:
-        preferred_host = f"{node_name}.{'.'.join(parts[1:])}"
-
-    return f"http://{preferred_host}:{port}"
+    return f"http://{address}:{port}"
 
 
 def local_llm_base_url():
