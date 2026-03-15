@@ -12,6 +12,7 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 - Product spec: [`docs/05-local-network-prd.md`](/Users/luchoh/Dev/OB1/docs/05-local-network-prd.md)
 - Verification script: [`scripts/verify-open-brain-local.sh`](/Users/luchoh/Dev/OB1/scripts/verify-open-brain-local.sh)
 - End-to-end smoke test: [`scripts/smoke-open-brain-local-mcp.sh`](/Users/luchoh/Dev/OB1/scripts/smoke-open-brain-local-mcp.sh)
+- Managed-service handoff: [`docs/09-open-brain-local-service-handoff.md`](/Users/luchoh/Dev/OB1/docs/09-open-brain-local-service-handoff.md)
 
 ## Canonical Services
 

@@ -1,0 +1,34 @@
+{
+  "service": {
+    "name": "open-brain-local",
+    "id": "open-brain-local-8787",
+    "address": "10.10.10.101",
+    "port": 8787,
+    "tags": [
+      "ob1",
+      "mcp",
+      "streamable-http",
+      "local-only",
+      "postgresql",
+      "qwen"
+    ],
+    "meta": {
+      "environment": "local",
+      "transport": "streamable-http",
+      "health_path": "/health",
+      "mcp_path": "/mcp",
+      "ingest_path": "/ingest/thought"
+    },
+    "checks": [
+      {
+        "id": "open-brain-local-health",
+        "name": "open-brain-local /health",
+        "http": "http://127.0.0.1:8787/health",
+        "method": "GET",
+        "interval": "15s",
+        "timeout": "5s",
+        "deregister_critical_service_after": "2m"
+      }
+    ]
+  }
+}

@@ -5,3 +5,5 @@ node_modules/
 .open-brain-local-smoke.log
 .mcp.json
 chatgpt-sync-log.json
+__pycache__/
+*.pyc

@@ -43,8 +43,7 @@ This applies the SQL files in [`local/open-brain-mcp/migrations`](/Users/luchoh/
 ## Run
 
 ```bash
-cd local/open-brain-mcp
-npm start
+./scripts/run-open-brain-local.sh
 ```
 
 Default bind:
@@ -109,3 +108,4 @@ Request body:
 - Importers can set `extract_metadata=false` when they already have structured metadata and only need embeddings plus storage.
 - The schema migration is idempotent at the SQL object level, and the migration runner records applied filenames in `open_brain_schema_migrations`.
 - The real runtime env file is `.env.open-brain-local` and should remain untracked.
+- Managed-service handoff details are in [docs/09-open-brain-local-service-handoff.md](/Users/luchoh/Dev/OB1/docs/09-open-brain-local-service-handoff.md#L1).
