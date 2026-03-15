@@ -11,9 +11,11 @@ import getpass
 import hashlib
 import imaplib
 import json
+import mimetypes
 import os
 import re
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from email import policy
@@ -21,6 +23,10 @@ from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
 from html.parser import HTMLParser
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 try:
     import requests
@@ -32,16 +38,27 @@ except ImportError:
 
 RECIPE_DIR = Path(__file__).resolve().parent
 SYNC_LOG_PATH = RECIPE_DIR / "imap-sync-log.json"
+SYNC_SCHEMA_VERSION = 2
 
-LOCAL_INGEST_URL = os.environ.get("OPEN_BRAIN_INGEST_URL") or "http://127.0.0.1:8787/ingest/thought"
+LOCAL_INGEST_URL = os.environ.get("OPEN_BRAIN_INGEST_URL") or "http://localhost:8787/ingest/thought"
 LOCAL_INGEST_KEY = os.environ.get("OPEN_BRAIN_INGEST_KEY") or os.environ.get("MCP_ACCESS_KEY", "")
-LOCAL_LLM_BASE = os.environ.get("LLM_BASE_URL", "http://10.10.10.101:8035/v1").rstrip("/")
 LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
 LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
     "1",
     "true",
     "yes",
     "on",
+)
+
+from recipes.shared_docling import (
+    discover_docling_base_url,
+    docling_chunk,
+    file_content_type,
+    ingest_thought,
+    local_llm_base_url,
+    sha256_text as shared_sha256_text,
+    summarize_document,
+    truncate_text,
 )
 
 THOUGHTS_TOOL = {
@@ -128,6 +145,23 @@ def load_sync_log():
 def save_sync_log(log):
     with open(SYNC_LOG_PATH, "w") as f:
         json.dump(log, f, indent=2)
+
+
+def sync_entry_version(entry):
+    if isinstance(entry, dict):
+        try:
+            return int(entry.get("schema_version", 1))
+        except (TypeError, ValueError):
+            return 1
+    return 1 if entry else 0
+
+
+def sync_entry_payload(record):
+    return {
+        "date_iso": record["date_iso"] or "",
+        "schema_version": SYNC_SCHEMA_VERSION,
+        "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+    }
 
 
 def http_post_with_retry(url, headers, body, retries=2, timeout=120):
@@ -297,7 +331,7 @@ def iso_date_from_email(message):
     return parsed.astimezone(timezone.utc).isoformat()
 
 
-def build_content(subject, sender, recipients, date_iso, mailbox, flags, body):
+def build_content(subject, sender, recipients, date_iso, mailbox, flags, body, attachment_names):
     lines = [
         f"Subject: {subject or '(no subject)'}",
         f"From: {sender or '(unknown)'}",
@@ -305,6 +339,7 @@ def build_content(subject, sender, recipients, date_iso, mailbox, flags, body):
         f"Date: {date_iso or '(unknown)'}",
         f"Mailbox: {mailbox}",
         f"Flags: {', '.join(flags) if flags else '(none)'}",
+        f"Attachments: {', '.join(attachment_names) if attachment_names else '(none)'}",
         "",
         body or "(empty body)",
     ]
@@ -316,7 +351,54 @@ def imap_key(account_hash, mailbox, uidvalidity, uid):
 
 
 def sha256_text(value):
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return shared_sha256_text(value)
+
+
+def guess_attachment_filename(raw_name, index, content_type):
+    if raw_name:
+        candidate = Path(str(raw_name)).name.replace("\x00", "").strip()
+        if candidate:
+            return candidate
+
+    extension = mimetypes.guess_extension(content_type or "") or ".bin"
+    return f"attachment-{index}{extension}"
+
+
+def extract_attachments(message):
+    attachments = []
+
+    for index, part in enumerate(message.walk()):
+        if part.is_multipart():
+            continue
+
+        disposition = (part.get_content_disposition() or "").lower()
+        raw_name = part.get_filename()
+        content_type = part.get_content_type()
+
+        if disposition != "attachment" and not raw_name:
+            continue
+        if disposition != "attachment" and content_type in {"text/plain", "text/html"}:
+            continue
+
+        payload = part.get_payload(decode=True)
+        if not payload:
+            continue
+
+        filename = guess_attachment_filename(raw_name, index, content_type)
+        attachments.append(
+            {
+                "index": len(attachments),
+                "filename": filename,
+                "content_type": content_type or "application/octet-stream",
+                "content_id": header_value(part, "Content-ID") or None,
+                "disposition": disposition or "inline",
+                "size_bytes": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "data": payload,
+            }
+        )
+
+    return attachments
 
 
 def connect_imap(host, port, username, password, use_ssl=True):
@@ -430,6 +512,8 @@ def fetch_message_bytes(client, uid):
 
 def parse_imap_record(uid, raw_bytes, mailbox, flags, uidvalidity, account_hash, strip_quotes=False):
     message = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+    attachments = extract_attachments(message)
+    attachment_names = [item["filename"] for item in attachments]
 
     sender_addresses = parse_addresses(header_value(message, "From"))
     to_addresses = parse_addresses(header_value(message, "To"))
@@ -458,6 +542,7 @@ def parse_imap_record(uid, raw_bytes, mailbox, flags, uidvalidity, account_hash,
         mailbox=mailbox,
         flags=flags,
         body=body,
+        attachment_names=attachment_names,
     )
 
     summary = subject or (normalize_text(body).split("\n", 1)[0] if body else "(no subject)")
@@ -466,6 +551,7 @@ def parse_imap_record(uid, raw_bytes, mailbox, flags, uidvalidity, account_hash,
     metadata = {
         "source": "imap",
         "type": "email",
+        "retrieval_role": "source",
         "summary": summary,
         "topics": [mailbox, *flags],
         "sender": sender_email or None,
@@ -477,6 +563,8 @@ def parse_imap_record(uid, raw_bytes, mailbox, flags, uidvalidity, account_hash,
         "date": date_iso,
         "mailbox": mailbox,
         "flags": flags,
+        "attachment_count": len(attachments),
+        "attachment_names": attachment_names,
         "imap_uid": uid,
         "imap_uidvalidity": uidvalidity,
         "imap_account_hash": account_hash,
@@ -491,7 +579,8 @@ def parse_imap_record(uid, raw_bytes, mailbox, flags, uidvalidity, account_hash,
         "content": content,
         "metadata": metadata,
         "subject": subject,
-        "dedupe_key": dedupe_key
+        "dedupe_key": dedupe_key,
+        "attachments": attachments,
     }
 
 
@@ -535,8 +624,9 @@ def ingest_email(record, dry_run=False):
 
 def distill_email_thoughts(record):
     body_preview = record["content"][:12000]
+    attachment_names = record["metadata"].get("attachment_names") or []
     resp = http_post_with_retry(
-        f"{LOCAL_LLM_BASE}/chat/completions",
+        f"{local_llm_base_url()}/chat/completions",
         headers={"Content-Type": "application/json"},
         body={
             "model": LOCAL_LLM_MODEL,
@@ -556,6 +646,7 @@ def distill_email_thoughts(record):
                         f"Sender: {record['metadata'].get('sender') or '(unknown)'}",
                         f"Subject: {record['subject'] or '(no subject)'}",
                         f"Date: {record['date_iso'] or '(unknown)'}",
+                        f"Attachments: {', '.join(attachment_names) if attachment_names else '(none)'}",
                         "",
                         "Email content:",
                         body_preview,
@@ -591,6 +682,7 @@ def ingest_email_thought(record, thought_text, index, dry_run=False):
             "metadata": {
                 "source": "imap",
                 "type": "email_thought",
+                "retrieval_role": "distilled",
                 "summary": thought_text[:280],
                 "topics": [record["metadata"].get("mailbox", "INBOX")],
                 "sender": record["metadata"].get("sender"),
@@ -623,12 +715,129 @@ def ingest_email_thought(record, thought_text, index, dry_run=False):
     return {"ok": True, "payload": payload}
 
 
+def attachment_virtual_path(record, attachment):
+    mailbox = record["metadata"].get("mailbox") or "INBOX"
+    uid = record["metadata"].get("imap_uid") or record["uid"]
+    return f"imap://{mailbox}/{uid}/{attachment['filename']}"
+
+
+def process_attachment(record, attachment, *, docling_base_url, chunker, dry_run=False, no_summaries=False, verbose=False):
+    with tempfile.TemporaryDirectory(prefix="ob1-imap-attachment-") as tmpdir:
+        temp_path = Path(tmpdir) / attachment["filename"]
+        temp_path.write_bytes(attachment["data"])
+
+        chunk_payload = docling_chunk(docling_base_url, temp_path, chunker, force_ocr=True)
+        chunks = chunk_payload.get("chunks", [])
+        document_text = "\n\n".join(
+            chunk.get("text", "").strip()
+            for chunk in chunks
+            if isinstance(chunk.get("text"), str) and chunk.get("text").strip()
+        )
+
+        summary_thoughts = []
+        if not no_summaries and document_text.strip():
+            summary_thoughts = summarize_document(attachment["filename"], document_text)
+            if verbose:
+                print(f"    attachment_summary_thoughts={len(summary_thoughts)}")
+                for idx, thought in enumerate(summary_thoughts):
+                    print(f"      attachment_summary[{idx}] {thought}")
+        elif verbose:
+            print("    attachment_summary_thoughts=skipped")
+
+        if dry_run:
+            return {
+                "chunk_count": len(chunks),
+                "summary_count": len(summary_thoughts),
+                "attachment_sha256": attachment["sha256"],
+            }
+
+        mailbox = record["metadata"].get("mailbox")
+        shared_metadata = {
+            "source": "imap_attachment",
+            "email_dedupe_key": record["dedupe_key"],
+            "email_subject": record["metadata"].get("subject"),
+            "email_sender": record["metadata"].get("sender"),
+            "mailbox": mailbox,
+            "imap_uid": record["metadata"].get("imap_uid"),
+            "attachment_filename": attachment["filename"],
+            "attachment_content_type": attachment["content_type"],
+            "attachment_content_id": attachment["content_id"],
+            "attachment_size_bytes": attachment["size_bytes"],
+            "attachment_index": attachment["index"],
+            "attachment_sha256": attachment["sha256"],
+            "document_filename": attachment["filename"],
+            "document_path": attachment_virtual_path(record, attachment),
+            "document_sha256": attachment["sha256"],
+            "document_mimetype": attachment["content_type"] or file_content_type(temp_path),
+            "document_size_bytes": attachment["size_bytes"],
+        }
+        dedupe_seed = f"{record['dedupe_key']}:attachment:{attachment['sha256']}"
+
+        ingested_chunks = 0
+        for chunk in chunks:
+            headings = chunk.get("headings") or []
+            origin = (chunk.get("metadata") or {}).get("origin") or {}
+            metadata = {
+                **shared_metadata,
+                "type": "document_chunk",
+                "retrieval_role": "source",
+                "summary": truncate_text(chunk.get("text", "").strip(), 280),
+                "topics": headings,
+                "document_chunk_index": chunk.get("chunk_index"),
+                "document_chunk_count": len(chunks),
+                "document_page_numbers": chunk.get("page_numbers") or [],
+                "document_headings": headings,
+                "document_doc_items": chunk.get("doc_items") or [],
+                "docling_chunker": chunker,
+                "docling_origin": origin,
+            }
+            ingest_thought(
+                chunk.get("text", "").strip(),
+                metadata,
+                dedupe_key=sha256_text(f"{dedupe_seed}:chunk:{chunk.get('chunk_index')}"),
+                thought_type="document_chunk",
+                source="imap_attachment",
+                tags=headings,
+                extract_metadata=False,
+            )
+            ingested_chunks += 1
+
+        ingested_summaries = 0
+        for idx, thought in enumerate(summary_thoughts):
+            metadata = {
+                **shared_metadata,
+                "type": "document_summary",
+                "retrieval_role": "distilled",
+                "summary": thought,
+                "topics": [],
+                "document_chunk_count": len(chunks),
+                "docling_chunker": chunker,
+            }
+            ingest_thought(
+                thought,
+                metadata,
+                dedupe_key=sha256_text(f"{dedupe_seed}:summary:{idx}"),
+                thought_type="document_summary",
+                source="imap_attachment",
+                tags=["attachment", "summary"],
+                extract_metadata=False,
+            )
+            ingested_summaries += 1
+
+        return {
+            "chunk_count": ingested_chunks,
+            "summary_count": ingested_summaries,
+            "attachment_sha256": attachment["sha256"],
+        }
+
+
 def parse_date_arg(value):
     return datetime.strptime(value, "%Y-%m-%d").date()
 
 
 def should_skip(record, sync_log, args):
-    if not args.ignore_sync_log and record["dedupe_key"] in sync_log["ingested_ids"]:
+    sync_entry = sync_log["ingested_ids"].get(record["dedupe_key"])
+    if not args.ignore_sync_log and sync_entry_version(sync_entry) >= SYNC_SCHEMA_VERSION:
         return "already_imported"
 
     if args.since and record["date_iso"]:
@@ -651,7 +860,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Import an IMAP mailbox into local OB1.")
     parser.add_argument("--host", default=os.environ.get("IMAP_HOST"), help="IMAP server host.")
     parser.add_argument("--port", type=int, default=int(os.environ.get("IMAP_PORT", "993")), help="IMAP server port.")
-    parser.add_argument("--username", default=os.environ.get("IMAP_USERNAME"), help="IMAP username.")
+    parser.add_argument("--username", default=os.environ.get("IMAP_USERNAME") or os.environ.get("IMAP_ACCOUNT"), help="IMAP username.")
     parser.add_argument("--password", default=os.environ.get("IMAP_PASSWORD"), help="IMAP password. If omitted, prompt securely.")
     parser.add_argument("--mailbox", default=os.environ.get("IMAP_MAILBOX", "INBOX"), help="Mailbox to import.")
     parser.add_argument("--no-ssl", action="store_true", help="Use plain IMAP instead of IMAPS.")
@@ -668,6 +877,15 @@ def parse_args():
     parser.add_argument("--ignore-sync-log", action="store_true", help="Process messages even if they appear in imap-sync-log.json.")
     parser.add_argument("--skip-empty", action="store_true", help="Skip messages with no extracted body text.")
     parser.add_argument("--no-distill", action="store_true", help="Store raw email records only, without durable thought extraction.")
+    parser.add_argument("--no-attachments", action="store_true", help="Skip attachment parsing and Docling-backed attachment ingest.")
+    parser.add_argument(
+        "--attachment-chunker",
+        choices=("hierarchical", "hybrid"),
+        default="hierarchical",
+        help="Docling chunker to use for attachments. hierarchical is the current safe default.",
+    )
+    parser.add_argument("--no-attachment-summaries", action="store_true", help="Skip whole-document summary extraction for attachments.")
+    parser.add_argument("--docling-url", help="Override the Docling base URL instead of using env/Consul discovery.")
     parser.add_argument("--verbose", action="store_true", help="Print sender and subject for each imported message.")
     return parser.parse_args()
 
@@ -694,11 +912,24 @@ def main():
     print(f"port={args.port}")
     print(f"mailbox={args.mailbox}")
     print(f"ingest_url={LOCAL_INGEST_URL}")
+    if args.no_attachments:
+        print("docling_base_url=disabled")
+    else:
+        try:
+            docling_base_url = discover_docling_base_url(args.docling_url)
+        except Exception as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        print(f"docling_base_url={docling_base_url}")
+        print(f"attachment_chunker={args.attachment_chunker}")
     print(f"dry_run={args.dry_run}")
 
     processed = 0
     imported = 0
     distilled = 0
+    attachment_files = 0
+    attachment_chunks = 0
+    attachment_summaries = 0
     skipped = {}
     failures = 0
 
@@ -746,6 +977,10 @@ def main():
                     sender = record["metadata"].get("sender") or "(unknown)"
                     subject = record["subject"] or "(no subject)"
                     print(f"- UID {uid} | {sender} | {subject}")
+                    if record["attachments"]:
+                        print(f"  attachments={len(record['attachments'])}")
+                        for attachment in record["attachments"]:
+                            print(f"    attachment[{attachment['index']}] {attachment['filename']} ({attachment['content_type']}, {attachment['size_bytes']} bytes)")
 
                 result = ingest_email(record, dry_run=args.dry_run)
                 if not result["ok"]:
@@ -753,7 +988,30 @@ def main():
                     print(f"ERROR UID {uid}: {result.get('error')}", file=sys.stderr)
                     continue
 
+                message_failed = False
+
                 if args.dry_run:
+                    if not args.no_attachments:
+                        for attachment in record["attachments"]:
+                            try:
+                                attachment_result = process_attachment(
+                                    record,
+                                    attachment,
+                                    docling_base_url=docling_base_url,
+                                    chunker=args.attachment_chunker,
+                                    dry_run=True,
+                                    no_summaries=args.no_attachment_summaries,
+                                    verbose=args.verbose,
+                                )
+                                attachment_files += 1
+                                attachment_chunks += attachment_result["chunk_count"]
+                                attachment_summaries += attachment_result["summary_count"]
+                            except Exception as exc:
+                                failures += 1
+                                print(
+                                    f"ERROR UID {uid}: attachment {attachment['filename']} processing failed: {exc}",
+                                    file=sys.stderr,
+                                )
                     if not args.no_distill:
                         try:
                             thoughts = distill_email_thoughts(record)
@@ -767,14 +1025,39 @@ def main():
                     continue
 
                 imported += 1
-                sync_log["ingested_ids"][record["dedupe_key"]] = record["date_iso"] or ""
+
+                if not args.no_attachments:
+                    for attachment in record["attachments"]:
+                        try:
+                            attachment_result = process_attachment(
+                                record,
+                                attachment,
+                                docling_base_url=docling_base_url,
+                                chunker=args.attachment_chunker,
+                                dry_run=False,
+                                no_summaries=args.no_attachment_summaries,
+                                verbose=args.verbose,
+                            )
+                            attachment_files += 1
+                            attachment_chunks += attachment_result["chunk_count"]
+                            attachment_summaries += attachment_result["summary_count"]
+                        except Exception as exc:
+                            message_failed = True
+                            failures += 1
+                            print(
+                                f"ERROR UID {uid}: attachment {attachment['filename']} processing failed: {exc}",
+                                file=sys.stderr,
+                            )
 
                 if args.no_distill:
+                    if not message_failed:
+                        sync_log["ingested_ids"][record["dedupe_key"]] = sync_entry_payload(record)
                     continue
 
                 try:
                     thoughts = distill_email_thoughts(record)
                 except Exception as exc:
+                    message_failed = True
                     failures += 1
                     print(f"ERROR UID {uid}: distillation failed: {exc}", file=sys.stderr)
                     continue
@@ -787,10 +1070,14 @@ def main():
                 for index, thought in enumerate(thoughts):
                     result = ingest_email_thought(record, thought, index, dry_run=False)
                     if not result["ok"]:
+                        message_failed = True
                         failures += 1
                         print(f"ERROR UID {uid}: thought ingest failed: {result.get('error')}", file=sys.stderr)
                         continue
                     distilled += 1
+
+                if not message_failed:
+                    sync_log["ingested_ids"][record["dedupe_key"]] = sync_entry_payload(record)
         finally:
             try:
                 client.logout()
@@ -808,6 +1095,9 @@ def main():
     print(f"processed={processed}")
     print(f"imported={imported}")
     print(f"distilled={distilled}")
+    print(f"attachment_files={attachment_files}")
+    print(f"attachment_chunks={attachment_chunks}")
+    print(f"attachment_summaries={attachment_summaries}")
     print(f"failures={failures}")
     for key in sorted(skipped):
         print(f"skipped_{key}={skipped[key]}")

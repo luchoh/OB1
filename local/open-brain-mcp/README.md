@@ -48,10 +48,10 @@ This applies the SQL files in [`local/open-brain-mcp/migrations`](/Users/luchoh/
 
 Default bind:
 
-- `http://127.0.0.1:8787/`
-- `http://127.0.0.1:8787/health`
-- `http://127.0.0.1:8787/mcp`
-- `http://127.0.0.1:8787/ingest/thought`
+- `http://localhost:8787/`
+- `http://localhost:8787/health`
+- `http://localhost:8787/mcp`
+- `http://localhost:8787/ingest/thought`
 
 ## Smoke Test
 
@@ -106,6 +106,7 @@ Request body:
 - The canonical embedding contract is `1536` dimensions, owned by `ob1-embedding`.
 - Importers should supply `dedupe_key` for idempotent writes when identical text can appear in different sources.
 - Importers can set `extract_metadata=false` when they already have structured metadata and only need embeddings plus storage.
+- By default, `search_thoughts` prefers distilled memory rows and falls back to raw source rows. Callers can still force raw/source searches with an explicit metadata filter.
 - The schema migration is idempotent at the SQL object level, and the migration runner records applied filenames in `open_brain_schema_migrations`.
 - The real runtime env file is `.env.open-brain-local` and should remain untracked.
 - Managed-service handoff details are in [docs/09-open-brain-local-service-handoff.md](/Users/luchoh/Dev/OB1/docs/09-open-brain-local-service-handoff.md#L1).

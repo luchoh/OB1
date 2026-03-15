@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+source "$ROOT_DIR/scripts/lib/consul.sh"
+
 if [[ -f ".env.open-brain-local" ]]; then
   set -a
   # shellcheck disable=SC1091
@@ -18,25 +20,28 @@ if [[ -f ".env" ]]; then
   set +a
 fi
 
-LLM_BASE_URL="${LLM_BASE_URL:-http://10.10.10.101:8035/v1}"
-LLM_HEALTH_URL="${LLM_HEALTH_URL:-http://10.10.10.101:8035/health}"
+CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-https://consul.lincoln.luchoh.net}"
+CONSUL_SKIP_TLS_VERIFY="${CONSUL_SKIP_TLS_VERIFY:-false}"
+CONSUL_FORCE_DISCOVERY="${CONSUL_FORCE_DISCOVERY:-false}"
+LLM_BASE_URL="${LLM_BASE_URL:-}"
+LLM_HEALTH_URL="${LLM_HEALTH_URL:-}"
 LLM_MODEL="${LLM_MODEL:-mlx-community/Qwen3.5-397B-A17B-nvfp4}"
 
-EMBEDDING_BASE_URL="${EMBEDDING_BASE_URL:-http://10.10.10.101:8082/v1}"
-EMBEDDING_HEALTH_URL="${EMBEDDING_HEALTH_URL:-http://10.10.10.101:8082/health}"
+EMBEDDING_BASE_URL="${EMBEDDING_BASE_URL:-}"
+EMBEDDING_HEALTH_URL="${EMBEDDING_HEALTH_URL:-}"
 EMBEDDING_MODEL="${EMBEDDING_MODEL:-mlx-community/Qwen3-Embedding-8B-mxfp8}"
 EXPECTED_EMBEDDING_DIMENSION="${EXPECTED_EMBEDDING_DIMENSION:-1536}"
 UNSUPPORTED_EMBEDDING_DIMENSION="${UNSUPPORTED_EMBEDDING_DIMENSION:-3072}"
-DOCLING_BASE_URL="${DOCLING_BASE_URL:-http://10.10.10.100:5001}"
-DOCLING_HEALTH_URL="${DOCLING_HEALTH_URL:-http://10.10.10.100:5001/health}"
-CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-http://127.0.0.1:8500}"
+DOCLING_BASE_URL="${DOCLING_BASE_URL:-}"
+DOCLING_HEALTH_URL="${DOCLING_HEALTH_URL:-}"
 CONSUL_HTTP_TOKEN="${CONSUL_HTTP_TOKEN:-}"
 LLM_SERVICE_NAME="${OPEN_BRAIN_LLM_SERVICE_NAME:-mlx-server}"
 EMBEDDING_SERVICE_NAME="${OPEN_BRAIN_EMBEDDING_SERVICE_NAME:-ob1-embedding}"
 DOCLING_SERVICE_NAME="${DOCLING_SERVICE_NAME:-docling}"
+CONSUL_POSTGRES_SERVICE="${CONSUL_POSTGRES_SERVICE:-postgresql}"
 
-PGHOST="${PGHOST:-10.10.10.100}"
-PGPORT="${PGPORT:-5432}"
+PGHOST="${PGHOST:-}"
+PGPORT="${PGPORT:-}"
 PGDATABASE="${PGDATABASE:-ob1}"
 PGUSER="${PGUSER:-${POSTGRES_USER:-ob1}}"
 PGPASSWORD="${PGPASSWORD:-${POSTGRES_PASSWORD:-}}"
@@ -50,9 +55,36 @@ export UNSUPPORTED_EMBEDDING_DIMENSION
 export DOCLING_BASE_URL
 export CONSUL_HTTP_ADDR
 export CONSUL_HTTP_TOKEN
+export CONSUL_SKIP_TLS_VERIFY
 export LLM_SERVICE_NAME
 export EMBEDDING_SERVICE_NAME
 export DOCLING_SERVICE_NAME
+
+if consul_bool_is_true "$CONSUL_FORCE_DISCOVERY" || [[ -z "$LLM_BASE_URL" || -z "$LLM_HEALTH_URL" ]]; then
+  llm_service_url="$(consul_service_url "$LLM_SERVICE_NAME")"
+  LLM_BASE_URL="${llm_service_url}/v1"
+  LLM_HEALTH_URL="${llm_service_url}/health"
+fi
+
+if consul_bool_is_true "$CONSUL_FORCE_DISCOVERY" || [[ -z "$EMBEDDING_BASE_URL" || -z "$EMBEDDING_HEALTH_URL" ]]; then
+  embedding_service_url="$(consul_service_url "$EMBEDDING_SERVICE_NAME")"
+  EMBEDDING_BASE_URL="${embedding_service_url}/v1"
+  EMBEDDING_HEALTH_URL="${embedding_service_url}/health"
+fi
+
+if consul_bool_is_true "$CONSUL_FORCE_DISCOVERY" || [[ -z "$DOCLING_BASE_URL" ]]; then
+  DOCLING_BASE_URL="$(consul_service_url "$DOCLING_SERVICE_NAME")"
+fi
+
+if [[ -z "$DOCLING_HEALTH_URL" ]]; then
+  DOCLING_HEALTH_URL="${DOCLING_BASE_URL%/}/health"
+fi
+
+if consul_bool_is_true "$CONSUL_FORCE_DISCOVERY" || [[ -z "$PGHOST" || -z "$PGPORT" ]]; then
+  pg_address_port="$(consul_service_address_port "$CONSUL_POSTGRES_SERVICE")"
+  PGHOST="${pg_address_port%:*}"
+  PGPORT="${pg_address_port##*:}"
+fi
 
 echo "== Health =="
 curl -fsS "$LLM_HEALTH_URL"

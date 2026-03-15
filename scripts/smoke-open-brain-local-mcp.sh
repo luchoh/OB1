@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+source "$ROOT_DIR/scripts/lib/consul.sh"
+
 if [[ -f ".env" ]]; then
   set -a
   # shellcheck disable=SC1091
@@ -18,12 +20,16 @@ if [[ -f ".env.open-brain-local" ]]; then
   set +a
 fi
 
-OPEN_BRAIN_HOST="${OPEN_BRAIN_HOST:-127.0.0.1}"
+CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-https://consul.lincoln.luchoh.net}"
+CONSUL_SKIP_TLS_VERIFY="${CONSUL_SKIP_TLS_VERIFY:-false}"
+CONSUL_FORCE_DISCOVERY="${CONSUL_FORCE_DISCOVERY:-false}"
+CONSUL_POSTGRES_SERVICE="${CONSUL_POSTGRES_SERVICE:-postgresql}"
+OPEN_BRAIN_HOST="${OPEN_BRAIN_HOST:-localhost}"
 OPEN_BRAIN_PORT="${OPEN_BRAIN_PORT:-8787}"
 OPEN_BRAIN_BASE_URL="http://${OPEN_BRAIN_HOST}:${OPEN_BRAIN_PORT}"
 MCP_ACCESS_KEY="${MCP_ACCESS_KEY:-}"
-PGHOST="${PGHOST:-10.10.10.100}"
-PGPORT="${PGPORT:-5432}"
+PGHOST="${PGHOST:-}"
+PGPORT="${PGPORT:-}"
 PGDATABASE="${PGDATABASE:-${POSTGRES_DB:-ob1}}"
 PGUSER="${PGUSER:-${POSTGRES_USER:-ob1}}"
 PGPASSWORD="${PGPASSWORD:-${POSTGRES_PASSWORD:-}}"
@@ -40,6 +46,12 @@ fi
 if [[ -z "$PGPASSWORD" ]]; then
   echo "PGPASSWORD is not set." >&2
   exit 1
+fi
+
+if consul_bool_is_true "$CONSUL_FORCE_DISCOVERY" || [[ -z "$PGHOST" || -z "$PGPORT" ]]; then
+  pg_address_port="$(consul_service_address_port "$CONSUL_POSTGRES_SERVICE")"
+  PGHOST="${pg_address_port%:*}"
+  PGPORT="${pg_address_port##*:}"
 fi
 
 cleanup() {

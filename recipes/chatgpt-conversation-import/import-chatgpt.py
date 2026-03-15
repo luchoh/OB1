@@ -45,12 +45,17 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 # ─── Configuration ───────────────────────────────────────────────────────────
+
+from recipes.shared_docling import local_llm_base_url
 
 SYNC_LOG_PATH = Path("chatgpt-sync-log.json")
 
 OLLAMA_BASE = "http://localhost:11434"
-LOCAL_LLM_BASE = os.environ.get("LLM_BASE_URL", "http://10.10.10.101:8035/v1").rstrip("/")
 LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
 LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
     "1",
@@ -58,7 +63,7 @@ LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip
     "yes",
     "on",
 )
-LOCAL_INGEST_URL = os.environ.get("OPEN_BRAIN_INGEST_URL") or "http://127.0.0.1:8787/ingest/thought"
+LOCAL_INGEST_URL = os.environ.get("OPEN_BRAIN_INGEST_URL") or "http://localhost:8787/ingest/thought"
 LOCAL_INGEST_KEY = os.environ.get("OPEN_BRAIN_INGEST_KEY") or os.environ.get("MCP_ACCESS_KEY", "")
 
 THOUGHTS_TOOL = {
@@ -405,7 +410,7 @@ def summarize_local(title, date_str, user_text):
     truncated = user_text[:6000]
 
     resp = http_post_with_retry(
-        f"{LOCAL_LLM_BASE}/chat/completions",
+        f"{local_llm_base_url()}/chat/completions",
         headers={"Content-Type": "application/json"},
         body={
             "model": LOCAL_LLM_MODEL,

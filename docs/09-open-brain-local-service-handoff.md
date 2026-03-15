@@ -34,13 +34,13 @@ Minimum required values:
 
 Recommended service-specific values:
 
-- `OPEN_BRAIN_HOST=0.0.0.0`
+- `OPEN_BRAIN_HOST=localhost` for workstation-only use, or bind all interfaces for managed LAN service
 - `OPEN_BRAIN_PORT=8787`
 - `OPEN_BRAIN_SERVICE_NAME=open-brain-local`
 - `OPEN_BRAIN_LLM_SERVICE_NAME=mlx-server`
 - `OPEN_BRAIN_EMBEDDING_SERVICE_NAME=ob1-embedding`
-- `DOCLING_BASE_URL=http://10.10.10.100:5001`
 - `DOCLING_SERVICE_NAME=docling`
+- `CONSUL_HTTP_ADDR=https://consul.lincoln.luchoh.net`
 
 Reference template:
 
@@ -61,7 +61,7 @@ The sysadmin-managed service should:
    - `/mcp`
    - `/ingest/thought`
 4. Register in Consul only after `/health` returns `200`
-5. Advertise the LAN IP in Consul, not `127.0.0.1`
+5. Advertise the host LAN hostname or FQDN in Consul, not `localhost`
 
 ## Consul Registration
 
@@ -73,11 +73,11 @@ Expected service identity:
 
 - service name: `open-brain-local`
 - service id: `open-brain-local-8787`
-- advertised address: the host LAN IP
+- advertised address: the host LAN hostname or FQDN
 - advertised port: `8787`
-- health check: `GET http://127.0.0.1:8787/health`
+- health check: `GET http://localhost:8787/health`
 
-The health check intentionally targets loopback. The catalog address should still be the LAN IP so clients can connect from elsewhere on the network.
+The health check intentionally targets localhost. The catalog address should still be the LAN hostname or FQDN so clients can connect from elsewhere on the network.
 
 ## Verification
 
@@ -127,8 +127,8 @@ Required behavior:
 - bind the service for LAN access, not loopback only
 - keep the canonical port at 8787 unless you have a concrete conflict
 - do not register in Consul until /health returns 200
-- advertise the LAN IP in Consul under service name open-brain-local
-- keep the health check on the local host side, e.g. http://127.0.0.1:8787/health
+- advertise the LAN hostname or FQDN in Consul under service name open-brain-local
+- keep the health check on the local host side, e.g. http://localhost:8787/health
 - preserve the existing model and database env contract from .env.open-brain-local
 
 Please return:

@@ -11,8 +11,8 @@ Import local documents into Open Brain through the live Docling service on your 
 
 This recipe uses the current local stack:
 - Docling on the LAN
-- local Qwen inference on `8035`
-- local OB1 ingest on `127.0.0.1:8787`
+- local Qwen inference through the `mlx-server` Consul service
+- local OB1 ingest on `localhost:8787`
 - no hosted Supabase/OpenRouter path
 
 ## Prerequisites
@@ -69,9 +69,9 @@ By default the script uses:
 
 - Docling: `DOCLING_BASE_URL` or Consul discovery of `docling`
 - summarizer model: `LLM_MODEL`
-- summarizer endpoint: `LLM_BASE_URL`
+- summarizer endpoint: `LLM_BASE_URL` or Consul discovery of `mlx-server`
 - summarizer thinking mode: `LLM_ENABLE_THINKING=false`
-- ingest endpoint: `http://127.0.0.1:8787/ingest/thought`
+- ingest endpoint: `http://localhost:8787/ingest/thought`
 - ingest key: `MCP_ACCESS_KEY`
 
 ## Notes

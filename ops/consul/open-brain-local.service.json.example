@@ -2,7 +2,7 @@
   "service": {
     "name": "open-brain-local",
     "id": "open-brain-local-8787",
-    "address": "10.10.10.101",
+    "address": "change-me.luchoh.net",
     "port": 8787,
     "tags": [
       "ob1",
@@ -23,7 +23,7 @@
       {
         "id": "open-brain-local-health",
         "name": "open-brain-local /health",
-        "http": "http://127.0.0.1:8787/health",
+        "http": "http://localhost:8787/health",
         "method": "GET",
         "interval": "15s",
         "timeout": "5s",

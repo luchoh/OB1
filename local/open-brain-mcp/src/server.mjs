@@ -27,7 +27,7 @@ const searchThoughtsSchema = {
   query: z.string().min(1).describe("Natural-language search query."),
   match_threshold: z.number().min(0).max(1).optional().describe("Minimum similarity threshold."),
   match_count: z.number().int().min(1).max(50).optional().describe("Maximum number of matches."),
-  filter: z.record(z.any()).optional().describe("Optional JSONB containment filter."),
+  filter: z.record(z.any()).optional().describe("Optional JSONB containment filter. If omitted, search prefers distilled thoughts before falling back to raw source records."),
 };
 
 const listThoughtsSchema = {
@@ -69,6 +69,42 @@ function errorToolResult(error) {
     ],
     isError: true,
   };
+}
+
+function hasExplicitSearchRole(filter) {
+  return filter
+    && typeof filter === "object"
+    && (Object.prototype.hasOwnProperty.call(filter, "type")
+      || Object.prototype.hasOwnProperty.call(filter, "retrieval_role"));
+}
+
+async function matchThoughtRows({ embedding, threshold, count, filter }) {
+  return query(
+    "select * from match_thoughts($1::vector, $2, $3, $4::jsonb)",
+    [
+      formatVector(embedding),
+      threshold,
+      count,
+      JSON.stringify(filter),
+    ],
+  );
+}
+
+function mergeUniqueThoughtRows(...groups) {
+  const seen = new Set();
+  const merged = [];
+
+  for (const group of groups) {
+    for (const row of group) {
+      if (!row?.id || seen.has(row.id)) {
+        continue;
+      }
+      seen.add(row.id);
+      merged.push(row);
+    }
+  }
+
+  return merged;
 }
 
 async function upsertThought({ content, embedding, metadata, dedupeKey }) {
@@ -171,21 +207,54 @@ async function handleCaptureThought(args) {
 
 async function handleSearchThoughts(args) {
   const embedding = await createEmbedding(args.query.trim());
-  const result = await query(
-    "select * from match_thoughts($1::vector, $2, $3, $4::jsonb)",
-    [
-      formatVector(embedding),
-      args.match_threshold ?? 0.4,
-      args.match_count ?? 10,
-      JSON.stringify(args.filter ?? {}),
-    ],
-  );
+  const threshold = args.match_threshold ?? 0.4;
+  const matchCount = args.match_count ?? 10;
+  const filter = args.filter ?? {};
+
+  let results;
+  let retrievalStrategy = "direct";
+  let fallbackUsed = false;
+
+  if (hasExplicitSearchRole(filter)) {
+    const direct = await matchThoughtRows({
+      embedding,
+      threshold,
+      count: matchCount,
+      filter,
+    });
+    results = direct.rows;
+  } else {
+    retrievalStrategy = "distilled-first";
+
+    const preferred = await matchThoughtRows({
+      embedding,
+      threshold,
+      count: matchCount,
+      filter: { ...filter, retrieval_role: "distilled" },
+    });
+
+    results = preferred.rows;
+
+    if (results.length < matchCount) {
+      const fallback = await matchThoughtRows({
+        embedding,
+        threshold,
+        count: Math.min(matchCount * 3, 50),
+        filter,
+      });
+
+      results = mergeUniqueThoughtRows(preferred.rows, fallback.rows).slice(0, matchCount);
+      fallbackUsed = true;
+    }
+  }
 
   return {
     success: true,
     query: args.query,
-    count: result.rows.length,
-    results: result.rows,
+    retrieval_strategy: retrievalStrategy,
+    fallback_used: fallbackUsed,
+    count: results.length,
+    results,
   };
 }
 

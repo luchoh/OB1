@@ -48,6 +48,11 @@ const metadataTool = {
   },
 };
 
+const SOURCE_RETRIEVAL_TYPES = new Set([
+  "email",
+  "document_chunk",
+]);
+
 function truncateText(text, limit = 240) {
   if (text.length <= limit) {
     return text;
@@ -118,7 +123,17 @@ function sanitizeStringList(values) {
     .filter(Boolean))];
 }
 
+function resolveRetrievalRole(metadata, type) {
+  if (typeof metadata.retrieval_role === "string" && metadata.retrieval_role.trim()) {
+    return metadata.retrieval_role.trim();
+  }
+
+  return SOURCE_RETRIEVAL_TYPES.has(type) ? "source" : "distilled";
+}
+
 export function normalizeMetadata({ content, extracted = {}, metadata = {}, source, type, tags, occurredAt, extractionError }) {
+  const resolvedType = type ?? metadata.type ?? extracted.type ?? "note";
+
   return {
     people: sanitizeStringList([...(metadata.people ?? []), ...(extracted.people ?? [])]),
     action_items: sanitizeStringList([...(metadata.action_items ?? []), ...(extracted.action_items ?? [])]),
@@ -133,9 +148,10 @@ export function normalizeMetadata({ content, extracted = {}, metadata = {}, sour
       ...(Array.isArray(tags) ? tags : []),
     ]),
     tags: sanitizeStringList([...(metadata.tags ?? []), ...(Array.isArray(tags) ? tags : [])]),
-    type: type ?? metadata.type ?? extracted.type ?? "note",
+    type: resolvedType,
     summary: metadata.summary ?? extracted.summary ?? truncateText(content, 280),
     source: source ?? metadata.source ?? extracted.source ?? "manual",
+    retrieval_role: resolveRetrievalRole(metadata, resolvedType),
     occurred_at: occurredAt ?? metadata.occurred_at ?? null,
     user_metadata: metadata,
     ...(extractionError ? { metadata_extraction_error: extractionError } : {}),

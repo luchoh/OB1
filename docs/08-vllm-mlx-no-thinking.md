@@ -19,7 +19,7 @@ That is the clean control. Prompt hacks like `/no_think` are not the right fix.
 
 ## What We Verified
 
-The live inference endpoint at `http://10.10.10.101:8035/v1/chat/completions` now honors `chat_template_kwargs.enable_thinking=false`.
+The live inference path through the `mlx-server` Consul service now honors `chat_template_kwargs.enable_thinking=false`.
 
 Verified outcome:
 
@@ -231,7 +231,7 @@ Expected outcome:
 Please update the M3 Ultra `vllm-mlx` inference service so request-level Qwen no-thinking control actually works.
 
 Target behavior:
-- The canonical inference endpoint remains `http://10.10.10.101:8035/v1`
+- The canonical inference path remains the `mlx-server` Consul service `/v1`
 - Model remains `mlx-community/Qwen3.5-397B-A17B-nvfp4`
 - Qwen requests with `chat_template_kwargs.enable_thinking=false` must disable reasoning output at the template level
 - Keep `--reasoning-parser qwen3` enabled for cases where thinking is intentionally on

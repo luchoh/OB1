@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+source "$ROOT_DIR/scripts/lib/consul.sh"
+
 if [[ -f ".env" ]]; then
   set -a
   # shellcheck disable=SC1091
@@ -18,11 +20,21 @@ if [[ -f ".env.open-brain-local" ]]; then
   set +a
 fi
 
-PGHOST="${PGHOST:-10.10.10.100}"
-PGPORT="${PGPORT:-5432}"
+CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-https://consul.lincoln.luchoh.net}"
+CONSUL_SKIP_TLS_VERIFY="${CONSUL_SKIP_TLS_VERIFY:-false}"
+CONSUL_FORCE_DISCOVERY="${CONSUL_FORCE_DISCOVERY:-false}"
+CONSUL_POSTGRES_SERVICE="${CONSUL_POSTGRES_SERVICE:-postgresql}"
+PGHOST="${PGHOST:-}"
+PGPORT="${PGPORT:-}"
 PGDATABASE="${PGDATABASE:-ob1}"
 PGUSER="${PGUSER:-${POSTGRES_USER:-ob1}}"
 PGPASSWORD="${PGPASSWORD:-${POSTGRES_PASSWORD:-}}"
+
+if consul_bool_is_true "$CONSUL_FORCE_DISCOVERY" || [[ -z "$PGHOST" || -z "$PGPORT" ]]; then
+  pg_address_port="$(consul_service_address_port "$CONSUL_POSTGRES_SERVICE")"
+  PGHOST="${pg_address_port%:*}"
+  PGPORT="${pg_address_port##*:}"
+fi
 
 if [[ -z "$PGPASSWORD" ]]; then
   echo "PGPASSWORD is not set." >&2

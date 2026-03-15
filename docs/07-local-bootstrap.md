@@ -17,13 +17,13 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 ## Canonical Services
 
 - PostgreSQL: `ob1` database with `pgvector`
-- Inference: `http://10.10.10.101:8035/v1` using `mlx-community/Qwen3.5-397B-A17B-nvfp4`
-- Inference health: `http://10.10.10.101:8035/health`
-- Embeddings: `http://10.10.10.101:8082/v1` using `mlx-community/Qwen3-Embedding-8B-mxfp8`
-- Embedding health: `http://10.10.10.101:8082/health`
-- Document parsing: `http://10.10.10.100:5001` via the `docling` Consul service
-- Document parsing health: `http://10.10.10.100:5001/health`
-- Rollback embedding path: `http://10.10.10.101:8081/v1` using the Nomic model
+- Inference: the `mlx-server` Consul service using `mlx-community/Qwen3.5-397B-A17B-nvfp4`
+- Inference health: the discovered `mlx-server` service `/health` endpoint
+- Embeddings: the `ob1-embedding` Consul service using `mlx-community/Qwen3-Embedding-8B-mxfp8`
+- Embedding health: the discovered `ob1-embedding` service `/health` endpoint
+- Document parsing: via the `docling` Consul service
+- Document parsing health: the discovered `docling` service `/health` endpoint
+- Rollback embedding path: the `llama-cpp-embedding` Consul service using the Nomic model
 
 ## Embedding Contract
 

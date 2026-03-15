@@ -6,6 +6,13 @@ Import a standard IMAP mailbox into the local Open Brain service as searchable e
 
 Connects to a standard IMAP mailbox, fetches each RFC 822 message, parses it locally, and ingests each email into OB1 through the local `/ingest/thought` contract.
 
+Attachments are now first-class inputs:
+- attachment files are detected from the MIME message
+- each attachment is sent through the same Docling pipeline used by the document importer
+- extracted attachment chunks become searchable `document_chunk` rows
+- distilled attachment summaries become searchable `document_summary` rows
+- each attachment-derived row links back to the parent email with stable provenance metadata
+
 Each imported email is stored with:
 - sender metadata
 - subject
@@ -28,6 +35,7 @@ Use `--no-distill` if you want raw email records only.
 - Python 3.10+
 - the local OB1 service running
 - your real `.env.open-brain-local`
+- a reachable Docling service if attachment processing is enabled
 
 ## Credential Tracker
 
@@ -92,6 +100,9 @@ python import-imap.py --host imap.example.com --username you@example.com --unsee
 
 # strip quoted reply blocks before ingest
 python import-imap.py --host imap.example.com --username you@example.com --strip-quotes
+
+# skip attachment parsing if you only want the email body
+python import-imap.py --host imap.example.com --username you@example.com --no-attachments
 ```
 
 ## Expected Outcome
@@ -106,6 +117,11 @@ After running the import, you should see your emails as rows in the `thoughts` t
 - `imap_uid`
 - `rfc822_message_id`
 
+If the email has attachments that Docling can parse, you should also see:
+- `document_chunk` rows with `source: "imap_attachment"`
+- `document_summary` rows with `source: "imap_attachment"`
+- `email_dedupe_key` metadata linking those rows back to the parent email
+
 You can search for any email content using the local OB1 MCP server's `search_thoughts` tool.
 
 ## Runtime Notes
@@ -114,7 +130,11 @@ You can search for any email content using the local OB1 MCP server's `search_th
 - `--since` and `--before` are applied through IMAP search and re-checked locally after parsing.
 - The importer writes with `extract_metadata=false` because sender, subject, date, mailbox, and flags are already structured and large mailboxes should not pay an LLM extraction cost per message.
 - Distillation is enabled by default and creates separate `email_thought` rows linked back to the source email with stable dedupe keys.
-- Attachments are ignored; the importer only ingests message body text.
+- Attachment processing is enabled by default and uses the shared Docling pipeline.
+- `--no-attachments` disables attachment processing.
+- `--no-attachment-summaries` keeps attachment chunks but skips attachment summary thoughts.
+- `--attachment-chunker hierarchical|hybrid` controls the Docling chunker used for attachments.
+- The sync log now records an importer schema version, so older body-only imports are reprocessed once and pick up attachments safely under the existing dedupe model.
 - The current search flags are `SINCE`, `BEFORE`, `UNSEEN`, `FROM`, `SUBJECT`, and `TEXT`.
 
 ## Troubleshooting
@@ -124,6 +144,10 @@ You can search for any email content using the local OB1 MCP server's `search_th
 
 `Import runs but no thoughts appear in OB1`
 - Check that `MCP_ACCESS_KEY` is loaded and the local OB1 service is healthy.
+
+`Attachment processing fails`
+- Confirm Docling is reachable through `DOCLING_BASE_URL` or Consul discovery, or pass `--docling-url http://host:port`.
+- Re-run with `--attachment-chunker hierarchical` before assuming the file itself is bad.
 
 `Mailbox select failed`
 - Make sure the mailbox name is valid for that server. Common values are `INBOX`, `Archive`, or provider-specific folder names.

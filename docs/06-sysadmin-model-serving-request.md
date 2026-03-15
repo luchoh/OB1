@@ -8,8 +8,8 @@ This file now serves as a historical handoff record. The prompt below is what wa
 
 ## Implemented Outcome
 
-- `mlx-server` remains the canonical inference service at `http://10.10.10.101:8035/v1`
-- `ob1-embedding` remains the canonical embedding service at `http://10.10.10.101:8082/v1`
+- `mlx-server` remains the canonical inference service, discovered through Consul
+- `ob1-embedding` remains the canonical embedding service, discovered through Consul
 - `ob1-embedding` now serves `1536`-dimensional embeddings by default
 - Accepted request behavior: no `dimensions` field or `dimensions = 1536`
 - Expected error behavior: `400` for unsupported dimensions such as `3072`
@@ -45,14 +45,14 @@ Current known state:
 
 Validated current model-serving state:
 - Inference endpoint:
-  - URL: http://10.10.10.101:8035
+  - URL: the discovered `mlx-server` service root
   - Service name in Consul: mlx-server
   - Model returned by /v1/models: mlx-community/Qwen3.5-397B-A17B-nvfp4
   - owned_by: vllm-mlx
   - This is working and should be treated as the current canonical inference service unless you recommend a better local serving arrangement on the M3 Ultra
 
 - Canonical embedding endpoint:
-  - URL: http://10.10.10.101:8082
+  - URL: the discovered `ob1-embedding` service root
   - Service name in Consul: ob1-embedding
   - Model returned by /v1/models: mlx-community/Qwen3-Embedding-8B-mxfp8
   - /health is healthy
@@ -60,7 +60,7 @@ Validated current model-serving state:
   - Important issue: the service currently returns 4096 values and ignores the OpenAI-style `dimensions` parameter
 
 - Rollback embedding endpoint:
-  - URL: http://10.10.10.101:8081
+  - URL: the discovered `llama-cpp-embedding` service root
   - Service name in Consul: llama-cpp-embedding
   - Current model: nomic-ai/nomic-embed-text-v1.5-GGUF:nomic-embed-text-v1.5.Q8_0.gguf
   - This should be treated as a rollback path, not the target canonical embedding service
@@ -89,7 +89,7 @@ What I need from you:
 
 2. Update the canonical embedding service so that `ob1-embedding` returns production-ready embeddings directly.
    Preferred outcome:
-   - same canonical endpoint: http://10.10.10.101:8082
+   - same canonical endpoint contract through the `ob1-embedding` service
    - same service name: ob1-embedding
    - same canonical model family: Qwen3-Embedding-8B
    - canonical served output dimension: 1536
@@ -137,19 +137,19 @@ Please implement the agreed production serving contract for Open Brain Local on 
 Accepted stack:
 - Inference service stays as:
   - service: mlx-server
-  - endpoint: http://10.10.10.101:8035/v1
-  - health: http://10.10.10.101:8035/health
+  - endpoint: the discovered `mlx-server` `/v1` route
+  - health: the discovered `mlx-server` `/health` route
   - model: mlx-community/Qwen3.5-397B-A17B-nvfp4
 
 - Embedding service stays as:
   - service: ob1-embedding
-  - endpoint: http://10.10.10.101:8082/v1
-  - health: http://10.10.10.101:8082/health
+  - endpoint: the discovered `ob1-embedding` `/v1` route
+  - health: the discovered `ob1-embedding` `/health` route
   - model: mlx-community/Qwen3-Embedding-8B-mxfp8
 
 - Rollback only:
   - service: llama-cpp-embedding
-  - endpoint: http://10.10.10.101:8081/v1
+  - endpoint: the discovered `llama-cpp-embedding` `/v1` route
   - model: nomic-ai/nomic-embed-text-v1.5-GGUF:nomic-embed-text-v1.5.Q8_0.gguf
 
 Required change:

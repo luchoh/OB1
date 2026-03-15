@@ -79,15 +79,15 @@ From `.env` and Consul:
   - MinIO
   - Neo4j
   - Docling
-- `mlx-server` is registered at `10.10.10.101:8035` and responds to OpenAI-compatible `chat/completions`
+- `mlx-server` is registered in Consul and responds to OpenAI-compatible `chat/completions`
 - The currently exposed MLX model is `mlx-community/Qwen3.5-397B-A17B-nvfp4`
-- `ob1-embedding` is registered at `10.10.10.101:8082` and responds to OpenAI-compatible `embeddings`
+- `ob1-embedding` is registered in Consul and responds to OpenAI-compatible `embeddings`
 - The canonical embedding model now exposed there is `mlx-community/Qwen3-Embedding-8B-mxfp8`
 - The `ob1-embedding` service now returns `1536`-dimensional embeddings server-side by default
 - It accepts either no `dimensions` field or `dimensions = 1536`
 - It returns `400` for unsupported dimensions such as `3072`
 - The embedding runtime is now pinned to a local artifact path at `/Volumes/llama-models/mlx-embedding/.cache/huggingface/hub/models--mlx-community--Qwen3-Embedding-8B-mxfp8/snapshots/51c773b7464b630a6c67b4f75dbd796b658d6236`
-- The earlier `llama-cpp-embedding` endpoint at `10.10.10.101:8081` remains available as a fallback path and serves the Nomic embedding model
+- The earlier `llama-cpp-embedding` service remains available as a fallback path and serves the Nomic embedding model
 - The MLX model does not support `/v1/embeddings`, so generation and embedding must remain separate services
 - Offline startup semantics are enabled for both inference and embeddings
 - `ob1-embedding` now loads from a local artifact path on disk
@@ -111,7 +111,7 @@ Implication: the network now has a validated end-to-end local path for PostgreSQ
 - For local Apple Silicon serving, a direct MLX port exists as `mlx-community/Qwen3-Embedding-8B-mxfp8`
 - Qwen reports that `Qwen3-Embedding-8B` ranks No. 1 on the multilingual MTEB leaderboard in its official evaluation set, with strong English performance as well
 - `Qwen3-Embedding-8B` is Apache 2.0 licensed, supports 100+ languages, supports instructions, and supports user-defined output dimensions
-- That embedding model is now confirmed live locally on the dedicated `ob1-embedding` service at `10.10.10.101:8082`
+- That embedding model is now confirmed live locally on the dedicated `ob1-embedding` service discovered through Consul
 - The official model card marks the model as MRL-capable, which means reduced-dimension outputs are a supported part of the model design
 - A strong smaller alternative exists in `jinaai/jina-embeddings-v5-text-small`, but it is not the best absolute model for this hardware budget and uses a non-commercial license
 - For inference, the strongest model that cleanly fits the current deployment direction is `Qwen/Qwen3.5-397B-A17B`, already validated locally as `mlx-community/Qwen3.5-397B-A17B-nvfp4`
@@ -315,20 +315,20 @@ Preferred operating model:
 Validated current endpoints:
 
 - Generation:
-  - Base URL: `http://10.10.10.101:8035/v1`
-  - Health: `http://10.10.10.101:8035/health`
+  - Base URL: discovered from the `mlx-server` Consul service
+  - Health: the discovered `mlx-server` `/health` route
   - Service: `mlx-server`
   - Model: `mlx-community/Qwen3.5-397B-A17B-nvfp4`
   - Role: chat, reasoning, metadata extraction
 - Embeddings:
-  - Base URL: `http://10.10.10.101:8082/v1`
-  - Health: `http://10.10.10.101:8082/health`
+  - Base URL: discovered from the `ob1-embedding` Consul service
+  - Health: the discovered `ob1-embedding` `/health` route
   - Service: `ob1-embedding`
   - Model: `mlx-community/Qwen3-Embedding-8B-mxfp8`
   - Production output dimension: `1536`
   - Role: vector generation only
 - Rollback embeddings:
-  - Base URL: `http://10.10.10.101:8081/v1`
+  - Base URL: discovered from the `llama-cpp-embedding` Consul service
   - Service: `llama-cpp-embedding`
   - Model: `nomic-ai/nomic-embed-text-v1.5-GGUF:nomic-embed-text-v1.5.Q8_0.gguf`
   - Role: rollback only
@@ -346,7 +346,7 @@ Recommended canonical v1 models:
 
 Recommended fallback models:
 
-- Operational embedding fallback: keep `llama-cpp-embedding` on `10.10.10.101:8081` with the Nomic model available as a temporary rollback path
+- Operational embedding fallback: keep `llama-cpp-embedding` available as a temporary rollback path with the Nomic model
 - Fast embedding fallback: `jinaai/jina-embeddings-v5-text-small-retrieval-mlx`
 - Experimental frontier inference fallback: `moonshotai/Kimi-K2.5` only after explicit validation on the target host with a quantization known to fit 512 GB
 

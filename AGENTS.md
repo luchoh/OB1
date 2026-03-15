@@ -22,8 +22,8 @@ License: `FSL-1.1-MIT`.
 ## Current Local Stack
 
 Canonical local services:
-- inference: `mlx-server` at `http://10.10.10.101:8035/v1`
-- embeddings: `ob1-embedding` at `http://10.10.10.101:8082/v1`
+- inference: discover `mlx-server` through Consul
+- embeddings: discover `ob1-embedding` through Consul
 - database: PostgreSQL `ob1` with `pgvector`
 
 Local MCP runtime:

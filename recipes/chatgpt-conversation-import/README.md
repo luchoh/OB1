@@ -10,8 +10,8 @@ Import a ChatGPT data export into Open Brain as distilled, searchable thoughts.
 - ingests those thoughts into the local OB1 service
 
 The local-first path uses:
-- local Qwen inference on `8035`
-- local OB1 ingest on `127.0.0.1:8787`
+- local Qwen inference through the `mlx-server` Consul service
+- local OB1 ingest on `localhost:8787`
 - local embeddings through the OB1 service
 - no internet egress in steady state
 - Qwen tool calling for structured extraction
@@ -76,15 +76,15 @@ This importer uses Qwen tool calling for thought extraction rather than `respons
 By default the script uses:
 
 - summarizer model: `LLM_MODEL`
-- summarizer endpoint: `LLM_BASE_URL`
+- summarizer endpoint: `LLM_BASE_URL` or Consul discovery of `mlx-server`
 - summarizer thinking mode: `LLM_ENABLE_THINKING=false`
-- ingest endpoint: `http://127.0.0.1:8787/ingest/thought`
+- ingest endpoint: `http://localhost:8787/ingest/thought`
 - ingest key: `MCP_ACCESS_KEY`
 
 You can override the ingest path with:
 
 ```bash
-export OPEN_BRAIN_INGEST_URL=http://127.0.0.1:8787/ingest/thought
+export OPEN_BRAIN_INGEST_URL=http://localhost:8787/ingest/thought
 export OPEN_BRAIN_INGEST_KEY="$MCP_ACCESS_KEY"
 ```
 
