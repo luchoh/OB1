@@ -67,23 +67,29 @@ def process_document(path, args, docling_base_url):
     print(f"\n== {path}")
     print(f"document_sha256={document_hash}")
 
-    chunk_payload = docling_chunk(docling_base_url, path, args.chunker)
-    chunks = chunk_payload.get("chunks", [])
-    document_text = "\n\n".join(
-        chunk.get("text", "").strip()
-        for chunk in chunks
-        if isinstance(chunk.get("text"), str) and chunk.get("text").strip()
-    )
+    extraction = docling_chunk(docling_base_url, path, args.chunker)
+    chunks = extraction["chunks"]
+    document_text = extraction["document_text"]
+    pipeline_used = extraction["pipeline_used"]
+    fallback_triggered = extraction["fallback_triggered"]
+    quality_signals = extraction["quality_signals"]
 
     print(f"chunks={len(chunks)}")
+    print(f"docling_pipeline={pipeline_used}")
+    print(f"docling_fallback_triggered={fallback_triggered}")
 
     summary_thoughts = []
+    summary_error = None
     if not args.no_summaries and document_text.strip():
-        summary_thoughts = summarize_document(path.name, document_text)
-        print(f"summary_thoughts={len(summary_thoughts)}")
-        if args.verbose:
-            for idx, thought in enumerate(summary_thoughts):
-                print(f"  summary[{idx}] {thought}")
+        try:
+            summary_thoughts = summarize_document(path.name, document_text)
+            print(f"summary_thoughts={len(summary_thoughts)}")
+            if args.verbose:
+                for idx, thought in enumerate(summary_thoughts):
+                    print(f"  summary[{idx}] {thought}")
+        except Exception as exc:
+            summary_error = str(exc)
+            print(f"summary_thoughts=0 (summarization failed: {summary_error})")
     elif args.no_summaries:
         print("summary_thoughts=skipped")
     else:
@@ -117,6 +123,10 @@ def process_document(path, args, docling_base_url):
             "document_headings": headings,
             "document_doc_items": chunk.get("doc_items") or [],
             "docling_chunker": args.chunker,
+            "docling_pipeline_used": pipeline_used,
+            "docling_fallback_triggered": fallback_triggered,
+            "docling_quality_signals": quality_signals,
+            "document_summary_extraction_error": summary_error,
             "docling_origin": origin,
         }
         dedupe_key = sha256_text(f"document:{document_hash}:chunk:{chunk.get('chunk_index')}")
@@ -143,6 +153,10 @@ def process_document(path, args, docling_base_url):
             "document_sha256": document_hash,
             "document_chunk_count": len(chunks),
             "docling_chunker": args.chunker,
+            "docling_pipeline_used": pipeline_used,
+            "docling_fallback_triggered": fallback_triggered,
+            "docling_quality_signals": quality_signals,
+            "document_summary_extraction_error": summary_error,
         }
         dedupe_key = sha256_text(f"document:{document_hash}:summary:{idx}")
         ingest_thought(
@@ -159,6 +173,7 @@ def process_document(path, args, docling_base_url):
         "chunk_count": ingested_chunks,
         "summary_count": ingested_summaries,
         "document_sha256": document_hash,
+        "summary_error": summary_error,
     }
 
 

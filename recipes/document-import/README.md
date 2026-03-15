@@ -6,6 +6,7 @@ Import local documents into Open Brain through the live Docling service on your 
 
 - discovers the Docling service from Consul or `DOCLING_BASE_URL`
 - parses and chunks documents through Docling
+- retries with Docling's `vlm` pipeline when the first OCR/text pass is clearly weak
 - ingests each chunk into the local OB1 service with stable `dedupe_key` values
 - optionally distills each document into 0-3 summary thoughts from the Docling chunk text with the local Qwen endpoint
 
@@ -73,6 +74,7 @@ By default the script uses:
 - summarizer thinking mode: `LLM_ENABLE_THINKING=false`
 - ingest endpoint: `http://localhost:8787/ingest/thought`
 - ingest key: `MCP_ACCESS_KEY`
+- Docling extraction strategy: OCR-first with automatic VLM fallback on low-quality extraction
 
 ## Notes
 
@@ -80,6 +82,8 @@ By default the script uses:
 - Each imported chunk gets a deterministic `dedupe_key`, so re-running the same document version is idempotent.
 - The current idempotency key is based on the file content hash and chunk index. If the file contents change, the new version is stored as new rows.
 - `hybrid` chunking is available, but `hierarchical` is the verified default on the current Docling service.
+- Imported metadata now records whether Docling stayed on the standard pipeline or escalated to `vlm`, plus the quality signals that triggered fallback.
+- If whole-document summary extraction fails, chunk ingest still succeeds and the error is recorded in metadata for inspection.
 
 ## Troubleshooting
 
@@ -90,4 +94,4 @@ By default the script uses:
 - The importer does not have the right `MCP_ACCESS_KEY`.
 
 `Docling returned zero chunks`
-- The selected chunker did not produce usable chunks for that file. Re-run with `--chunker hierarchical` before assuming the file itself is bad.
+- The importer already tries `vlm` automatically when the standard OCR pass is weak. Re-run with `--chunker hierarchical` before assuming the file itself is bad.

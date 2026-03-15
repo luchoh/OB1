@@ -6,9 +6,15 @@ Import a standard IMAP mailbox into the local Open Brain service as searchable e
 
 Connects to a standard IMAP mailbox, fetches each RFC 822 message, parses it locally, and ingests each email into OB1 through the local `/ingest/thought` contract.
 
+It also supports unattended mailbox watching:
+- run [watch-imap.py](/Users/luchoh/Dev/OB1/recipes/email-history-import/watch-imap.py#L1) as a background process
+- new mail sent to the inbox is imported automatically on the next poll cycle
+- failed message imports are retried automatically because the sync log only advances after a full successful message run
+
 Attachments are now first-class inputs:
 - attachment files are detected from the MIME message
 - each attachment is sent through the same Docling pipeline used by the document importer
+- attachments use OCR first and automatically escalate to Docling `vlm` when the initial extraction is weak
 - extracted attachment chunks become searchable `document_chunk` rows
 - distilled attachment summaries become searchable `document_summary` rows
 - each attachment-derived row links back to the parent email with stable provenance metadata
@@ -103,6 +109,15 @@ python import-imap.py --host imap.example.com --username you@example.com --strip
 
 # skip attachment parsing if you only want the email body
 python import-imap.py --host imap.example.com --username you@example.com --no-attachments
+
+# reprocess only specific attachments from matching messages
+python import-imap.py --host imap.example.com --username you@example.com \
+  --mailbox INBOX --ignore-sync-log --attachments-only \
+  --attachment-name AHIztok_Shema_15_07032026.pdf \
+  --attachment-name AHIztok_Shema_15_10032026.pdf
+
+# watch the mailbox forever and auto-import new mail
+python watch-imap.py --host imap.example.com --username you@example.com --verbose
 ```
 
 ## Expected Outcome
@@ -131,11 +146,47 @@ You can search for any email content using the local OB1 MCP server's `search_th
 - The importer writes with `extract_metadata=false` because sender, subject, date, mailbox, and flags are already structured and large mailboxes should not pay an LLM extraction cost per message.
 - Distillation is enabled by default and creates separate `email_thought` rows linked back to the source email with stable dedupe keys.
 - Attachment processing is enabled by default and uses the shared Docling pipeline.
+- Attachment-derived metadata now records `docling_pipeline_used`, `docling_fallback_triggered`, and the quality signals behind any fallback.
+- If attachment summary extraction fails, the importer still keeps the attachment chunks and records the summary error in metadata.
 - `--no-attachments` disables attachment processing.
+- `--attachments-only` turns the importer into an attachment reprocess tool and skips email body + email thought ingest.
+- `--attachment-name FILE` limits attachment processing to exact filenames. Repeatable.
 - `--no-attachment-summaries` keeps attachment chunks but skips attachment summary thoughts.
 - `--attachment-chunker hierarchical|hybrid` controls the Docling chunker used for attachments.
 - The sync log now records an importer schema version, so older body-only imports are reprocessed once and pick up attachments safely under the existing dedupe model.
 - The current search flags are `SINCE`, `BEFORE`, `UNSEEN`, `FROM`, `SUBJECT`, and `TEXT`.
+- `watch-imap.py` is the unattended mode. It polls the mailbox forever, reuses the same importer, and relies on `imap-sync-log.json` for idempotency and retry behavior.
+
+## Auto Mode
+
+For a workstation/local service:
+
+```bash
+cd recipes/email-history-import
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+set -a
+source ../../.env.open-brain-local
+source ../../.env
+set +a
+python watch-imap.py --verbose
+```
+
+For a managed service, use:
+
+```bash
+./scripts/run-open-brain-imap-watch.sh --verbose
+```
+
+Recommended env:
+- `IMAP_HOST`
+- `IMAP_PORT=993`
+- `IMAP_ACCOUNT` or `IMAP_USERNAME`
+- `IMAP_PASSWORD`
+- `IMAP_MAILBOX=INBOX`
+- `IMAP_POLL_INTERVAL_SECONDS=60`
+- `IMAP_ERROR_BACKOFF_SECONDS=300`
 
 ## Troubleshooting
 
@@ -147,13 +198,17 @@ You can search for any email content using the local OB1 MCP server's `search_th
 
 `Attachment processing fails`
 - Confirm Docling is reachable through `DOCLING_BASE_URL` or Consul discovery, or pass `--docling-url http://host:port`.
-- Re-run with `--attachment-chunker hierarchical` before assuming the file itself is bad.
+- Re-run with `--attachment-chunker hierarchical` before assuming the file itself is bad. The importer already retries with `vlm` automatically when the first pass is weak.
 
 `Mailbox select failed`
 - Make sure the mailbox name is valid for that server. Common values are `INBOX`, `Archive`, or provider-specific folder names.
 
 `Large mailbox`
 - Import in batches with `--since`, `--before`, `--from`, `--subject`, or `--text`.
+
+`Large attachment looks slow`
+- The unattended watcher still processes it automatically; it just keeps running until Docling and summarization finish.
+- Use `--verbose` so the logs show `processing_attachment=` and `processed_attachment=` progress lines.
 
 `Need to re-run everything from scratch`
 - Remove `imap-sync-log.json` and rerun. The `dedupe_key` still protects the DB from duplicates.

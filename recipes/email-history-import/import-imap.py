@@ -726,22 +726,33 @@ def process_attachment(record, attachment, *, docling_base_url, chunker, dry_run
         temp_path = Path(tmpdir) / attachment["filename"]
         temp_path.write_bytes(attachment["data"])
 
-        chunk_payload = docling_chunk(docling_base_url, temp_path, chunker, force_ocr=True)
-        chunks = chunk_payload.get("chunks", [])
-        document_text = "\n\n".join(
-            chunk.get("text", "").strip()
-            for chunk in chunks
-            if isinstance(chunk.get("text"), str) and chunk.get("text").strip()
-        )
+        extraction = docling_chunk(docling_base_url, temp_path, chunker, force_ocr=True)
+        chunks = extraction["chunks"]
+        document_text = extraction["document_text"]
+        pipeline_used = extraction["pipeline_used"]
+        fallback_triggered = extraction["fallback_triggered"]
+        quality_signals = extraction["quality_signals"]
 
         summary_thoughts = []
+        summary_error = None
         if not no_summaries and document_text.strip():
-            summary_thoughts = summarize_document(attachment["filename"], document_text)
-            if verbose:
-                print(f"    attachment_summary_thoughts={len(summary_thoughts)}")
-                for idx, thought in enumerate(summary_thoughts):
-                    print(f"      attachment_summary[{idx}] {thought}")
+            try:
+                summary_thoughts = summarize_document(attachment["filename"], document_text)
+                if verbose:
+                    print(f"    attachment_docling_pipeline={pipeline_used}")
+                    print(f"    attachment_docling_fallback_triggered={fallback_triggered}")
+                    print(f"    attachment_summary_thoughts={len(summary_thoughts)}")
+                    for idx, thought in enumerate(summary_thoughts):
+                        print(f"      attachment_summary[{idx}] {thought}")
+            except Exception as exc:
+                summary_error = str(exc)
+                if verbose:
+                    print(f"    attachment_docling_pipeline={pipeline_used}")
+                    print(f"    attachment_docling_fallback_triggered={fallback_triggered}")
+                    print(f"    attachment_summary_thoughts=0 (summarization failed: {summary_error})")
         elif verbose:
+            print(f"    attachment_docling_pipeline={pipeline_used}")
+            print(f"    attachment_docling_fallback_triggered={fallback_triggered}")
             print("    attachment_summary_thoughts=skipped")
 
         if dry_run:
@@ -749,6 +760,9 @@ def process_attachment(record, attachment, *, docling_base_url, chunker, dry_run
                 "chunk_count": len(chunks),
                 "summary_count": len(summary_thoughts),
                 "attachment_sha256": attachment["sha256"],
+                "docling_pipeline_used": pipeline_used,
+                "docling_fallback_triggered": fallback_triggered,
+                "summary_error": summary_error,
             }
 
         mailbox = record["metadata"].get("mailbox")
@@ -789,6 +803,10 @@ def process_attachment(record, attachment, *, docling_base_url, chunker, dry_run
                 "document_headings": headings,
                 "document_doc_items": chunk.get("doc_items") or [],
                 "docling_chunker": chunker,
+                "docling_pipeline_used": pipeline_used,
+                "docling_fallback_triggered": fallback_triggered,
+                "docling_quality_signals": quality_signals,
+                "document_summary_extraction_error": summary_error,
                 "docling_origin": origin,
             }
             ingest_thought(
@@ -812,6 +830,10 @@ def process_attachment(record, attachment, *, docling_base_url, chunker, dry_run
                 "topics": [],
                 "document_chunk_count": len(chunks),
                 "docling_chunker": chunker,
+                "docling_pipeline_used": pipeline_used,
+                "docling_fallback_triggered": fallback_triggered,
+                "docling_quality_signals": quality_signals,
+                "document_summary_extraction_error": summary_error,
             }
             ingest_thought(
                 thought,
@@ -828,6 +850,9 @@ def process_attachment(record, attachment, *, docling_base_url, chunker, dry_run
             "chunk_count": ingested_chunks,
             "summary_count": ingested_summaries,
             "attachment_sha256": attachment["sha256"],
+            "docling_pipeline_used": pipeline_used,
+            "docling_fallback_triggered": fallback_triggered,
+            "summary_error": summary_error,
         }
 
 
@@ -879,6 +904,17 @@ def parse_args():
     parser.add_argument("--no-distill", action="store_true", help="Store raw email records only, without durable thought extraction.")
     parser.add_argument("--no-attachments", action="store_true", help="Skip attachment parsing and Docling-backed attachment ingest.")
     parser.add_argument(
+        "--attachments-only",
+        action="store_true",
+        help="Only process matching attachments; skip email body ingest and email thought distillation.",
+    )
+    parser.add_argument(
+        "--attachment-name",
+        action="append",
+        dest="attachment_names",
+        help="Only process attachments with this exact filename. Repeatable.",
+    )
+    parser.add_argument(
         "--attachment-chunker",
         choices=("hierarchical", "hybrid"),
         default="hierarchical",
@@ -904,6 +940,9 @@ def main():
     if not args.dry_run and not args.list_mailboxes and not LOCAL_INGEST_KEY:
         print("Error: OPEN_BRAIN_INGEST_KEY or MCP_ACCESS_KEY is required for live ingest.", file=sys.stderr)
         return 1
+    if args.attachments_only and args.no_attachments:
+        print("Error: --attachments-only cannot be combined with --no-attachments.", file=sys.stderr)
+        return 1
 
     sync_log = load_sync_log()
     account_hash = sha256_text(f"{args.host}|{args.username}")[:16]
@@ -927,11 +966,13 @@ def main():
     processed = 0
     imported = 0
     distilled = 0
+    attachment_only_messages = 0
     attachment_files = 0
     attachment_chunks = 0
     attachment_summaries = 0
     skipped = {}
     failures = 0
+    attachment_name_filter = set(args.attachment_names or [])
 
     try:
         client, effective_username = connect_imap(args.host, args.port, args.username, args.password, use_ssl=not args.no_ssl)
@@ -982,6 +1023,83 @@ def main():
                         for attachment in record["attachments"]:
                             print(f"    attachment[{attachment['index']}] {attachment['filename']} ({attachment['content_type']}, {attachment['size_bytes']} bytes)")
 
+                selected_attachments = record["attachments"]
+                if attachment_name_filter:
+                    selected_attachments = [
+                        attachment for attachment in record["attachments"] if attachment["filename"] in attachment_name_filter
+                    ]
+                    if args.verbose:
+                        print(f"  matched_attachments={len(selected_attachments)}")
+
+                if args.attachments_only:
+                    if not selected_attachments:
+                        skipped["no_matching_attachments"] = skipped.get("no_matching_attachments", 0) + 1
+                        continue
+
+                    if args.dry_run:
+                        for attachment in selected_attachments:
+                            try:
+                                if args.verbose:
+                                    print(f"  processing_attachment={attachment['filename']}")
+                                attachment_result = process_attachment(
+                                    record,
+                                    attachment,
+                                    docling_base_url=docling_base_url,
+                                    chunker=args.attachment_chunker,
+                                    dry_run=True,
+                                    no_summaries=args.no_attachment_summaries,
+                                    verbose=args.verbose,
+                                )
+                                if args.verbose:
+                                    print(
+                                        "  processed_attachment="
+                                        f"{attachment['filename']} chunks={attachment_result['chunk_count']} "
+                                        f"summaries={attachment_result['summary_count']} "
+                                        f"pipeline={attachment_result.get('docling_pipeline_used')}"
+                                    )
+                                attachment_files += 1
+                                attachment_chunks += attachment_result["chunk_count"]
+                                attachment_summaries += attachment_result["summary_count"]
+                            except Exception as exc:
+                                failures += 1
+                                print(
+                                    f"ERROR UID {uid}: attachment {attachment['filename']} processing failed: {exc}",
+                                    file=sys.stderr,
+                                )
+                        continue
+
+                    attachment_only_messages += 1
+                    for attachment in selected_attachments:
+                        try:
+                            if args.verbose:
+                                print(f"  processing_attachment={attachment['filename']}")
+                            attachment_result = process_attachment(
+                                record,
+                                attachment,
+                                docling_base_url=docling_base_url,
+                                chunker=args.attachment_chunker,
+                                dry_run=False,
+                                no_summaries=args.no_attachment_summaries,
+                                verbose=args.verbose,
+                            )
+                            if args.verbose:
+                                print(
+                                    "  processed_attachment="
+                                    f"{attachment['filename']} chunks={attachment_result['chunk_count']} "
+                                    f"summaries={attachment_result['summary_count']} "
+                                    f"pipeline={attachment_result.get('docling_pipeline_used')}"
+                                )
+                            attachment_files += 1
+                            attachment_chunks += attachment_result["chunk_count"]
+                            attachment_summaries += attachment_result["summary_count"]
+                        except Exception as exc:
+                            failures += 1
+                            print(
+                                f"ERROR UID {uid}: attachment {attachment['filename']} processing failed: {exc}",
+                                file=sys.stderr,
+                            )
+                    continue
+
                 result = ingest_email(record, dry_run=args.dry_run)
                 if not result["ok"]:
                     failures += 1
@@ -992,8 +1110,10 @@ def main():
 
                 if args.dry_run:
                     if not args.no_attachments:
-                        for attachment in record["attachments"]:
+                        for attachment in selected_attachments:
                             try:
+                                if args.verbose:
+                                    print(f"  processing_attachment={attachment['filename']}")
                                 attachment_result = process_attachment(
                                     record,
                                     attachment,
@@ -1003,6 +1123,13 @@ def main():
                                     no_summaries=args.no_attachment_summaries,
                                     verbose=args.verbose,
                                 )
+                                if args.verbose:
+                                    print(
+                                        "  processed_attachment="
+                                        f"{attachment['filename']} chunks={attachment_result['chunk_count']} "
+                                        f"summaries={attachment_result['summary_count']} "
+                                        f"pipeline={attachment_result.get('docling_pipeline_used')}"
+                                    )
                                 attachment_files += 1
                                 attachment_chunks += attachment_result["chunk_count"]
                                 attachment_summaries += attachment_result["summary_count"]
@@ -1027,8 +1154,10 @@ def main():
                 imported += 1
 
                 if not args.no_attachments:
-                    for attachment in record["attachments"]:
+                    for attachment in selected_attachments:
                         try:
+                            if args.verbose:
+                                print(f"  processing_attachment={attachment['filename']}")
                             attachment_result = process_attachment(
                                 record,
                                 attachment,
@@ -1038,6 +1167,13 @@ def main():
                                 no_summaries=args.no_attachment_summaries,
                                 verbose=args.verbose,
                             )
+                            if args.verbose:
+                                print(
+                                    "  processed_attachment="
+                                    f"{attachment['filename']} chunks={attachment_result['chunk_count']} "
+                                    f"summaries={attachment_result['summary_count']} "
+                                    f"pipeline={attachment_result.get('docling_pipeline_used')}"
+                                )
                             attachment_files += 1
                             attachment_chunks += attachment_result["chunk_count"]
                             attachment_summaries += attachment_result["summary_count"]
@@ -1095,6 +1231,7 @@ def main():
     print(f"processed={processed}")
     print(f"imported={imported}")
     print(f"distilled={distilled}")
+    print(f"attachment_only_messages={attachment_only_messages}")
     print(f"attachment_files={attachment_files}")
     print(f"attachment_chunks={attachment_chunks}")
     print(f"attachment_summaries={attachment_summaries}")

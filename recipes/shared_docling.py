@@ -10,6 +10,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -41,6 +42,30 @@ DOCLING_OCR_ENABLED = os.environ.get("DOCLING_OCR_ENABLED", "true").strip().lowe
 DOCLING_FORCE_OCR = os.environ.get("DOCLING_FORCE_OCR", "false").strip().lower() in ("1", "true", "yes", "on")
 DOCLING_OCR_ENGINE = os.environ.get("DOCLING_OCR_ENGINE", "tesseract").strip() or "tesseract"
 DOCLING_OCR_LANG = os.environ.get("DOCLING_OCR_LANG", "bul,eng").strip() or "bul,eng"
+DOCLING_VLM_FALLBACK_ENABLED = os.environ.get("DOCLING_VLM_FALLBACK_ENABLED", "true").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+DOCLING_VLM_FALLBACK_MIN_TEXT_CHARS_PDF = int(os.environ.get("DOCLING_VLM_FALLBACK_MIN_TEXT_CHARS_PDF", "500"))
+DOCLING_VLM_FALLBACK_MIN_TEXT_CHARS_IMAGE = int(os.environ.get("DOCLING_VLM_FALLBACK_MIN_TEXT_CHARS_IMAGE", "120"))
+DOCLING_VLM_FALLBACK_MAX_SHORT_LINE_RATIO = float(
+    os.environ.get("DOCLING_VLM_FALLBACK_MAX_SHORT_LINE_RATIO", "0.35")
+)
+DOCLING_VLM_FALLBACK_MIN_ALNUM_RATIO = float(os.environ.get("DOCLING_VLM_FALLBACK_MIN_ALNUM_RATIO", "0.55"))
+DOCLING_VLM_FALLBACK_MAX_DUPLICATE_LINE_RATIO = float(
+    os.environ.get("DOCLING_VLM_FALLBACK_MAX_DUPLICATE_LINE_RATIO", "0.30")
+)
+DOCLING_VLM_FALLBACK_MIN_LEXICAL_VARIETY = float(
+    os.environ.get("DOCLING_VLM_FALLBACK_MIN_LEXICAL_VARIETY", "0.18")
+)
+DOCLING_VLM_FALLBACK_MIN_TOKEN_COUNT_FOR_VARIETY = int(
+    os.environ.get("DOCLING_VLM_FALLBACK_MIN_TOKEN_COUNT_FOR_VARIETY", "200")
+)
+DOCLING_VLM_FALLBACK_REQUIRED_SOFT_FAILS = int(
+    os.environ.get("DOCLING_VLM_FALLBACK_REQUIRED_SOFT_FAILS", "2")
+)
 
 THOUGHTS_TOOL = {
     "type": "function",
@@ -240,7 +265,99 @@ def file_content_type(path):
     return guessed or "application/octet-stream"
 
 
-def docling_chunk(base_url, path, chunker, *, force_ocr=None):
+def collect_chunk_text(chunks):
+    return "\n\n".join(
+        chunk.get("text", "").strip()
+        for chunk in chunks
+        if isinstance(chunk, dict) and isinstance(chunk.get("text"), str) and chunk.get("text").strip()
+    ).strip()
+
+
+def normalize_extracted_text(text):
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def classify_file_kind(path):
+    suffix = Path(path).suffix.lower()
+    if suffix == ".pdf":
+        return "pdf"
+    if suffix in {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp"}:
+        return "image"
+    return "other"
+
+
+def score_extraction_quality(path, chunks, document_text):
+    file_kind = classify_file_kind(path)
+    normalized_text = normalize_extracted_text(document_text)
+    raw_lines = [
+        line.strip()
+        for line in (document_text or "").splitlines()
+        if isinstance(line, str) and line.strip()
+    ]
+    non_whitespace_chars = [char for char in normalized_text if not char.isspace()]
+    alnum_chars = [char for char in non_whitespace_chars if char.isalnum()]
+    tokens = re.findall(r"\w+", normalized_text.lower(), flags=re.UNICODE)
+
+    unique_lines = len(set(raw_lines))
+    duplicate_line_ratio = 0.0
+    if raw_lines:
+        duplicate_line_ratio = max(0.0, 1.0 - (unique_lines / len(raw_lines)))
+
+    short_line_ratio = 0.0
+    if raw_lines:
+        short_line_ratio = sum(1 for line in raw_lines if len(line) <= 3) / len(raw_lines)
+
+    alnum_ratio = 0.0
+    if non_whitespace_chars:
+        alnum_ratio = len(alnum_chars) / len(non_whitespace_chars)
+
+    lexical_variety = None
+    if len(tokens) >= DOCLING_VLM_FALLBACK_MIN_TOKEN_COUNT_FOR_VARIETY:
+        lexical_variety = len(set(tokens)) / len(tokens)
+
+    min_text_chars = DOCLING_VLM_FALLBACK_MIN_TEXT_CHARS_IMAGE if file_kind == "image" else DOCLING_VLM_FALLBACK_MIN_TEXT_CHARS_PDF
+
+    hard_fail_reasons = []
+    if not chunks:
+        hard_fail_reasons.append("zero_chunks")
+    if not normalized_text:
+        hard_fail_reasons.append("empty_text")
+
+    soft_fail_reasons = []
+    if normalized_text and len(normalized_text) < min_text_chars:
+        soft_fail_reasons.append("text_too_short")
+    if raw_lines and short_line_ratio > DOCLING_VLM_FALLBACK_MAX_SHORT_LINE_RATIO:
+        soft_fail_reasons.append("short_line_ratio_high")
+    if non_whitespace_chars and alnum_ratio < DOCLING_VLM_FALLBACK_MIN_ALNUM_RATIO:
+        soft_fail_reasons.append("alnum_ratio_low")
+    if raw_lines and duplicate_line_ratio > DOCLING_VLM_FALLBACK_MAX_DUPLICATE_LINE_RATIO:
+        soft_fail_reasons.append("duplicate_line_ratio_high")
+    if lexical_variety is not None and lexical_variety < DOCLING_VLM_FALLBACK_MIN_LEXICAL_VARIETY:
+        soft_fail_reasons.append("lexical_variety_low")
+
+    return {
+        "file_kind": file_kind,
+        "chunk_count": len(chunks),
+        "normalized_char_count": len(normalized_text),
+        "line_count": len(raw_lines),
+        "token_count": len(tokens),
+        "min_text_chars": min_text_chars,
+        "short_line_ratio": round(short_line_ratio, 4),
+        "alnum_ratio": round(alnum_ratio, 4),
+        "duplicate_line_ratio": round(duplicate_line_ratio, 4),
+        "lexical_variety": round(lexical_variety, 4) if lexical_variety is not None else None,
+        "hard_fail_reasons": hard_fail_reasons,
+        "soft_fail_reasons": soft_fail_reasons,
+    }
+
+
+def should_run_vlm_fallback(signals):
+    if signals["hard_fail_reasons"]:
+        return True
+    return len(signals["soft_fail_reasons"]) >= DOCLING_VLM_FALLBACK_REQUIRED_SOFT_FAILS
+
+
+def docling_request(base_url, path, chunker, *, pipeline="standard", force_ocr=None):
     path = Path(path)
     endpoint = {
         "hierarchical": "/v1/chunk/hierarchical/file",
@@ -251,6 +368,8 @@ def docling_chunk(base_url, path, chunker, *, force_ocr=None):
         "convert_force_ocr": str(DOCLING_FORCE_OCR if force_ocr is None else force_ocr).lower(),
         "convert_ocr_engine": DOCLING_OCR_ENGINE,
         "convert_ocr_lang": DOCLING_OCR_LANG,
+        "convert_pipeline": pipeline,
+        "include_converted_doc": "true",
         "target_type": "inbody",
     }
 
@@ -279,11 +398,67 @@ def docling_chunk(base_url, path, chunker, *, force_ocr=None):
         body = resp.text[:500] if resp is not None else "no response"
         raise RuntimeError(f"Docling chunking failed for {path.name}: {resp.status_code if resp else 'no response'} {body}")
 
-    payload = resp.json()
-    chunks = payload.get("chunks", [])
-    if not chunks:
-        raise RuntimeError(f"Docling returned zero chunks for {path.name} with chunker={chunker}")
-    return payload
+    return resp.json()
+
+
+def docling_chunk(base_url, path, chunker, *, force_ocr=None):
+    standard_payload = docling_request(base_url, path, chunker, pipeline="standard", force_ocr=force_ocr)
+    standard_chunks = standard_payload.get("chunks", [])
+    standard_text = collect_chunk_text(standard_chunks)
+    standard_signals = score_extraction_quality(path, standard_chunks, standard_text)
+
+    final_payload = standard_payload
+    final_chunks = standard_chunks
+    final_text = standard_text
+    final_pipeline = "standard"
+    fallback_triggered = False
+    fallback_attempted = False
+    fallback_error = None
+    fallback_reasons = standard_signals["hard_fail_reasons"] + standard_signals["soft_fail_reasons"]
+
+    if DOCLING_VLM_FALLBACK_ENABLED and should_run_vlm_fallback(standard_signals):
+        fallback_attempted = True
+        try:
+            vlm_payload = docling_request(base_url, path, chunker, pipeline="vlm", force_ocr=force_ocr)
+            vlm_chunks = vlm_payload.get("chunks", [])
+            vlm_text = collect_chunk_text(vlm_chunks)
+            vlm_signals = score_extraction_quality(path, vlm_chunks, vlm_text)
+
+            if vlm_chunks:
+                final_payload = vlm_payload
+                final_chunks = vlm_chunks
+                final_text = vlm_text
+                final_pipeline = "vlm"
+                fallback_triggered = True
+                final_signals = vlm_signals
+            else:
+                fallback_error = "vlm_returned_zero_chunks"
+                final_signals = standard_signals
+        except Exception as exc:
+            fallback_error = str(exc)
+            final_signals = standard_signals
+    else:
+        final_signals = standard_signals
+
+    if not final_chunks:
+        raise RuntimeError(
+            f"Docling returned zero chunks for {Path(path).name} with chunker={chunker} pipeline={final_pipeline}"
+        )
+
+    return {
+        "chunks": final_chunks,
+        "document_text": final_text,
+        "pipeline_used": final_pipeline,
+        "fallback_triggered": fallback_triggered,
+        "quality_signals": {
+            "standard": standard_signals,
+            "final": final_signals,
+            "fallback_reasons": fallback_reasons,
+            "fallback_attempted": fallback_attempted,
+            "fallback_error": fallback_error,
+        },
+        "raw_payload": final_payload,
+    }
 
 
 def summarize_document(title, document_text):

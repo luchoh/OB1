@@ -50,6 +50,7 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 - The service now serves the production embedding dimension directly, so clients should not perform their own truncation in steady state.
 - The canonical runtime scaffold now lives in [`local/open-brain-mcp`](/Users/luchoh/Dev/OB1/local/open-brain-mcp) and mirrors the Hono/MCP pattern used by the extension examples.
 - The canonical document-ingest path is now the live Docling service plus [recipes/document-import](/Users/luchoh/Dev/OB1/recipes/document-import#L1).
+- Document and attachment import now use an OCR-first Docling pass and automatically retry with the `vlm` pipeline when extraction quality is clearly weak.
 - Run one worker per model service and scale embeddings with batching, not worker duplication.
 - Pre-stage model artifacts locally and prefer offline startup semantics.
 - If later testing proves that `halfvec(3072)` materially improves retrieval quality, that should be treated as an explicit schema migration rather than an in-place tweak.
