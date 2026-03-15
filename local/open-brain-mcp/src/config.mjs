@@ -229,6 +229,7 @@ async function loadConfig() {
     embeddingDimensions: envOptionalNumber("EMBEDDING_DIMENSIONS_PARAMETER", 1536) ?? 1536,
     expectedEmbeddingDimension: envOptionalNumber("EMBEDDING_STORE_DIMENSION", 1536) ?? 1536,
     metadataMaxTokens: envOptionalNumber("OPEN_BRAIN_METADATA_MAX_TOKENS", 400) ?? 400,
+    answerMaxTokens: envOptionalNumber("OPEN_BRAIN_ANSWER_MAX_TOKENS", 600) ?? 600,
     postgres: await pgConfig(consul),
   };
 }

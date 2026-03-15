@@ -101,6 +101,17 @@ const transport = new StreamableHTTPClientTransport(new URL(`${process.env.OPEN_
 try {
   await client.connect(transport);
 
+  const parseToolJson = (result, name) => {
+    if (result.isError) {
+      throw new Error(`${name} returned an error: ${JSON.stringify(result)}`);
+    }
+    const text = result.content?.find((item) => item.type === 'text')?.text;
+    if (!text) {
+      throw new Error(`${name} returned no text payload`);
+    }
+    return JSON.parse(text);
+  };
+
   const tools = await Promise.race([client.listTools(), timeout(5000)]);
   console.log(JSON.stringify({ tools: tools.tools.map((tool) => tool.name) }, null, 2));
 
@@ -115,9 +126,7 @@ try {
     }),
     timeout(20000),
   ]);
-  if (capture.isError) {
-    throw new Error(`capture_thought returned an error: ${JSON.stringify(capture)}`);
-  }
+  parseToolJson(capture, 'capture_thought');
 
   const search = await Promise.race([
     client.callTool({
@@ -130,24 +139,34 @@ try {
     }),
     timeout(20000),
   ]);
-  if (search.isError) {
-    throw new Error(`search_thoughts returned an error: ${JSON.stringify(search)}`);
-  }
+  parseToolJson(search, 'search_thoughts');
 
   const listThoughts = await Promise.race([
     client.callTool({ name: 'list_thoughts', arguments: { limit: 3 } }),
     timeout(5000),
   ]);
-  if (listThoughts.isError) {
-    throw new Error(`list_thoughts returned an error: ${JSON.stringify(listThoughts)}`);
-  }
+  parseToolJson(listThoughts, 'list_thoughts');
 
   const stats = await Promise.race([
     client.callTool({ name: 'stats', arguments: {} }),
     timeout(5000),
   ]);
-  if (stats.isError) {
-    throw new Error(`stats returned an error: ${JSON.stringify(stats)}`);
+  parseToolJson(stats, 'stats');
+
+  const answer = await Promise.race([
+    client.callTool({
+      name: 'ask_brain',
+      arguments: {
+        question: `What does the note beginning "${process.env.SMOKE_MARKER}" say the managed open-brain-local service accepts?`,
+        match_count: 4,
+        match_threshold: 0.1,
+      },
+    }),
+    timeout(30000),
+  ]);
+  const answerPayload = parseToolJson(answer, 'ask_brain');
+  if (!answerPayload.grounded || answerPayload.insufficient_evidence || !Array.isArray(answerPayload.citations) || answerPayload.citations.length === 0) {
+    throw new Error(`ask_brain returned an ungrounded answer: ${JSON.stringify(answerPayload)}`);
   }
 
   console.log(JSON.stringify({
@@ -155,6 +174,7 @@ try {
     search_ok: true,
     list_ok: true,
     stats_ok: true,
+    ask_brain_ok: true,
   }, null, 2));
 } finally {
   await client.close().catch(() => {});

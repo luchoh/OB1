@@ -13,6 +13,7 @@ This is the runnable local core service for the Open Brain Local design.
   - `search_thoughts`
   - `list_thoughts`
   - `stats`
+  - `ask_brain`
 
 ## Prerequisites
 
@@ -52,6 +53,7 @@ Default bind:
 - `http://localhost:8787/health`
 - `http://localhost:8787/mcp`
 - `http://localhost:8787/ingest/thought`
+- `http://localhost:8787/ask`
 
 ## Smoke Test
 
@@ -65,7 +67,7 @@ This verifies:
 - upstream model services and PostgreSQL
 - local migrations
 - local MCP server boot
-- MCP tool calls for capture, search, list, and stats
+- MCP tool calls for capture, search, list, stats, and grounded answering
 
 ## Auth
 
@@ -98,6 +100,24 @@ Request body:
 }
 ```
 
+## HTTP Grounded Answer
+
+The grounded answer route is:
+
+```bash
+POST /ask
+```
+
+Request body:
+
+```json
+{
+  "question": "What units and how large is the apartment on Rayko Aleksiev?",
+  "match_threshold": 0.4,
+  "match_count": 6
+}
+```
+
 ## Notes
 
 - The service loads the repo root `.env` first and then `.env.open-brain-local` so app-specific values win.
@@ -107,6 +127,7 @@ Request body:
 - Importers should supply `dedupe_key` for idempotent writes when identical text can appear in different sources.
 - Importers can set `extract_metadata=false` when they already have structured metadata and only need embeddings plus storage.
 - By default, `search_thoughts` prefers distilled memory rows and falls back to raw source rows. Callers can still force raw/source searches with an explicit metadata filter.
+- `ask_brain` uses the same retrieval path, then forces a grounded answer with explicit citations or an insufficient-evidence response.
 - The schema migration is idempotent at the SQL object level, and the migration runner records applied filenames in `open_brain_schema_migrations`.
 - The real runtime env file is `.env.open-brain-local` and should remain untracked.
 - Managed-service handoff details are in [docs/09-open-brain-local-service-handoff.md](/Users/luchoh/Dev/OB1/docs/09-open-brain-local-service-handoff.md#L1).

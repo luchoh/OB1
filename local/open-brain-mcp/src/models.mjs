@@ -48,6 +48,35 @@ const metadataTool = {
   },
 };
 
+const groundedAnswerTool = {
+  type: "function",
+  function: {
+    name: "submit_grounded_answer",
+    description: "Return a grounded answer using only the provided evidence items.",
+    parameters: {
+      type: "object",
+      additionalProperties: false,
+      required: [
+        "answer",
+        "grounded",
+        "citations",
+      ],
+      properties: {
+        answer: {
+          type: "string",
+        },
+        grounded: {
+          type: "boolean",
+        },
+        citations: {
+          type: "array",
+          items: { type: "string" },
+        },
+      },
+    },
+  },
+};
+
 const SOURCE_RETRIEVAL_TYPES = new Set([
   "email",
   "document_chunk",
@@ -101,6 +130,10 @@ function extractJsonPayload(text) {
 function extractToolArguments(response, expectedName) {
   const toolCalls = response?.choices?.[0]?.message?.tool_calls;
   if (!Array.isArray(toolCalls) || toolCalls.length === 0) {
+    const inlineToolArgs = extractInlineToolArguments(response?.choices?.[0]?.message?.content, expectedName);
+    if (inlineToolArgs) {
+      return inlineToolArgs;
+    }
     throw new Error("Model did not return a tool call");
   }
 
@@ -113,6 +146,37 @@ function extractToolArguments(response, expectedName) {
   return extractJsonPayload(raw);
 }
 
+function extractInlineToolArguments(content, expectedName) {
+  const text = normalizeChatContent(content);
+  if (!text.includes("<function=")) {
+    return null;
+  }
+
+  const functionMatch = text.match(/<function=([^>\n]+)>\s*([\s\S]*)/);
+  if (!functionMatch) {
+    return null;
+  }
+
+  const functionName = functionMatch[1]?.trim();
+  if (!functionName || (expectedName && functionName !== expectedName)) {
+    return null;
+  }
+
+  const body = functionMatch[2] ?? "";
+  const params = {};
+  const paramRegex = /<parameter=([^>\n]+)>\s*([\s\S]*?)\s*<\/parameter>/g;
+
+  for (const match of body.matchAll(paramRegex)) {
+    const key = match[1]?.trim();
+    if (!key) {
+      continue;
+    }
+    params[key] = match[2]?.trim() ?? "";
+  }
+
+  return Object.keys(params).length > 0 ? params : null;
+}
+
 function sanitizeStringList(values) {
   if (!Array.isArray(values)) {
     return [];
@@ -121,6 +185,45 @@ function sanitizeStringList(values) {
   return [...new Set(values
     .map((value) => (typeof value === "string" ? value.trim() : ""))
     .filter(Boolean))];
+}
+
+function sanitizeEvidenceItems(evidence) {
+  if (!Array.isArray(evidence)) {
+    return [];
+  }
+
+  return evidence.map((item) => ({
+    id: item.id,
+    similarity: typeof item.similarity === "number" ? Number(item.similarity.toFixed(4)) : null,
+    type: item.type ?? null,
+    source: item.source ?? null,
+    retrieval_role: item.retrieval_role ?? null,
+    occurred_at: item.occurred_at ?? null,
+    summary: item.summary ?? null,
+    excerpt: item.excerpt ?? null,
+    email_sender: item.email_sender ?? null,
+    email_subject: item.email_subject ?? null,
+    document_path: item.document_path ?? null,
+    attachment_filename: item.attachment_filename ?? null,
+  }));
+}
+
+function sanitizeBoolean(value) {
+  if (typeof value === "boolean") {
+    return value;
+  }
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (["true", "yes", "1"].includes(normalized)) {
+      return true;
+    }
+    if (["false", "no", "0"].includes(normalized)) {
+      return false;
+    }
+  }
+
+  return false;
 }
 
 function resolveRetrievalRole(metadata, type) {
@@ -239,6 +342,69 @@ export async function extractMetadata(content, source) {
       ? parsed.summary.trim()
       : truncateText(content, 280),
     source: typeof parsed.source === "string" && parsed.source.trim() ? parsed.source.trim() : null,
+  };
+}
+
+export async function answerFromEvidence(question, evidence) {
+  const response = await requestJson(`${config.llmBaseUrl}/chat/completions`, {
+    model: config.llmModel,
+    temperature: 0,
+    max_tokens: config.answerMaxTokens,
+    chat_template_kwargs: {
+      enable_thinking: config.llmEnableThinking,
+    },
+    tools: [groundedAnswerTool],
+    tool_choice: "required",
+    messages: [
+      {
+        role: "system",
+        content: [
+          "You answer questions about a personal knowledge base using only the supplied evidence items.",
+          "Do not infer missing facts, motives, purchases, or relationships that are not supported.",
+          "If the evidence is partial, answer only the supported portion and mark the rest as missing.",
+          "If the evidence does not support the question, say so plainly.",
+          "Use only citation ids that appear in the evidence list.",
+          "Never include chain-of-thought or internal reasoning.",
+        ].join(" "),
+      },
+      {
+        role: "user",
+        content: [
+          `Question:\n${question.trim()}`,
+          `Evidence items:\n${JSON.stringify(sanitizeEvidenceItems(evidence), null, 2)}`,
+        ].join("\n\n"),
+      },
+    ],
+  });
+
+  let parsed;
+  try {
+    parsed = extractToolArguments(response, "submit_grounded_answer");
+  } catch (error) {
+    const plainAnswer = normalizeChatContent(response?.choices?.[0]?.message?.content);
+    if (plainAnswer) {
+      return {
+        answer: plainAnswer.trim(),
+        grounded: false,
+        insufficient_evidence: true,
+        citations: [],
+      };
+    }
+    throw error;
+  }
+
+  const evidenceIds = new Set(evidence.map((item) => item.id));
+  const citations = sanitizeStringList(parsed.citations).filter((item) => evidenceIds.has(item));
+  const grounded = sanitizeBoolean(parsed.grounded) && citations.length > 0;
+  const insufficientEvidence = Boolean(parsed.insufficient_evidence) || !grounded;
+
+  return {
+    answer: typeof parsed.answer === "string" && parsed.answer.trim()
+      ? parsed.answer.trim()
+      : "I do not have enough evidence in memory to answer that reliably.",
+    grounded,
+    insufficient_evidence: insufficientEvidence,
+    citations,
   };
 }
 

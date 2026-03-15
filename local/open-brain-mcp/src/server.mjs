@@ -5,6 +5,7 @@ import * as z from "zod/v3";
 import { config } from "./config.mjs";
 import { closePool, formatVector, healthcheckDatabase, query } from "./db.mjs";
 import {
+  answerFromEvidence,
   createEmbedding,
   extractMetadata,
   healthcheckUpstreams,
@@ -34,6 +35,14 @@ const listThoughtsSchema = {
   limit: z.number().int().min(1).max(100).optional().describe("Number of recent thoughts to return."),
   filter: z.record(z.any()).optional().describe("Optional JSONB containment filter."),
 };
+
+const askBrainSchema = {
+  question: z.string().min(1).describe("Natural-language question to answer from the local brain."),
+  match_threshold: z.number().min(0).max(1).optional().describe("Minimum similarity threshold for retrieval."),
+  match_count: z.number().int().min(1).max(12).optional().describe("Maximum number of evidence items to consider."),
+  filter: z.record(z.any()).optional().describe("Optional JSONB containment filter for retrieval."),
+};
+const askBrainInput = z.object(askBrainSchema);
 
 function authKey(c) {
   return c.req.query("key")
@@ -71,6 +80,46 @@ function errorToolResult(error) {
   };
 }
 
+function truncateText(text, limit = 280) {
+  if (typeof text !== "string") {
+    return "";
+  }
+
+  if (text.length <= limit) {
+    return text;
+  }
+
+  return `${text.slice(0, limit - 1)}…`;
+}
+
+function nestedUserMetadata(row) {
+  const userMetadata = row?.metadata?.user_metadata;
+  return userMetadata && typeof userMetadata === "object" && !Array.isArray(userMetadata)
+    ? userMetadata
+    : {};
+}
+
+function evidenceCitation(row) {
+  const metadata = row.metadata ?? {};
+  const userMetadata = nestedUserMetadata(row);
+
+  return {
+    id: row.id,
+    similarity: typeof row.similarity === "number" ? Number(row.similarity.toFixed(4)) : null,
+    type: metadata.type ?? userMetadata.type ?? null,
+    source: metadata.source ?? userMetadata.source ?? null,
+    retrieval_role: metadata.retrieval_role ?? null,
+    occurred_at: metadata.occurred_at ?? userMetadata.occurred_at ?? null,
+    summary: metadata.summary ?? userMetadata.summary ?? truncateText(row.content, 240),
+    excerpt: truncateText(row.content, 420),
+    email_sender: userMetadata.email_sender ?? userMetadata.sender ?? null,
+    email_subject: userMetadata.email_subject ?? userMetadata.subject ?? null,
+    document_path: userMetadata.document_path ?? null,
+    attachment_filename: userMetadata.attachment_filename ?? null,
+    created_at: row.created_at ?? null,
+  };
+}
+
 function hasExplicitSearchRole(filter) {
   return filter
     && typeof filter === "object"
@@ -88,6 +137,54 @@ async function matchThoughtRows({ embedding, threshold, count, filter }) {
       JSON.stringify(filter),
     ],
   );
+}
+
+async function retrieveThoughts({ queryText, threshold, count, filter }) {
+  const embedding = await createEmbedding(queryText.trim());
+
+  let results;
+  let retrievalStrategy = "direct";
+  let fallbackUsed = false;
+
+  if (hasExplicitSearchRole(filter)) {
+    const direct = await matchThoughtRows({
+      embedding,
+      threshold,
+      count,
+      filter,
+    });
+    results = direct.rows;
+  } else {
+    retrievalStrategy = "distilled-first";
+
+    const preferred = await matchThoughtRows({
+      embedding,
+      threshold,
+      count,
+      filter: { ...filter, retrieval_role: "distilled" },
+    });
+
+    results = preferred.rows;
+
+    if (results.length < count) {
+      const fallback = await matchThoughtRows({
+        embedding,
+        threshold,
+        count: Math.min(count * 3, 50),
+        filter,
+      });
+
+      results = mergeUniqueThoughtRows(preferred.rows, fallback.rows).slice(0, count);
+      fallbackUsed = true;
+    }
+  }
+
+  return {
+    query: queryText,
+    retrieval_strategy: retrievalStrategy,
+    fallback_used: fallbackUsed,
+    results,
+  };
 }
 
 function mergeUniqueThoughtRows(...groups) {
@@ -206,55 +303,65 @@ async function handleCaptureThought(args) {
 }
 
 async function handleSearchThoughts(args) {
-  const embedding = await createEmbedding(args.query.trim());
   const threshold = args.match_threshold ?? 0.4;
   const matchCount = args.match_count ?? 10;
   const filter = args.filter ?? {};
-
-  let results;
-  let retrievalStrategy = "direct";
-  let fallbackUsed = false;
-
-  if (hasExplicitSearchRole(filter)) {
-    const direct = await matchThoughtRows({
-      embedding,
-      threshold,
-      count: matchCount,
-      filter,
-    });
-    results = direct.rows;
-  } else {
-    retrievalStrategy = "distilled-first";
-
-    const preferred = await matchThoughtRows({
-      embedding,
-      threshold,
-      count: matchCount,
-      filter: { ...filter, retrieval_role: "distilled" },
-    });
-
-    results = preferred.rows;
-
-    if (results.length < matchCount) {
-      const fallback = await matchThoughtRows({
-        embedding,
-        threshold,
-        count: Math.min(matchCount * 3, 50),
-        filter,
-      });
-
-      results = mergeUniqueThoughtRows(preferred.rows, fallback.rows).slice(0, matchCount);
-      fallbackUsed = true;
-    }
-  }
+  const retrieval = await retrieveThoughts({
+    queryText: args.query,
+    threshold,
+    count: matchCount,
+    filter,
+  });
 
   return {
     success: true,
     query: args.query,
-    retrieval_strategy: retrievalStrategy,
-    fallback_used: fallbackUsed,
-    count: results.length,
-    results,
+    retrieval_strategy: retrieval.retrieval_strategy,
+    fallback_used: retrieval.fallback_used,
+    count: retrieval.results.length,
+    results: retrieval.results,
+  };
+}
+
+async function handleAskBrain(args) {
+  const threshold = args.match_threshold ?? 0.4;
+  const matchCount = args.match_count ?? 6;
+  const filter = args.filter ?? {};
+  const retrieval = await retrieveThoughts({
+    queryText: args.question,
+    threshold,
+    count: matchCount,
+    filter,
+  });
+  const evidence = retrieval.results.map(evidenceCitation);
+
+  if (evidence.length === 0) {
+    return {
+      success: true,
+      question: args.question,
+      answer: "I do not have enough evidence in memory to answer that reliably.",
+      grounded: false,
+      insufficient_evidence: true,
+      retrieval_strategy: retrieval.retrieval_strategy,
+      fallback_used: retrieval.fallback_used,
+      evidence_count: 0,
+      citations: [],
+    };
+  }
+
+  const grounded = await answerFromEvidence(args.question, evidence);
+  const citations = evidence.filter((item) => grounded.citations.includes(item.id));
+
+  return {
+    success: true,
+    question: args.question,
+    answer: grounded.answer,
+    grounded: grounded.grounded,
+    insufficient_evidence: grounded.insufficient_evidence,
+    retrieval_strategy: retrieval.retrieval_strategy,
+    fallback_used: retrieval.fallback_used,
+    evidence_count: evidence.length,
+    citations,
   };
 }
 
@@ -373,6 +480,19 @@ function buildMcpServer() {
     },
   );
 
+  server.tool(
+    "ask_brain",
+    "Answer a question from the local Open Brain using grounded retrieved evidence.",
+    askBrainSchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleAskBrain(args));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
   return server;
 }
 
@@ -425,6 +545,23 @@ app.post("/ingest/thought", async (c) => {
     const payload = captureThoughtInput.parse(await c.req.json());
     const result = await handleCaptureThought(payload);
     return c.json(result, 201);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const status = error instanceof z.ZodError ? 400 : 500;
+    return c.json({ success: false, error: message }, status);
+  }
+});
+
+app.post("/ask", async (c) => {
+  const key = authKey(c);
+  if (!key || key !== config.accessKey) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const payload = askBrainInput.parse(await c.req.json());
+    const result = await handleAskBrain(payload);
+    return c.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     const status = error instanceof z.ZodError ? 400 : 500;
