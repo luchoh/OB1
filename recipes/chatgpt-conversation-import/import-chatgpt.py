@@ -3,11 +3,13 @@
 Open Brain — ChatGPT Export Importer
 
 Extracts conversations from a ChatGPT data export (zip or extracted directory),
-filters trivial ones, summarizes each into 1-3 distilled thoughts via LLM,
+filters trivial ones, summarizes each into adaptively sized distilled thoughts via LLM,
 and loads them into your Open Brain instance.
 
 Supports both single conversations.json and the multi-file format
 (conversations-000.json through conversations-NNN.json) used in large exports.
+Also preserves text from newer multimodal user turns and includes attachment
+filenames as textual context for summarization.
 
 Usage:
     python import-chatgpt.py path/to/export.zip [options]
@@ -66,29 +68,22 @@ LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip
 LOCAL_INGEST_URL = os.environ.get("OPEN_BRAIN_INGEST_URL") or "http://localhost:8787/ingest/thought"
 LOCAL_INGEST_KEY = os.environ.get("OPEN_BRAIN_INGEST_KEY") or os.environ.get("MCP_ACCESS_KEY", "")
 
-THOUGHTS_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "submit_thoughts",
-        "description": "Return extracted durable thoughts from the conversation.",
-        "parameters": {
-            "type": "object",
-            "additionalProperties": False,
-            "required": ["thoughts"],
-            "properties": {
-                "thoughts": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Up to 3 durable first-person thoughts worth keeping.",
-                }
-            },
-        },
-    },
-}
-
 # Filtering thresholds
 MIN_TOTAL_MESSAGES = 4
 MIN_USER_WORDS = 20
+DEFAULT_THOUGHT_LIMIT = 3
+MAX_THOUGHT_LIMIT = 7
+WORD_BASED_THOUGHT_LIMITS = (
+    (6500, 7),
+    (4000, 6),
+    (2000, 5),
+    (900, 4),
+)
+MESSAGE_BASED_THOUGHT_LIMITS = (
+    (36, 6),
+    (24, 5),
+    (14, 4),
+)
 SKIP_TITLE_PATTERNS = re.compile(
     r"do not remember|forget this|don't remember|ignore this"
     r"|limerick|haiku|poem |joke |riddle"
@@ -98,12 +93,12 @@ SKIP_TITLE_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-SUMMARIZATION_PROMPT = """\
+SUMMARIZATION_PROMPT_TEMPLATE = """\
 You are distilling a ChatGPT conversation into standalone thoughts for a \
 personal knowledge base. Your job is to be HIGHLY SELECTIVE — only extract \
 knowledge that would be valuable to retrieve months or years from now.
 
-CAPTURE these (1-3 thoughts max):
+CAPTURE these (1-{limit} thoughts max):
 - Decisions made and the reasoning behind them
 - People mentioned with context (who they are, relationship, what was discussed)
 - Project plans, strategies, or architectural choices
@@ -125,9 +120,12 @@ Each thought must be:
 - 1-3 sentences
 
 Return a JSON object with exactly one key: "thoughts".
-The value of "thoughts" must be an array of 0-3 real thought strings.
+The value of "thoughts" must be an array of 0-{limit} real thought strings.
+Treat {limit} as an upper bound, not a target. Return fewer when the conversation
+only supports a small number of durable memories, and only go above 3 when the
+conversation clearly contains several distinct long-term-useful ideas.
 Do not use placeholders such as "thought1", "thought2", or template labels.
-If the conversation has nothing worth capturing, return {"thoughts": []}
+If the conversation has nothing worth capturing, return {{"thoughts": []}}
 Err on the side of returning empty — less is more."""
 
 # ─── Sync Log ────────────────────────────────────────────────────────────────
@@ -215,6 +213,129 @@ def extract_tool_arguments(response_json, expected_name):
         raise ValueError("Tool call arguments were empty")
 
     return extract_json_payload(arguments)
+
+
+def normalize_thoughts(thoughts, limit=3):
+    """Normalize model output to a small unique list of real thoughts."""
+    if isinstance(thoughts, str):
+        thoughts = [thoughts]
+    elif not isinstance(thoughts, list):
+        return []
+
+    normalized = []
+    seen = set()
+    for item in thoughts:
+        if isinstance(item, str):
+            stripped = item.strip()
+            if stripped.startswith("[") or stripped.startswith("{"):
+                parsed = None
+                candidates = [stripped]
+                if stripped.startswith("[") and "]" in stripped:
+                    candidates.append(stripped[: stripped.rfind("]") + 1])
+                if stripped.startswith("{") and "}" in stripped:
+                    candidates.append(stripped[: stripped.rfind("}") + 1])
+
+                for candidate in candidates:
+                    try:
+                        parsed = json.loads(candidate)
+                        break
+                    except json.JSONDecodeError:
+                        continue
+                if isinstance(parsed, list):
+                    for nested in normalize_thoughts(parsed, limit=limit - len(normalized)):
+                        if nested in seen:
+                            continue
+                        seen.add(nested)
+                        normalized.append(nested)
+                        if len(normalized) >= limit:
+                            return normalized
+                    continue
+                if isinstance(parsed, dict):
+                    for nested in normalize_thoughts(parsed.get("thoughts", []), limit=limit - len(normalized)):
+                        if nested in seen:
+                            continue
+                        seen.add(nested)
+                        normalized.append(nested)
+                        if len(normalized) >= limit:
+                            return normalized
+                    continue
+        else:
+            continue
+
+        thought = item.strip()
+        if not thought:
+            continue
+        if thought in seen:
+            continue
+        seen.add(thought)
+        normalized.append(thought)
+        if len(normalized) >= limit:
+            break
+
+    return normalized
+
+
+def determine_thought_limit(word_count, message_count):
+    """Return a deterministic upper bound for durable thoughts.
+
+    This is an upper bound, not a target. The LLM should still return fewer
+    thoughts for narrow conversations.
+    """
+    word_limit = DEFAULT_THOUGHT_LIMIT
+    for minimum_words, candidate_limit in WORD_BASED_THOUGHT_LIMITS:
+        if word_count >= minimum_words:
+            word_limit = candidate_limit
+            break
+
+    message_limit = DEFAULT_THOUGHT_LIMIT
+    for minimum_messages, candidate_limit in MESSAGE_BASED_THOUGHT_LIMITS:
+        if message_count >= minimum_messages:
+            message_limit = candidate_limit
+            break
+
+    return min(MAX_THOUGHT_LIMIT, max(DEFAULT_THOUGHT_LIMIT, word_limit, message_limit))
+
+
+def build_thoughts_tool(limit):
+    """Build the tool schema for the current adaptive thought cap."""
+    return {
+        "type": "function",
+        "function": {
+            "name": "submit_thoughts",
+            "description": "Return extracted durable thoughts from the conversation.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["thoughts"],
+                "properties": {
+                    "thoughts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            f"Up to {limit} durable first-person thoughts worth keeping. "
+                            "Return fewer when appropriate."
+                        ),
+                    }
+                },
+            },
+        },
+    }
+
+
+def build_summarization_prompt(limit):
+    """Render the prompt for the current adaptive thought cap."""
+    return SUMMARIZATION_PROMPT_TEMPLATE.format(limit=limit)
+
+
+def summarize_input_limit(thought_limit):
+    """Return the input truncation budget for summarization."""
+    extra_limit = max(0, thought_limit - DEFAULT_THOUGHT_LIMIT)
+    return min(16000, 6000 + (extra_limit * 2500))
+
+
+def summarize_output_limit(thought_limit):
+    """Return the token budget for summarization."""
+    return max(500, 220 * thought_limit)
 
 
 # ─── ChatGPT Export Parsing ──────────────────────────────────────────────────
@@ -331,6 +452,53 @@ def walk_messages(mapping):
     return messages
 
 
+def extract_message_text(message, include_attachment_labels=False):
+    """Extract human-readable text from a ChatGPT message payload."""
+    content = message.get("content", {})
+    content_type = content.get("content_type")
+    metadata = message.get("metadata") or {}
+
+    if content_type == "user_editable_context":
+        # This is the persistent profile/instructions blob, not a real turn.
+        return ""
+
+    fragments = []
+
+    if content_type in {
+        "text",
+        "code",
+        "execution_output",
+        "computer_output",
+        "system_error",
+        "tether_browsing_display",
+        "tether_quote",
+    }:
+        parts = content.get("parts", [])
+        for part in parts:
+            if isinstance(part, str):
+                text = part.strip()
+                if text:
+                    fragments.append(text)
+
+    elif content_type == "multimodal_text":
+        if include_attachment_labels:
+            attachment_names = []
+            for attachment in metadata.get("attachments") or []:
+                name = attachment.get("name") or attachment.get("id")
+                if name:
+                    attachment_names.append(name)
+            if attachment_names:
+                fragments.append(f"Attachments: {', '.join(attachment_names)}")
+
+        for part in content.get("parts", []):
+            if isinstance(part, str):
+                text = part.strip()
+                if text:
+                    fragments.append(text)
+
+    return "\n".join(fragments).strip()
+
+
 def extract_user_text(messages):
     """Extract text from user messages only, concatenated with separators."""
     parts = []
@@ -338,26 +506,22 @@ def extract_user_text(messages):
         author = msg.get("author", {})
         if author.get("role") != "user":
             continue
-        content = msg.get("content", {})
-        if content.get("content_type") != "text":
-            continue
-        text_parts = content.get("parts", [])
-        text = "\n".join(str(p) for p in text_parts if isinstance(p, str)).strip()
+        text = extract_message_text(msg, include_attachment_labels=True)
         if text:
             parts.append(text)
     return "\n---\n".join(parts)
 
 
 def count_messages(messages):
-    """Count total messages (all roles) that have text content."""
+    """Count visible user/assistant turns that carry meaningful text."""
     count = 0
     for msg in messages:
-        content = msg.get("content", {})
-        if content.get("content_type") == "text":
-            parts = content.get("parts", [])
-            text = "".join(str(p) for p in parts if isinstance(p, str)).strip()
-            if text:
-                count += 1
+        author_role = (msg.get("author") or {}).get("role")
+        if author_role not in {"user", "assistant"}:
+            continue
+        text = extract_message_text(msg, include_attachment_labels=(author_role == "user"))
+        if text:
+            count += 1
     return count
 
 
@@ -405,9 +569,9 @@ def should_skip(conv, user_text, message_count, sync_log, args):
 # ─── LLM Summarization ──────────────────────────────────────────────────────
 
 
-def summarize_local(title, date_str, user_text):
+def summarize_local(title, date_str, user_text, thought_limit):
     """Summarize a conversation using the local OpenAI-compatible LLM endpoint."""
-    truncated = user_text[:6000]
+    truncated = user_text[: summarize_input_limit(thought_limit)]
 
     resp = http_post_with_retry(
         f"{local_llm_base_url()}/chat/completions",
@@ -415,14 +579,14 @@ def summarize_local(title, date_str, user_text):
         body={
             "model": LOCAL_LLM_MODEL,
             "temperature": 0,
-            "max_tokens": 500,
+            "max_tokens": summarize_output_limit(thought_limit),
             "chat_template_kwargs": {
                 "enable_thinking": LOCAL_LLM_ENABLE_THINKING,
             },
-            "tools": [THOUGHTS_TOOL],
+            "tools": [build_thoughts_tool(thought_limit)],
             "tool_choice": "required",
             "messages": [
-                {"role": "system", "content": SUMMARIZATION_PROMPT},
+                {"role": "system", "content": build_summarization_prompt(thought_limit)},
                 {
                     "role": "user",
                     "content": f"Conversation title: {title}\nDate: {date_str}\n\nUser messages:\n{truncated}",
@@ -440,19 +604,19 @@ def summarize_local(title, date_str, user_text):
     try:
         data = resp.json()
         result = extract_tool_arguments(data, "submit_thoughts")
-        thoughts = result.get("thoughts", [])
-        return [t.strip() for t in thoughts if isinstance(t, str) and t.strip()]
+        thoughts = normalize_thoughts(result.get("thoughts", []), limit=thought_limit)
+        return thoughts
     except (KeyError, json.JSONDecodeError, IndexError, ValueError) as e:
         print(f"   Warning: Failed to parse local summarization response: {e}")
         return []
 
 
-def summarize_ollama(title, date_str, user_text, model_name="qwen3"):
+def summarize_ollama(title, date_str, user_text, thought_limit, model_name="qwen3"):
     """Summarize a conversation using a local Ollama model."""
-    truncated = user_text[:6000]
+    truncated = user_text[: summarize_input_limit(thought_limit)]
 
     prompt = (
-        f"{SUMMARIZATION_PROMPT}\n\n"
+        f"{build_summarization_prompt(thought_limit)}\n\n"
         f"Conversation title: {title}\nDate: {date_str}\n\n"
         f"User messages:\n{truncated}"
     )
@@ -479,19 +643,18 @@ def summarize_ollama(title, date_str, user_text, model_name="qwen3"):
     try:
         raw = resp.json().get("response", "")
         result = json.loads(raw)
-        thoughts = result.get("thoughts", [])
-        return [t for t in thoughts if isinstance(t, str) and t.strip()]
+        return normalize_thoughts(result.get("thoughts", []), limit=thought_limit)
     except (json.JSONDecodeError, KeyError) as e:
         print(f"   Warning: Failed to parse Ollama response: {e}")
         return []
 
 
-def summarize(title, date_str, user_text, args):
+def summarize(title, date_str, user_text, thought_limit, args):
     """Dispatch to the appropriate summarization backend."""
     if args.model == "local":
-        return summarize_local(title, date_str, user_text)
+        return summarize_local(title, date_str, user_text, thought_limit)
     if args.model == "ollama":
-        return summarize_ollama(title, date_str, user_text, args.ollama_model)
+        return summarize_ollama(title, date_str, user_text, thought_limit, args.ollama_model)
     raise ValueError(f"Unsupported model backend: {args.model}")
 
 
@@ -673,13 +836,17 @@ def main():
 
         print(f"{processed}. {title}")
         url_display = f"https://chatgpt.com/c/{chatgpt_id}" if chatgpt_id else "no id"
-        print(f"   {message_count} messages | {word_count} user words | {date_str} | {url_display}")
+        thought_limit = determine_thought_limit(word_count, message_count)
+        print(
+            f"   {message_count} messages | {word_count} user words | "
+            f"up to {thought_limit} thoughts | {date_str} | {url_display}"
+        )
 
         # Summarize or use raw
         if args.raw:
             thoughts = [user_text]
         else:
-            thoughts = summarize(title, date_str, user_text, args)
+            thoughts = summarize(title, date_str, user_text, thought_limit, args)
 
         thoughts_generated += len(thoughts)
 
@@ -702,6 +869,7 @@ def main():
                 "date": date_str,
                 "messages": message_count,
                 "user_words": word_count,
+                "thought_limit": thought_limit,
                 "thoughts": thoughts,
             })
 
@@ -730,6 +898,10 @@ def main():
                 "chatgpt_conversation_hash": conv_id,
                 "chatgpt_conversation_id": chatgpt_id,
                 "chatgpt_conversation_url": metadata.get("conversation_url"),
+                "chatgpt_thought_limit": thought_limit,
+                "chatgpt_thought_count": len(thoughts),
+                "chatgpt_message_count": message_count,
+                "chatgpt_user_word_count": word_count,
                 "full_text": user_text,
                 "type": "chatgpt_conversation",
                 "topics": ["chatgpt", "import"],
@@ -812,7 +984,10 @@ def _write_report(filepath, entries, stats):
         f.write("## Conversations\n\n")
         for entry in entries:
             f.write(f"### {entry['title']} ({entry['date']})\n\n")
-            f.write(f"_{entry['messages']} messages, {entry['user_words']} user words_\n\n")
+            f.write(
+                f"_{entry['messages']} messages, {entry['user_words']} user words, "
+                f"adaptive cap {entry['thought_limit']}_\n\n"
+            )
             for i, thought in enumerate(entry["thoughts"], 1):
                 f.write(f"{i}. {thought}\n")
             f.write("\n")

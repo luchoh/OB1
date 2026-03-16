@@ -8,3 +8,6 @@ chatgpt-sync-log.json
 __pycache__/
 *.pyc
 recipes/email-history-import/imap-sync-log.json
+recipes/chatgpt-conversation-import/.venv/
+recipes/chatgpt-conversation-import/adaptive-import-*.log
+recipes/chatgpt-conversation-import/chatgpt-sync-log.pre-adaptive-*.json

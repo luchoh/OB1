@@ -5,8 +5,11 @@ Import a ChatGPT data export into Open Brain as distilled, searchable thoughts.
 ## What It Does
 
 - reads a ChatGPT export zip or extracted folder
+- supports both `conversations.json` and sharded `conversations-000.json` style exports
+- preserves user text from newer multimodal turns and includes attachment filenames as context
 - filters low-value conversations
-- distills each kept conversation into 1-3 durable thoughts
+- distills each kept conversation into a selective set of durable thoughts
+- uses an adaptive thought cap: usually `1-3`, but up to `7` for dense conversations
 - ingests those thoughts into the local OB1 service
 
 The local-first path uses:
@@ -37,6 +40,10 @@ In ChatGPT:
 The importer accepts either:
 - the downloaded zip directly
 - the extracted folder
+
+Current boundary:
+- the importer reads conversation JSON plus message-level attachment metadata
+- it does not separately ingest binary ChatGPT-export files or images
 
 ## Local Run
 
@@ -109,3 +116,6 @@ python import-chatgpt.py /path/to/chatgpt-export.zip --model ollama --ollama-mod
 
 `Already imported`
 - The sync log is `chatgpt-sync-log.json` in this recipe directory. Remove it if you want to re-run from scratch.
+
+`Why did one conversation produce more than 3 thoughts?`
+- The importer now uses an adaptive cap based on conversation size. Long dense conversations can yield more than `3`, but the model is still instructed to stay selective and return fewer when appropriate.
