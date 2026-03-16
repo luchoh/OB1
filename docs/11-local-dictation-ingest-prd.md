@@ -12,19 +12,22 @@ OB1 now has a verified local dictation producer on the M3 Ultra:
 - transcript cleanup via local Qwen
 - output written as markdown notes to a local outbox
 
-That is a good capture path, but it is not yet an OB1 memory path. This PRD defines the missing product slice: automatically ingest dictation notes from the outbox into OB1 as searchable, grounded memory with provenance, idempotency, and private-network-only operation.
+That is a good capture path, but it is not yet an OB1 memory path. This PRD defines the missing product slice: automatically ingest dictation artifacts into OB1 as searchable, grounded memory with provenance, idempotency, and private-network-only operation.
 
 The architectural boundary is explicit:
 
 - dictation is a separate producer service
+- dictation-sync may distribute canonical artifacts without changing them
 - OB1 is a consumer of dictation artifacts
 - the dictation producer may later serve other consumers besides OB1
 
 The design goal is simple:
 
 - speak into the local dictation stack
-- get a cleaned note written to the outbox
-- have OB1 ingest it automatically
+- get a cleaned note written to the canonical outbox
+- have OB1 ingest it automatically from either:
+  - direct outbox access
+  - or a distributed artifact source
 - make it retrievable both as source material and as distilled memory
 
 ## Problem
@@ -50,6 +53,7 @@ That means dictation is useful as a note-taking tool, but it is not yet part of 
 - Preserve provenance from source audio/transcript through final OB1 rows
 - Keep the path private-network-only and compatible with the current local OB1 runtime
 - Make the ingest idempotent and safe to retry
+- Support multi-host consumption without requiring direct filesystem access to the producer host
 - Store both:
   - the source dictation note
   - distilled thought rows derived from it
@@ -61,7 +65,7 @@ That means dictation is useful as a note-taking tool, but it is not yet part of 
 - Designing a general meeting-transcript workflow in v1
 - Long-form transcript evaluation or brainstorming in v1
   - that can later use [recipes/panning-for-gold](/Users/luchoh/Dev/OB1/recipes/panning-for-gold/README.md#L1)
-- Audio file object storage as a hard dependency in v1
+- Audio retention as a hard dependency in v1
 
 ## Product Definition
 
@@ -71,11 +75,11 @@ OB1 Local Dictation Ingest
 
 ### Core Promise
 
-A dictation note written to the local outbox becomes searchable OB1 memory without manual forwarding or copy/paste.
+A dictation artifact produced by the local dictation service becomes searchable OB1 memory without manual forwarding or copy/paste.
 
 ### User Story
 
-As a user, I want to dictate a note locally and trust that it will show up in OB1 automatically, with the cleaned text available for retrieval and the raw transcript still traceable.
+As a user, I want to dictate a note locally and trust that it will show up in OB1 automatically, with the cleaned text available for retrieval and the raw transcript still traceable, even when OB1 is running on a different host.
 
 ## Current Verified State
 
@@ -104,9 +108,15 @@ Implication:
 - the missing piece is the importer/watcher plus the stable ingest contract
 - older artifacts created before the final hash fix may still have a `cleaned_text_hash` mismatch
 
+Multi-host distribution note:
+
+- the canonical producer seam is still the local outbox on `m3ultrastudio`
+- a separate system PRD now proposes `dictation-sync` plus MinIO for cross-host distribution
+- this PRD treats MinIO-backed distribution as the preferred multi-host consumer path once available
+
 ## v1 Product Decision
 
-Use an outbox watcher/importer.
+Use an artifact watcher/importer.
 
 Do not couple the dictation service directly to the OB1 ingest endpoint in v1.
 
@@ -116,6 +126,11 @@ Reason:
 - it gives replay, retry, and auditability
 - it keeps speech capture independent from OB1 availability
 - it is easier to operate than a tightly coupled synchronous push path
+
+Consumer mode decision:
+
+- simple/local mode: consume directly from the canonical outbox when OB1 has direct access
+- preferred multi-host mode: consume from MinIO after `dictation-sync` distributes byte-identical artifacts
 
 ## System Boundary
 
@@ -129,8 +144,12 @@ Ownership split:
   - cleanup
   - packaging the canonical markdown artifact
   - publishing that artifact to the outbox
+- `dictation-sync` may own:
+  - distribution of canonical artifacts to shared storage
+  - retry/backoff for distribution
+  - distribution state
 - `OB1` owns:
-  - watching/subscribing to the dictation outbox
+  - watching/subscribing to the dictation artifact source
   - validating artifact structure
   - ingesting source rows
   - creating derived memory rows
@@ -147,13 +166,15 @@ Reason:
 ## Canonical Flow
 
 1. User records dictation through the local dictation stack.
-2. The dictation stack writes a markdown note with YAML frontmatter into the outbox.
-3. A local watcher detects the new note.
-4. The watcher parses the note and validates the frontmatter contract.
-5. The watcher ingests one source row into OB1.
-6. The watcher distills up to 3 durable `dictation_thought` rows from the cleaned note.
-7. On success, the source file is archived or marked processed.
-8. On failure, the file stays retriable and is not silently dropped.
+2. The dictation stack writes a markdown note with YAML frontmatter into the canonical outbox.
+3. One of two consumer paths is used:
+   - direct mode: OB1 watches the canonical outbox
+   - distributed mode: `dictation-sync` uploads the exact artifact bytes to MinIO and OB1 watches the distributed artifact source
+4. The OB1 importer parses the artifact and validates the frontmatter contract.
+5. The importer ingests one source row into OB1.
+6. The importer distills up to 3 durable `dictation_thought` rows from the cleaned note.
+7. On success, importer state records the artifact as processed.
+8. On failure, the artifact stays retriable and is not silently dropped.
 
 ## Functional Requirements
 
@@ -182,7 +203,6 @@ Required v1 frontmatter:
 - `cleanup_thinking_disabled`
 - `audio_duration_seconds`
 - `cleaned_text_hash`
-
 - `audio_sha256`
 - `audio_filename`
 - `dictation_service_version`
@@ -206,6 +226,12 @@ Each dictation file must create one source row in `thoughts` with:
 - `metadata.type = "dictation_note"`
 - `metadata.retrieval_role = "source"`
 - all frontmatter stored in `metadata.user_metadata`
+
+The importer must preserve the canonical producer identity fields:
+
+- `artifact_id`
+- `audio_sha256`
+- original artifact source URI or file path
 
 ### FR3: Distilled Memory Ingest
 
@@ -233,6 +259,8 @@ Canonical v1 dedupe key order:
 3. otherwise `dictation:${source_host}:${created_at}:${cleaned_text_hash}`
 
 Derived thought rows must also use stable dedupe keys derived from the source note dedupe key.
+
+If MinIO-backed distribution is used, object location must not become the primary identity. Object path is transport, not identity.
 
 ### FR5: Search and Answer Behavior
 
@@ -267,7 +295,7 @@ The whole path must remain private-network-only at runtime:
 Allowed network shape:
 
 - authenticated remote submission to the `dictation` producer on the private network is acceptable
-- artifact consumption still happens through the outbox seam
+- artifact consumption still happens through the canonical artifact seam
 
 No internet egress should be required for steady-state operation.
 
@@ -278,9 +306,24 @@ The dictation output must be stable enough that multiple consumers can read it w
 That means:
 
 - the markdown + frontmatter artifact is the public contract
-- the outbox directory is the producer/consumer seam
+- the outbox directory is the canonical producer seam
 - OB1 must not depend on private in-process dictation state
 - future consumers should be able to read the same artifact format
+
+### FR9: Distribution-Source Compatibility
+
+The OB1 importer must support at least these artifact sources:
+
+- direct filesystem consumption from the canonical outbox
+- distributed object consumption from MinIO when `dictation-sync` is deployed
+
+The imported logical content must be identical regardless of which source path is used.
+
+Rules:
+
+- the markdown artifact remains the source of truth
+- MinIO object metadata is advisory only
+- object keys and transport paths must not replace frontmatter as canonical consumer data
 
 ## Data Contract
 
@@ -309,6 +352,8 @@ Recommended metadata fields for `dictation_note`:
 - `user_metadata.audio_filename`
 - `user_metadata.cleaned_text_hash`
 - `user_metadata.dictation_file_path`
+- `user_metadata.dictation_object_key`
+- `user_metadata.dictation_storage_backend`
 
 ### Derived Row Shape
 
@@ -334,6 +379,12 @@ Recommended v1 directory model:
 Canonical producer outbox path:
 
 - `/Volumes/llama-models/dictation/outbox`
+
+Preferred multi-host distribution path:
+
+- `dictation-sync` uploads canonical markdown artifacts to MinIO
+- preferred bucket name: `dictation-artifacts`
+- preferred object key layout: `canonical/YYYY/MM/DD/<artifact_id>.md`
 
 If moving files is operationally awkward on the producer host, an acceptable v1 alternative is:
 
@@ -361,14 +412,36 @@ Producer responsibility ends at publishing the canonical artifact.
 
 OB1 should not be embedded into the producer process.
 
+### Distributor
+
+Preferred multi-host distributor:
+
+- `dictation-sync`
+
+Distributor responsibilities:
+
+- watch the canonical outbox
+- upload byte-identical markdown artifacts to MinIO
+- retry failed uploads
+- keep distribution state separate from the producer outbox
+
+Distributor non-responsibilities:
+
+- do not alter artifact contents
+- do not push directly into OB1
+- do not define consumer ingest behavior
+
 ### Importer
 
 New component to build:
 
-- one-shot importer for an outbox directory
-- optional watcher mode for continuous ingest
+- one-shot importer for an artifact source
+- optional continuous watch/poll mode
+- source adapters for:
+  - direct outbox filesystem access
+  - MinIO object listing/fetch
 
-This importer is effectively OB1's subscription/consumer layer for dictation artifacts.
+This importer is effectively OB1's subscription/consumer layer for dictation artifacts, regardless of whether those artifacts are read directly from the outbox or from MinIO.
 
 The importer should live in this repo as a recipe or small standalone pipeline, similar to:
 
@@ -391,7 +464,9 @@ The dictation service should remain independently useful even if OB1 is down or 
 That means:
 
 - dictation still writes valid artifacts when no consumer is running
-- OB1 can catch up later by replaying the outbox
+- OB1 can catch up later by replaying either:
+  - the canonical outbox
+  - or the distributed object store
 - a second consumer can be added later without changing the producer contract
 
 ### Submission vs Distribution
@@ -400,7 +475,15 @@ Remote submission does not change the consumer model.
 
 - Traefik and Consul make `dictation` reachable for authenticated submission from other hosts
 - they do not distribute artifacts to consumers automatically
-- OB1 still consumes artifacts by watching the canonical outbox
+- OB1 still consumes artifacts through a separate consumer path
+
+### Preferred Multi-Host Topology
+
+For hosts that do not share direct access to the producer filesystem, the preferred topology is:
+
+`dictation -> canonical outbox -> dictation-sync -> MinIO -> OB1 importer`
+
+Direct outbox watching remains the simple fallback for single-host or shared-filesystem setups.
 
 ## Rollout Phases
 
@@ -408,7 +491,7 @@ Remote submission does not change the consumer model.
 
 Build a manual importer that:
 
-- scans the outbox
+- scans one artifact source
 - parses notes
 - ingests source rows
 - distills thought rows
@@ -422,9 +505,23 @@ Add continuous watch mode so new dictation notes are imported automatically.
 
 This is the point where the product promise becomes true in daily use.
 
-### Phase 3: Managed Service
+### Phase 3: MinIO Distribution Support
 
-Run the watcher under service management on the producer host or another host with mounted access to the outbox.
+Add support for MinIO-backed artifact consumption so OB1 can ingest dictation without direct access to the producer host filesystem.
+
+This phase should include:
+
+- MinIO source adapter
+- object-key to artifact identity handling
+- byte-for-byte fetch of canonical markdown artifacts
+- importer state that does not depend on local filenames only
+
+### Phase 4: Managed Service
+
+Run the importer under service management on a host that can read the chosen artifact source:
+
+- direct mode: mounted/local access to the canonical outbox
+- distributed mode: network access to MinIO
 
 This phase should include:
 
@@ -433,7 +530,7 @@ This phase should include:
 - restart policy
 - health signaling
 
-### Phase 4: Optional Long-Form Distillation
+### Phase 5: Optional Long-Form Distillation
 
 For long or multi-topic dictations, optionally route the source note through a richer evaluation flow later.
 
@@ -447,7 +544,7 @@ This is explicitly out of scope for v1.
 
 The PRD is considered implemented when all of the following are true:
 
-1. A new dictation markdown file placed in the outbox is imported into OB1 automatically.
+1. A new canonical dictation artifact is imported into OB1 automatically from at least one supported source path.
 2. The importer creates:
    - one `dictation_note` source row
    - zero to three `dictation_thought` distilled rows
@@ -458,6 +555,7 @@ The PRD is considered implemented when all of the following are true:
 7. Failure/retry state is observable.
 8. The path remains private-network-only at runtime.
 9. The importer accepts the live `dictation` artifact contract, including `artifact_id`, `cleanup_mode`, and `null` semantics.
+10. In MinIO mode, OB1 can ingest the same canonical artifact content without direct access to M3's local filesystem.
 
 ## Risks
 
@@ -508,6 +606,16 @@ Mitigation:
 
 - keep the outbox seam
 - make the importer independently restartable
+
+### Risk 5: Divergence Between Outbox And Distributed Copy
+
+If `dictation-sync` mutates artifacts or consumers start trusting object metadata over markdown contents, the system can drift.
+
+Mitigation:
+
+- treat the markdown bytes as canonical
+- keep object metadata advisory only
+- verify byte-for-byte identity where practical
 
 ## Explicit Rejections
 
