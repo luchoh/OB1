@@ -1,0 +1,20 @@
+{
+  "name": "Claude Conversation Import",
+  "description": "Parse your Claude data export, filter trivial conversations, summarize each via LLM into standalone thoughts, and ingest them into Open Brain with embeddings.",
+  "category": "recipes",
+  "author": {
+    "name": "Codex",
+    "github": "openai"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": ["mlx-server", "ob1-embedding"],
+    "tools": ["Python 3.10+"]
+  },
+  "tags": ["claude", "import", "conversations", "migration", "summarization"],
+  "difficulty": "beginner",
+  "estimated_time": "20 minutes",
+  "created": "2026-03-16",
+  "updated": "2026-03-16"
+}
