@@ -39,6 +39,12 @@ LLM_SERVICE_NAME="${OPEN_BRAIN_LLM_SERVICE_NAME:-mlx-server}"
 EMBEDDING_SERVICE_NAME="${OPEN_BRAIN_EMBEDDING_SERVICE_NAME:-ob1-embedding}"
 DOCLING_SERVICE_NAME="${DOCLING_SERVICE_NAME:-docling}"
 CONSUL_POSTGRES_SERVICE="${CONSUL_POSTGRES_SERVICE:-postgresql}"
+OPEN_BRAIN_GRAPH_ENABLED="${OPEN_BRAIN_GRAPH_ENABLED:-false}"
+OPEN_BRAIN_GRAPH_SERVICE_NAME="${OPEN_BRAIN_GRAPH_SERVICE_NAME:-neo4j-enterprise}"
+NEO4J_URI="${NEO4J_URI:-}"
+NEO4J_USERNAME="${NEO4J_USERNAME:-neo4j}"
+NEO4J_PASSWORD="${NEO4J_PASSWORD:-}"
+OPEN_BRAIN_GRAPH_DATABASE="${OPEN_BRAIN_GRAPH_DATABASE:-ob1-graph}"
 
 PGHOST="${PGHOST:-}"
 PGPORT="${PGPORT:-}"
@@ -59,31 +65,42 @@ export CONSUL_SKIP_TLS_VERIFY
 export LLM_SERVICE_NAME
 export EMBEDDING_SERVICE_NAME
 export DOCLING_SERVICE_NAME
+export OPEN_BRAIN_GRAPH_ENABLED
+export OPEN_BRAIN_GRAPH_SERVICE_NAME
+export NEO4J_URI
+export NEO4J_USERNAME
+export NEO4J_PASSWORD
+export OPEN_BRAIN_GRAPH_DATABASE
 
-if consul_bool_is_true "$CONSUL_FORCE_DISCOVERY" || [[ -z "$LLM_BASE_URL" || -z "$LLM_HEALTH_URL" ]]; then
+if [[ -z "$LLM_BASE_URL" || -z "$LLM_HEALTH_URL" ]]; then
   llm_service_url="$(consul_service_url "$LLM_SERVICE_NAME")"
-  LLM_BASE_URL="${llm_service_url}/v1"
-  LLM_HEALTH_URL="${llm_service_url}/health"
+  [[ -z "$LLM_BASE_URL" ]] && LLM_BASE_URL="${llm_service_url}/v1"
+  [[ -z "$LLM_HEALTH_URL" ]] && LLM_HEALTH_URL="${llm_service_url}/health"
 fi
 
-if consul_bool_is_true "$CONSUL_FORCE_DISCOVERY" || [[ -z "$EMBEDDING_BASE_URL" || -z "$EMBEDDING_HEALTH_URL" ]]; then
+if [[ -z "$EMBEDDING_BASE_URL" || -z "$EMBEDDING_HEALTH_URL" ]]; then
   embedding_service_url="$(consul_service_url "$EMBEDDING_SERVICE_NAME")"
-  EMBEDDING_BASE_URL="${embedding_service_url}/v1"
-  EMBEDDING_HEALTH_URL="${embedding_service_url}/health"
+  [[ -z "$EMBEDDING_BASE_URL" ]] && EMBEDDING_BASE_URL="${embedding_service_url}/v1"
+  [[ -z "$EMBEDDING_HEALTH_URL" ]] && EMBEDDING_HEALTH_URL="${embedding_service_url}/health"
 fi
 
-if consul_bool_is_true "$CONSUL_FORCE_DISCOVERY" || [[ -z "$DOCLING_BASE_URL" ]]; then
+if [[ -z "$DOCLING_BASE_URL" ]]; then
   DOCLING_BASE_URL="$(consul_service_url "$DOCLING_SERVICE_NAME")"
+fi
+
+if consul_bool_is_true "$OPEN_BRAIN_GRAPH_ENABLED" && [[ -z "$NEO4J_URI" ]]; then
+  graph_address_port="$(consul_service_address_port "$OPEN_BRAIN_GRAPH_SERVICE_NAME")"
+  NEO4J_URI="bolt://${graph_address_port}"
 fi
 
 if [[ -z "$DOCLING_HEALTH_URL" ]]; then
   DOCLING_HEALTH_URL="${DOCLING_BASE_URL%/}/health"
 fi
 
-if consul_bool_is_true "$CONSUL_FORCE_DISCOVERY" || [[ -z "$PGHOST" || -z "$PGPORT" ]]; then
+if [[ -z "$PGHOST" || -z "$PGPORT" ]]; then
   pg_address_port="$(consul_service_address_port "$CONSUL_POSTGRES_SERVICE")"
-  PGHOST="${pg_address_port%:*}"
-  PGPORT="${pg_address_port##*:}"
+  [[ -z "$PGHOST" ]] && PGHOST="${pg_address_port%:*}"
+  [[ -z "$PGPORT" ]] && PGPORT="${pg_address_port##*:}"
 fi
 
 echo "== Health =="
@@ -207,6 +224,13 @@ for service_name in (llm_service_name, embedding_service_name, docling_service_n
     if not checks:
         raise SystemExit(f"Consul has no passing instances for {service_name}")
     print(f"consul_passing_service={service_name}")
+
+if os.environ.get("OPEN_BRAIN_GRAPH_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}:
+    graph_service_name = os.environ["OPEN_BRAIN_GRAPH_SERVICE_NAME"]
+    checks = consul_get(f"/v1/health/service/{graph_service_name}?passing=1")
+    if not checks:
+        raise SystemExit(f"Consul has no passing instances for {graph_service_name}")
+    print(f"consul_passing_service={graph_service_name}")
 PY
 
 echo
@@ -223,6 +247,26 @@ psql "host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER" -Atc \
   "select attname || ':' || format_type(atttypid, atttypmod) from pg_attribute where attrelid = 'thoughts'::regclass and attname = 'embedding';"
 psql "host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER" -Atc \
   "select attname || ':' || format_type(atttypid, atttypmod) from pg_attribute where attrelid = 'thoughts'::regclass and attname = 'dedupe_key';"
+psql "host=$PGHOST port=$PGPORT dbname=$PGDATABASE user=$PGUSER" -Atc \
+  "select coalesce(to_regclass('public.thought_graph_projection_state')::text, 'missing');"
+
+if consul_bool_is_true "$OPEN_BRAIN_GRAPH_ENABLED"; then
+  echo
+  echo "== Neo4j =="
+  if [[ -z "$NEO4J_PASSWORD" ]]; then
+    echo "NEO4J_PASSWORD is not set; skipping Neo4j verification." >&2
+  else
+    (
+      cd "$ROOT_DIR/local/open-brain-mcp"
+      node --input-type=module <<'JS'
+import { healthcheckGraph } from "./src/graph.mjs";
+
+const result = await healthcheckGraph();
+console.log(JSON.stringify(result));
+JS
+    )
+  fi
+fi
 
 echo
 echo "Verification passed."

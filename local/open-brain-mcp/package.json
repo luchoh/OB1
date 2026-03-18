@@ -10,7 +10,8 @@
   "scripts": {
     "start": "node src/index.mjs",
     "dev": "node --watch src/index.mjs",
-    "check": "node --check src/index.mjs && node --check src/server.mjs && node --check src/models.mjs && node --check src/db.mjs && node --check src/config.mjs"
+    "check": "node --check src/index.mjs && node --check src/server.mjs && node --check src/models.mjs && node --check src/db.mjs && node --check src/config.mjs && node --check src/graph.mjs && node --check src/graph-projector.mjs",
+    "project-graph": "OPEN_BRAIN_RUNTIME_ROLE=graph-projector node src/graph-projector.mjs"
   },
   "dependencies": {
     "@hono/mcp": "0.2.4",
@@ -18,6 +19,7 @@
     "@modelcontextprotocol/sdk": "1.27.1",
     "dotenv": "17.3.1",
     "hono": "4.12.8",
+    "neo4j-driver": "5.28.2",
     "pg": "8.20.0",
     "zod": "4.3.6"
   }

@@ -146,10 +146,17 @@ async function resolveServiceUrls({ serviceName, baseUrl, healthUrl, consul }) {
   let resolvedBaseUrl = baseUrl;
   let resolvedHealthUrl = healthUrl;
 
+  if (resolvedBaseUrl && resolvedHealthUrl) {
+    return {
+      baseUrl: resolvedBaseUrl.replace(/\/$/, ""),
+      healthUrl: resolvedHealthUrl,
+    };
+  }
+
   if (consul.forceDiscovery || !resolvedBaseUrl || !resolvedHealthUrl) {
     const service = await discoverConsulService(consul, serviceName);
-    resolvedBaseUrl = `${service.rootUrl}/v1`;
-    resolvedHealthUrl = `${service.rootUrl}/health`;
+    resolvedBaseUrl ??= `${service.rootUrl}/v1`;
+    resolvedHealthUrl ??= `${service.rootUrl}/health`;
   }
 
   if (!resolvedBaseUrl || !resolvedHealthUrl) {
@@ -160,6 +167,25 @@ async function resolveServiceUrls({ serviceName, baseUrl, healthUrl, consul }) {
     baseUrl: resolvedBaseUrl.replace(/\/$/, ""),
     healthUrl: resolvedHealthUrl,
   };
+}
+
+async function resolveGraphUri({ serviceName, uri, consul }) {
+  let resolvedUri = uri;
+
+  if (resolvedUri) {
+    return resolvedUri;
+  }
+
+  if (consul.forceDiscovery || !resolvedUri) {
+    const service = await discoverConsulService(consul, serviceName);
+    resolvedUri = `bolt://${service.address}:${service.port}`;
+  }
+
+  if (!resolvedUri) {
+    throw new Error(`Missing graph URI for ${serviceName}`);
+  }
+
+  return resolvedUri;
 }
 
 async function pgConfig(consul) {
@@ -173,10 +199,20 @@ async function pgConfig(consul) {
   let host = envOptionalString("PGHOST");
   let port = envOptionalNumber("PGPORT", undefined);
 
+  if (host && port) {
+    return {
+      host: envString("PGHOST", host),
+      port: envNumber("PGPORT", port),
+      database: envString("PGDATABASE", process.env.POSTGRES_DB ?? "ob1"),
+      user: envString("PGUSER", process.env.POSTGRES_USER ?? "ob1"),
+      password: envString("PGPASSWORD", process.env.POSTGRES_PASSWORD),
+    };
+  }
+
   if (consul.forceDiscovery || !host || !port) {
     const service = await discoverConsulService(consul, consul.postgresServiceName);
-    host = service.address;
-    port = service.port;
+    host ??= service.address;
+    port ??= service.port;
   }
 
   return {
@@ -189,6 +225,7 @@ async function pgConfig(consul) {
 }
 
 async function loadConfig() {
+  const runtimeRole = envOptionalString("OPEN_BRAIN_RUNTIME_ROLE") ?? "service";
   const consul = {
     addr: envOptionalString("CONSUL_HTTP_ADDR") ?? "https://consul.lincoln.luchoh.net",
     token: envOptionalString("CONSUL_HTTP_TOKEN") ?? "",
@@ -199,23 +236,74 @@ async function loadConfig() {
 
   const llmServiceName = envOptionalString("OPEN_BRAIN_LLM_SERVICE_NAME") ?? "mlx-server";
   const embeddingServiceName = envOptionalString("OPEN_BRAIN_EMBEDDING_SERVICE_NAME") ?? "ob1-embedding";
+  const graphEnabled = envBoolean("OPEN_BRAIN_GRAPH_ENABLED", false);
+  const graphServiceName = envOptionalString("OPEN_BRAIN_GRAPH_SERVICE_NAME") ?? "neo4j-enterprise";
+  const needsModelServices = runtimeRole !== "graph-projector";
 
-  const llm = await resolveServiceUrls({
-    serviceName: llmServiceName,
-    baseUrl: envOptionalString("LLM_BASE_URL"),
-    healthUrl: envOptionalString("LLM_HEALTH_URL"),
-    consul,
-  });
+  let llm;
+  if (needsModelServices) {
+    llm = await resolveServiceUrls({
+      serviceName: llmServiceName,
+      baseUrl: envOptionalString("LLM_BASE_URL"),
+      healthUrl: envOptionalString("LLM_HEALTH_URL"),
+      consul,
+    });
+  } else {
+    llm = {
+      baseUrl: envOptionalString("LLM_BASE_URL") ?? "",
+      healthUrl: envOptionalString("LLM_HEALTH_URL") ?? "",
+    };
+  }
 
-  const embedding = await resolveServiceUrls({
-    serviceName: embeddingServiceName,
-    baseUrl: envOptionalString("EMBEDDING_BASE_URL"),
-    healthUrl: envOptionalString("EMBEDDING_HEALTH_URL"),
-    consul,
-  });
+  let embedding;
+  if (needsModelServices) {
+    embedding = await resolveServiceUrls({
+      serviceName: embeddingServiceName,
+      baseUrl: envOptionalString("EMBEDDING_BASE_URL"),
+      healthUrl: envOptionalString("EMBEDDING_HEALTH_URL"),
+      consul,
+    });
+  } else {
+    embedding = {
+      baseUrl: envOptionalString("EMBEDDING_BASE_URL") ?? "",
+      healthUrl: envOptionalString("EMBEDDING_HEALTH_URL") ?? "",
+    };
+  }
+
+  let graph;
+  if (graphEnabled) {
+    graph = {
+      enabled: true,
+      serviceName: graphServiceName,
+      uri: await resolveGraphUri({
+        serviceName: graphServiceName,
+        uri: envOptionalString("NEO4J_URI"),
+        consul,
+      }),
+      username: envString("NEO4J_USERNAME", "neo4j"),
+      password: envString("NEO4J_PASSWORD", undefined),
+      database: envOptionalString("OPEN_BRAIN_GRAPH_DATABASE") ?? "ob1-graph",
+      stagingDatabase: envOptionalString("OPEN_BRAIN_GRAPH_STAGING_DATABASE") ?? "ob1-graph-stage",
+      projectorIntervalSeconds: envOptionalNumber("OPEN_BRAIN_GRAPH_PROJECTOR_INTERVAL_SECONDS", 60) ?? 60,
+      projectorBatchSize: envOptionalNumber("OPEN_BRAIN_GRAPH_PROJECTOR_BATCH_SIZE", 100) ?? 100,
+    };
+  } else {
+    graph = {
+      enabled: false,
+      serviceName: graphServiceName,
+      uri: undefined,
+      username: undefined,
+      password: undefined,
+      database: envOptionalString("OPEN_BRAIN_GRAPH_DATABASE") ?? "ob1-graph",
+      stagingDatabase: envOptionalString("OPEN_BRAIN_GRAPH_STAGING_DATABASE") ?? "ob1-graph-stage",
+      projectorIntervalSeconds: envOptionalNumber("OPEN_BRAIN_GRAPH_PROJECTOR_INTERVAL_SECONDS", 60) ?? 60,
+      projectorBatchSize: envOptionalNumber("OPEN_BRAIN_GRAPH_PROJECTOR_BATCH_SIZE", 100) ?? 100,
+    };
+  }
 
   return {
     serviceName: process.env.OPEN_BRAIN_SERVICE_NAME ?? "open-brain-local",
+    runtimeRole,
     host: process.env.OPEN_BRAIN_HOST ?? "localhost",
     port: envNumber("OPEN_BRAIN_PORT", 8787),
     accessKey: envString("MCP_ACCESS_KEY", undefined),
@@ -230,6 +318,7 @@ async function loadConfig() {
     expectedEmbeddingDimension: envOptionalNumber("EMBEDDING_STORE_DIMENSION", 1536) ?? 1536,
     metadataMaxTokens: envOptionalNumber("OPEN_BRAIN_METADATA_MAX_TOKENS", 400) ?? 400,
     answerMaxTokens: envOptionalNumber("OPEN_BRAIN_ANSWER_MAX_TOKENS", 600) ?? 600,
+    graph,
     postgres: await pgConfig(consul),
   };
 }

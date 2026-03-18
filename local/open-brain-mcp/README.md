@@ -14,6 +14,8 @@ This is the runnable local core service for the Open Brain Local design.
   - `list_thoughts`
   - `stats`
   - `ask_brain`
+  - `graph_neighbors`
+  - `source_lineage`
 
 ## Prerequisites
 
@@ -22,6 +24,7 @@ This is the runnable local core service for the Open Brain Local design.
 - `pgvector` enabled in that database
 - `ob1-embedding` healthy at `EMBEDDING_BASE_URL`
 - `mlx-server` healthy at `LLM_BASE_URL`
+- optional local `neo4j` / `neo4j-enterprise` graph service
 - `.env.open-brain-local` populated from [`.env.open-brain-local.example`](/Users/luchoh/Dev/OB1/.env.open-brain-local.example)
 
 ## Install
@@ -68,6 +71,31 @@ This verifies:
 - local migrations
 - local MCP server boot
 - MCP tool calls for capture, search, list, stats, and grounded answering
+
+## Graph Projection
+
+Phase-1 Neo4j integration is provenance-first:
+
+- PostgreSQL stays canonical
+- Neo4j is a derived projection
+- writes do not block on graph updates
+- a background projector can sync rows asynchronously when graph support is enabled
+
+Enable graph integration with the Neo4j env block in [`.env.open-brain-local.example`](/Users/luchoh/Dev/OB1/.env.open-brain-local.example).
+When explicit service URLs or `NEO4J_URI` are set, they override Consul discovery and Consul only fills missing values.
+
+Manual projection:
+
+```bash
+OPEN_BRAIN_GRAPH_ENABLED=true \
+NEO4J_URI=bolt://localhost:7687 \
+./scripts/project-open-brain-graph.sh --database ob1-graph-stage --all --verbose
+```
+
+The runtime also exposes:
+
+- `POST /graph/neighbors`
+- `POST /graph/source-lineage`
 
 ## Auth
 
@@ -128,6 +156,7 @@ Request body:
 - Importers can set `extract_metadata=false` when they already have structured metadata and only need embeddings plus storage.
 - By default, `search_thoughts` prefers distilled memory rows and falls back to raw source rows. Callers can still force raw/source searches with an explicit metadata filter.
 - `ask_brain` uses the same retrieval path, then forces a grounded answer with explicit citations or an insufficient-evidence response.
+- when `OPEN_BRAIN_GRAPH_ENABLED=true`, the runtime can project provenance into Neo4j and expose read-only graph inspection tools
 - The schema migration is idempotent at the SQL object level, and the migration runner records applied filenames in `open_brain_schema_migrations`.
 - The real runtime env file is `.env.open-brain-local` and should remain untracked.
 - Managed-service handoff details are in [docs/09-open-brain-local-service-handoff.md](/Users/luchoh/Dev/OB1/docs/09-open-brain-local-service-handoff.md#L1).
