@@ -54,6 +54,7 @@ if str(REPO_ROOT) not in sys.path:
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 from recipes.shared_docling import local_llm_base_url
+from recipes.secret_hygiene import sanitize_text, sanitize_thoughts
 
 SYNC_LOG_PATH = Path("chatgpt-sync-log.json")
 
@@ -272,7 +273,7 @@ def normalize_thoughts(thoughts, limit=3):
         if len(normalized) >= limit:
             break
 
-    return normalized
+    return sanitize_thoughts(normalized, limit=limit)["thoughts"]
 
 
 def determine_thought_limit(word_count, message_count):
@@ -842,11 +843,16 @@ def main():
             f"up to {thought_limit} thoughts | {date_str} | {url_display}"
         )
 
+        raw_title = title
+        raw_text = user_text
+        title = sanitize_text(raw_title)["text"]
+        sanitized_full_text = sanitize_text(raw_text)
+
         # Summarize or use raw
         if args.raw:
-            thoughts = [user_text]
+            thoughts = sanitize_thoughts([raw_text], limit=1)["thoughts"]
         else:
-            thoughts = summarize(title, date_str, user_text, thought_limit, args)
+            thoughts = summarize(title, date_str, raw_text, thought_limit, args)
 
         thoughts_generated += len(thoughts)
 
@@ -902,10 +908,16 @@ def main():
                 "chatgpt_thought_count": len(thoughts),
                 "chatgpt_message_count": message_count,
                 "chatgpt_user_word_count": word_count,
-                "full_text": user_text,
+                "full_text": sanitized_full_text["text"],
                 "type": "chatgpt_conversation",
                 "topics": ["chatgpt", "import"],
             }
+            thought_hygiene = sanitize_text(thought)
+            total_redactions = sanitized_full_text["redaction_count"] + thought_hygiene["redaction_count"]
+            total_rules = sorted(set(sanitized_full_text["rules"]) | set(thought_hygiene["rules"]))
+            if total_redactions:
+                extra_metadata["secret_hygiene_redaction_count"] = total_redactions
+                extra_metadata["secret_hygiene_rules"] = total_rules
             result = ingest_thought_local(content, extra_metadata, occurred_at=date_str)
 
             if result.get("ok"):

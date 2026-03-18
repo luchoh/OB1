@@ -10,6 +10,7 @@ Import a ChatGPT data export into Open Brain as distilled, searchable thoughts.
 - filters low-value conversations
 - distills each kept conversation into a selective set of durable thoughts
 - uses an adaptive thought cap: usually `1-3`, but up to `7` for dense conversations
+- applies deterministic secret hygiene before ingest, redacting obvious literal secrets from both extracted thoughts and stored source text
 - ingests those thoughts into the local OB1 service
 
 The local-first path uses:
@@ -75,6 +76,7 @@ This importer uses Qwen tool calling for thought extraction rather than `respons
 - `--after YYYY-MM-DD`: only import newer conversations
 - `--before YYYY-MM-DD`: only import older conversations
 - `--raw`: skip summarization and ingest the user text directly
+  - secret hygiene still applies before ingest
 - `--verbose`: print the full extracted thoughts
 - `--report FILE`: write a markdown import report
 
