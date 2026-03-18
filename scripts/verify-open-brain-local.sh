@@ -259,10 +259,16 @@ if consul_bool_is_true "$OPEN_BRAIN_GRAPH_ENABLED"; then
     (
       cd "$ROOT_DIR/local/open-brain-mcp"
       node --input-type=module <<'JS'
-import { healthcheckGraph } from "./src/graph.mjs";
+import { healthcheckGraph, closeGraph } from "./src/graph.mjs";
+import { closePool } from "./src/db.mjs";
 
-const result = await healthcheckGraph();
-console.log(JSON.stringify(result));
+try {
+  const result = await healthcheckGraph();
+  console.log(JSON.stringify(result));
+} finally {
+  await closeGraph();
+  await closePool();
+}
 JS
     )
   fi
