@@ -1,0 +1,98 @@
+[
+  {
+    "conversation_id": "6907e69a-9e10-832a-b1c5-f43b8ed187b8",
+    "title": "Telephoto lenses for Fuji GFX",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 2,
+    "expected_max_thoughts": 4,
+    "expectations": [
+      "Keep the Fuji GFX telephoto-lens selection context and the emphasis on resolving power over autofocus.",
+      "Anchor the memory to adapted manual-focus lens research, not generic photography advice."
+    ]
+  },
+  {
+    "conversation_id": "67d94015-c654-8009-8566-de147442e39d",
+    "title": "ICEBreaker FPGA Buttons and Diodes",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the ICEBreaker / Amaranth debugging specifics and the actual FPGA workflow constraints.",
+      "Do not flatten the session into generic GPIO or simulator advice."
+    ]
+  },
+  {
+    "conversation_id": "690d0baa-7b94-8327-8f33-2bea2136a1ed",
+    "title": "PSU comparison for DACs",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 2,
+    "expected_max_thoughts": 5,
+    "expectations": [
+      "Keep the actual DAC/headphone-amp PSU comparison, transformer sizing, and component-selection context.",
+      "Do not invent unrelated project details or adopt assistant-suggested hardware as if the user already chose it."
+    ]
+  },
+  {
+    "conversation_id": "681e452a-0df4-8009-8355-58bc302333f4",
+    "title": "Unifi Protect Presence Detection",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the UniFi Protect/Home Assistant/TrueNAS/Traefik project context.",
+      "Preserve the home-presence goal and the concrete environment details instead of generic home-automation advice."
+    ]
+  },
+  {
+    "conversation_id": "67ae0144-9a58-8009-be56-899e39740071",
+    "title": "KiCad JLCPCB Setup",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 2,
+    "expected_max_thoughts": 3,
+    "expectations": [
+      "Keep the KiCad manufacturing-coordinate workflow and the macOS footprint-library issue.",
+      "Stay anchored to the user's actual PCB workflow."
+    ]
+  },
+  {
+    "conversation_id": "67acc2ff-a2b0-8009-bc82-0281fbd703a7",
+    "title": "Limit app permissions workaround",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 2,
+    "expected_max_thoughts": 3,
+    "expectations": [
+      "Keep the user's security objection to broad org permissions and the isolated-org workaround.",
+      "Avoid turning this into generic SaaS-permissions advice."
+    ]
+  },
+  {
+    "conversation_id": "67c300b8-4424-8009-9a33-722119898b81",
+    "title": "Viber registration issue",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is transient consumer-app support and should usually be dropped."
+    ]
+  },
+  {
+    "conversation_id": "67a7d0bc-1f08-8009-b67e-94c1465d3c10",
+    "title": "Apple Watch Sleep Error",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is a short consumer-device oddity and should usually be dropped."
+    ]
+  },
+  {
+    "conversation_id": "67b45157-05b0-8009-b56c-a49c6565dc90",
+    "title": "Currency Use in Jordan",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is a transient travel lookup and should be dropped."
+    ]
+  }
+]

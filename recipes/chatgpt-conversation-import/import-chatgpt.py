@@ -57,6 +57,7 @@ from recipes.shared_docling import local_llm_base_url
 from recipes.secret_hygiene import sanitize_text, sanitize_thoughts
 
 SYNC_LOG_PATH = Path("chatgpt-sync-log.json")
+PROMPT_FILE_PATH = Path(__file__).with_name("prompt.md")
 
 OLLAMA_BASE = "http://localhost:11434"
 LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
@@ -94,40 +95,17 @@ SKIP_TITLE_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-SUMMARIZATION_PROMPT_TEMPLATE = """\
-You are distilling a ChatGPT conversation into standalone thoughts for a \
-personal knowledge base. Your job is to be HIGHLY SELECTIVE — only extract \
-knowledge that would be valuable to retrieve months or years from now.
+def load_prompt_template(prompt_file=None):
+    path = Path(prompt_file) if prompt_file else PROMPT_FILE_PATH
+    try:
+        template = path.read_text().strip()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"Prompt file not found: {path}") from exc
 
-CAPTURE these (1-{limit} thoughts max):
-- Decisions made and the reasoning behind them
-- People mentioned with context (who they are, relationship, what was discussed)
-- Project plans, strategies, or architectural choices
-- Lessons learned, mistakes acknowledged, preferences discovered
-- Business context: companies, roles, goals, metrics
-- Personal values, beliefs, or frameworks articulated
+    if "{limit}" not in template:
+        raise ValueError(f"Prompt file must include a {{limit}} placeholder: {path}")
 
-SKIP these entirely (return empty):
-- One-off creative tasks (poems, letters, stories, jokes)
-- Generic Q&A or factual lookups
-- Coding help with no lasting architectural decisions
-- Hypothetical explorations with no conclusion
-- Short tasks where the user just needed something written/formatted
-
-Each thought must be:
-- A clear, standalone statement (makes sense without the conversation)
-- Written in first person
-- Anchored with names, dates, or project context when available
-- 1-3 sentences
-
-Return a JSON object with exactly one key: "thoughts".
-The value of "thoughts" must be an array of 0-{limit} real thought strings.
-Treat {limit} as an upper bound, not a target. Return fewer when the conversation
-only supports a small number of durable memories, and only go above 3 when the
-conversation clearly contains several distinct long-term-useful ideas.
-Do not use placeholders such as "thought1", "thought2", or template labels.
-If the conversation has nothing worth capturing, return {{"thoughts": []}}
-Err on the side of returning empty — less is more."""
+    return template
 
 # ─── Sync Log ────────────────────────────────────────────────────────────────
 
@@ -323,9 +301,10 @@ def build_thoughts_tool(limit):
     }
 
 
-def build_summarization_prompt(limit):
+def build_summarization_prompt(limit, prompt_template=None):
     """Render the prompt for the current adaptive thought cap."""
-    return SUMMARIZATION_PROMPT_TEMPLATE.format(limit=limit)
+    template = prompt_template if prompt_template is not None else load_prompt_template()
+    return template.format(limit=limit)
 
 
 def summarize_input_limit(thought_limit):
@@ -400,6 +379,33 @@ def _load_conversations_from_dir(directory):
         sys.exit(1)
     print(f"  Loaded {len(candidates)} conversation file(s) from directory.")
     return all_conversations
+
+
+def conversation_id(conv):
+    """Return the exported ChatGPT conversation id when present."""
+    return str(conv.get("id") or "").strip()
+
+
+def conversation_title(conv):
+    """Return the human-readable conversation title."""
+    return str(conv.get("title") or "(untitled)").strip() or "(untitled)"
+
+
+def conversation_created_at(conv):
+    """Return the conversation creation timestamp as UTC datetime."""
+    value = conv.get("create_time")
+    if value in (None, "", 0):
+        return None
+
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    try:
+        return datetime.fromtimestamp(numeric, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def conversation_hash(conv):
@@ -570,7 +576,7 @@ def should_skip(conv, user_text, message_count, sync_log, args):
 # ─── LLM Summarization ──────────────────────────────────────────────────────
 
 
-def summarize_local(title, date_str, user_text, thought_limit):
+def summarize_local(title, date_str, user_text, thought_limit, prompt_template=None):
     """Summarize a conversation using the local OpenAI-compatible LLM endpoint."""
     truncated = user_text[: summarize_input_limit(thought_limit)]
 
@@ -587,7 +593,7 @@ def summarize_local(title, date_str, user_text, thought_limit):
             "tools": [build_thoughts_tool(thought_limit)],
             "tool_choice": "required",
             "messages": [
-                {"role": "system", "content": build_summarization_prompt(thought_limit)},
+                {"role": "system", "content": build_summarization_prompt(thought_limit, prompt_template)},
                 {
                     "role": "user",
                     "content": f"Conversation title: {title}\nDate: {date_str}\n\nUser messages:\n{truncated}",
@@ -612,12 +618,12 @@ def summarize_local(title, date_str, user_text, thought_limit):
         return []
 
 
-def summarize_ollama(title, date_str, user_text, thought_limit, model_name="qwen3"):
+def summarize_ollama(title, date_str, user_text, thought_limit, model_name="qwen3", prompt_template=None):
     """Summarize a conversation using a local Ollama model."""
     truncated = user_text[: summarize_input_limit(thought_limit)]
 
     prompt = (
-        f"{build_summarization_prompt(thought_limit)}\n\n"
+        f"{build_summarization_prompt(thought_limit, prompt_template)}\n\n"
         f"Conversation title: {title}\nDate: {date_str}\n\n"
         f"User messages:\n{truncated}"
     )
@@ -653,9 +659,16 @@ def summarize_ollama(title, date_str, user_text, thought_limit, model_name="qwen
 def summarize(title, date_str, user_text, thought_limit, args):
     """Dispatch to the appropriate summarization backend."""
     if args.model == "local":
-        return summarize_local(title, date_str, user_text, thought_limit)
+        return summarize_local(title, date_str, user_text, thought_limit, prompt_template=args.prompt_template)
     if args.model == "ollama":
-        return summarize_ollama(title, date_str, user_text, thought_limit, args.ollama_model)
+        return summarize_ollama(
+            title,
+            date_str,
+            user_text,
+            thought_limit,
+            args.ollama_model,
+            prompt_template=args.prompt_template,
+        )
     raise ValueError(f"Unsupported model backend: {args.model}")
 
 
@@ -738,6 +751,7 @@ Examples:
     parser.add_argument("--raw", action="store_true", help="Skip summarization, ingest user messages directly")
     parser.add_argument("--verbose", action="store_true", help="Show full summaries during processing")
     parser.add_argument("--report", type=str, metavar="FILE", help="Write a markdown report of everything imported")
+    parser.add_argument("--prompt-file", default=str(PROMPT_FILE_PATH), help="Prompt template file (default: prompt.md)")
     return parser.parse_args()
 
 
@@ -746,6 +760,7 @@ Examples:
 
 def main():
     args = parse_args()
+    args.prompt_template = None if args.raw else load_prompt_template(args.prompt_file)
 
     if not os.path.isfile(args.zip_path) and not os.path.isdir(args.zip_path):
         print(f"Error: Path not found: {args.zip_path}")
@@ -825,15 +840,11 @@ def main():
         word_count = len(user_text.split())
         total_user_words += word_count
 
-        title = conv.get("title", "(untitled)")
-        create_time = conv.get("create_time")
-        date_str = (
-            datetime.fromtimestamp(create_time, tz=timezone.utc).strftime("%Y-%m-%d")
-            if create_time
-            else "unknown"
-        )
+        title = conversation_title(conv)
+        created_at = conversation_created_at(conv)
+        date_str = created_at.strftime("%Y-%m-%d") if created_at else "unknown"
         conv_id = conversation_hash(conv)
-        chatgpt_id = conv.get("id", "")
+        chatgpt_id = conversation_id(conv)
 
         print(f"{processed}. {title}")
         url_display = f"https://chatgpt.com/c/{chatgpt_id}" if chatgpt_id else "no id"

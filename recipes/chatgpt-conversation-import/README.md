@@ -46,6 +46,12 @@ Current boundary:
 - the importer reads conversation JSON plus message-level attachment metadata
 - it does not separately ingest binary ChatGPT-export files or images
 
+Prompt and evaluation artifacts:
+- [prompt.md](/Users/luchoh/Dev/OB1/recipes/chatgpt-conversation-import/prompt.md#L1)
+- [eval-prompt.py](/Users/luchoh/Dev/OB1/recipes/chatgpt-conversation-import/eval-prompt.py#L1)
+- [eval-cases.json](/Users/luchoh/Dev/OB1/recipes/chatgpt-conversation-import/eval-cases.json#L1)
+- [program.md](/Users/luchoh/Dev/OB1/recipes/chatgpt-conversation-import/program.md#L1)
+
 ## Local Run
 
 From the repo root:
@@ -68,6 +74,27 @@ python import-chatgpt.py /path/to/chatgpt-export.zip
 ```
 
 This importer uses Qwen tool calling for thought extraction rather than `response_format`, because that is the reliable structured-output path on the current `mlx-server`. Details are in [docs/08-vllm-mlx-no-thinking.md](/Users/luchoh/Dev/OB1/docs/08-vllm-mlx-no-thinking.md#L1).
+
+## Prompt QA
+
+Run the fixed prompt benchmark on a real export:
+
+```bash
+recipes/chatgpt-conversation-import/.venv/bin/python \
+  recipes/chatgpt-conversation-import/eval-prompt.py \
+  /path/to/chatgpt-export.zip
+```
+
+Run autoresearch against the fixed benchmark:
+
+```bash
+recipes/chatgpt-conversation-import/.venv/bin/python \
+  recipes/prompt-autoresearch.py \
+  /path/to/chatgpt-export.zip \
+  --eval-module recipes/chatgpt-conversation-import/eval-prompt.py \
+  --prompt-file recipes/chatgpt-conversation-import/prompt.md \
+  --cases recipes/chatgpt-conversation-import/eval-cases.json
+```
 
 ## Important Flags
 
