@@ -1,0 +1,253 @@
+[
+  {
+    "conversation_id": "d94174f0-7622-42d0-9893-5f258e8a3897",
+    "title": "Authentication Issue Accessing Models",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 3,
+    "expected_max_thoughts": 5,
+    "expectations": [
+      "Keep the auth header wiring issue and the circular-import diagnosis.",
+      "Keep project-specific Alembic state only if it is clearly grounded in the user's actual setup.",
+      "Avoid generic migration theory or support-style boilerplate."
+    ]
+  },
+  {
+    "conversation_id": "2ce93140-ef7f-4c63-a43f-c8013556a82b",
+    "title": "Safely Aligning Database Schema with ORM Models",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the cautious ORM/schema alignment workflow and the concrete SQLAlchemy import fixes.",
+      "Preserve the user's preference for minimal targeted changes.",
+      "Avoid over-indexing on generic Alembic trivia."
+    ]
+  },
+  {
+    "conversation_id": "d3c6bb0b-4ef6-43cb-899e-842b094c4267",
+    "title": "Analyzing Electronic Schematics from Images",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the actual power-supply project context and troubleshooting specifics.",
+      "Do not collapse the conversation into generic LED math only.",
+      "Anchor the memories to the user's hardware and measurements."
+    ]
+  },
+  {
+    "conversation_id": "48d31468-a72b-4dbc-84eb-2a0b0df6a681",
+    "title": "AMB Sigma 11 power supply options",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the Sigma 11 transformer/headroom decisions and troubleshooting checkpoints.",
+      "Anchor the output to 9V Sigma 11 and the actual transformer options under discussion."
+    ]
+  },
+  {
+    "conversation_id": "13e28a10-db09-4b9b-a50c-da71b503b875",
+    "title": "Comparing Database Index Performance Across Replicas",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the schema and import design decisions.",
+      "Preserve the actual file naming convention and normalization choices.",
+      "Avoid bland database-design clichés."
+    ]
+  },
+  {
+    "conversation_id": "1593fe4e-a0f9-4273-8545-61b5f55654f8",
+    "title": "Setting up Time-Restricted Internet Access with OPNsense Captive Portal",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the OPNsense captive-portal architecture and the exact time-limit goals.",
+      "Keep the rejected approaches and the custom-script direction.",
+      "Anchor the result to the user's real network path."
+    ]
+  },
+  {
+    "conversation_id": "6a6874be-053b-4e33-8ee6-6b6a67c31884",
+    "title": "Troubleshooting AWS CodeCommit on macOS",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "If kept, anchor the memory to macOS, Nix, and the git-remote-codecommit failure.",
+      "Do not expand a short support interaction into generic package-management advice."
+    ]
+  },
+  {
+    "conversation_id": "9681f15a-2502-4f18-a863-c5d6bb921736",
+    "title": "Deleting eSIM on iPhone",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is a short consumer-support issue and should normally be dropped."
+    ]
+  },
+  {
+    "conversation_id": "e9169f8c-bc1f-4aeb-a723-60573a625e3f",
+    "title": "Understanding Claude's Max plan pricing",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is transient plan/pricing Q&A and should be dropped."
+    ]
+  },
+  {
+    "conversation_id": "62698a65-d4fe-4d24-a306-d3d40e74638c",
+    "title": "Deploying Qdrant on AWS",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the CloudFormation deployment context, Ubuntu user-data mismatch, and local Nix/awscli setup issues.",
+      "Preserve the user's infrastructure preferences such as updating stacks instead of recreating them.",
+      "Do not retain literal secrets, API keys, or low-level log noise as memories."
+    ]
+  },
+  {
+    "conversation_id": "a9dc704d-c1d3-4978-84fa-b3a5edf27843",
+    "title": "Clarifying SMPD Audio Distribution",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the custom DAC chain, HQPlayer/NAA signal path, and the SMPD to Snake Oil OS migration.",
+      "Keep concrete tuning choices that the user actually described.",
+      "Do not turn exploratory measurements or not-yet-validated tweaks into settled conclusions."
+    ]
+  },
+  {
+    "conversation_id": "4fb3ba98-dc55-42ef-a070-952f0a610e05",
+    "title": "Migrating Photography Gallery to Modern Tech Stack",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the Meteor.js migration context, MySQL/self-hosting constraints, and the CMS/backend direction.",
+      "Keep the concrete import, auth, or migration failures that shaped the implementation.",
+      "Avoid generic FastAPI boilerplate and filler."
+    ]
+  },
+  {
+    "conversation_id": "ab9eb6f6-6a07-44bb-acb6-1ce48affef77",
+    "title": "Nix installation error on macOS",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the nix-darwin bootstrap context, machine-specific flake requirement, and the exact activation blockers.",
+      "Preserve the /etc backup requirement and system.stateVersion detail.",
+      "Avoid generic Nix theory unrelated to the actual failure."
+    ]
+  },
+  {
+    "conversation_id": "0139bf8c-daac-4761-bb63-521c53dda658",
+    "title": "Skipping Folders with the Tree Command",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is a tiny generic shell-usage question and should be dropped."
+    ]
+  },
+  {
+    "conversation_id": "45a2b672-6ab9-44db-bd98-4d252bd5e85f",
+    "title": "Identifying Resistor Value",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is a one-off resistor reading question and should not become a durable memory."
+    ]
+  },
+  {
+    "conversation_id": "30e61fa4-1723-4021-9ce9-6a49fbfd4042",
+    "title": "Checking IRS direct pay confirmation",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is transient consumer-support/payment lookup chatter and should be dropped."
+    ]
+  },
+  {
+    "conversation_id": "bf5aaefc-5620-49c9-a354-de6be8a82657",
+    "title": "Migrating Google Fi to a New iPhone",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is short consumer-device support and should be dropped."
+    ]
+  },
+  {
+    "conversation_id": "fc1db4c5-f6bd-4193-9f7b-8f4cc3ed5bbc",
+    "title": "Running SonarQube on macOS with Nix Flakes",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "If kept, anchor the memory to macOS, Nix flakes/devenv, and the desire to avoid Docker.",
+      "Do not expand it into generic package-management advice."
+    ]
+  },
+  {
+    "conversation_id": "10a5be3e-632d-45fd-8356-bf1558561ce7",
+    "title": "Reverting ECS deployments to previous versions",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is generic how-to support with no durable project context and should be dropped."
+    ]
+  },
+  {
+    "conversation_id": "5060557b-6795-4b6a-8c0e-a187949de30e",
+    "title": "Debugging the /user-settings Endpoint",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "The user text is attachment-heavy and underspecified, so this should stay empty unless grounded facts are explicit."
+    ]
+  },
+  {
+    "conversation_id": "ba78d4ce-9401-48bf-9517-652c7872fdf2",
+    "title": "SMPS PSU for Low-Power DACs",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is exploratory product brainstorming with no committed design decision and should be dropped."
+    ]
+  },
+  {
+    "conversation_id": "0d7ea32e-3082-4466-86bf-4b07cfd4e6c0",
+    "title": "Starlink Router Statistics Page",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is screenshot-based consumer support and should be dropped."
+    ]
+  },
+  {
+    "conversation_id": "0f5db942-68e9-4d23-8fbb-aa3cdc3989e4",
+    "title": "Comparing US Army and Russian Military Unit Structures",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is generic external knowledge Q&A and should not become a personal memory."
+    ]
+  }
+]

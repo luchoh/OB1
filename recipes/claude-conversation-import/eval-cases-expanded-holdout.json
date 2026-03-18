@@ -1,0 +1,68 @@
+[
+  {
+    "conversation_id": "16aea178-82ec-42a6-bb04-37e56598bed7",
+    "title": "Troubleshooting ROON ROCK VM on TrueNAS with VLAN setup",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the dual-subnet/VLAN context, the TrueNAS bridge issue, and the SMB-not-NFS outcome.",
+      "Anchor the memories to the user's actual network and storage setup.",
+      "Avoid generic TrueNAS or VLAN troubleshooting filler."
+    ]
+  },
+  {
+    "conversation_id": "6603e777-5bd9-4384-9174-4ee7f6fc043e",
+    "title": "Using OPNsense as a Fiber-to-Ethernet Bridge",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 4,
+    "expected_max_thoughts": 6,
+    "expectations": [
+      "Keep the audio/VLAN bridge topology, DHCP failure, and loop/L2 conflict signals.",
+      "Preserve the user's specific audio chain and OPNsense role.",
+      "Avoid drifting into generic bridge or firewall advice."
+    ]
+  },
+  {
+    "conversation_id": "c165d2a5-6ffa-4f98-bfd3-ae61ddb4a66f",
+    "title": "Supermicro IPMI password reset",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "If kept, anchor the memory to Supermicro IPMI and ipmicfg usage.",
+      "Do not over-expand a tiny support exchange."
+    ]
+  },
+  {
+    "conversation_id": "9aaeedc0-d362-4ab7-9bf8-e0bfbc42ce4e",
+    "title": "Understanding VDEVs in TrueNAS",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "The user text is mostly attachment-dependent and underspecified, so this should stay empty unless the user's own messages contain durable concrete facts."
+    ]
+  },
+  {
+    "conversation_id": "2ce4094b-32d8-4017-b561-64d3298797af",
+    "title": "Refactoring the Admin.js File",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "Keep the maintainability-driven admin.js refactor and the explicit ES-module/CommonJS syntax error.",
+      "Do not turn this into generic JavaScript module advice."
+    ]
+  },
+  {
+    "conversation_id": "5562d852-f715-404e-b2c7-db9660cb923c",
+    "title": "Understanding Datadog APM for Application Monitoring",
+    "expected_mode": "empty",
+    "expected_min_thoughts": 0,
+    "expected_max_thoughts": 0,
+    "expectations": [
+      "This is generic product education and should be dropped."
+    ]
+  }
+]

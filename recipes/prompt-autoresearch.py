@@ -114,8 +114,16 @@ def summarize_weak_cases(results, limit=4):
     return weak
 
 
-def propose_prompt(current_prompt, summary, attempt_index):
-    system_prompt = textwrap.dedent(
+def load_research_program(program_file):
+    if program_file:
+        path = Path(program_file)
+    else:
+        path = None
+
+    if path and path.exists():
+        return path.read_text().strip()
+
+    return textwrap.dedent(
         """
         Revise the extraction prompt to improve the fixed QA score.
 
@@ -126,6 +134,14 @@ def propose_prompt(current_prompt, summary, attempt_index):
         - Keep dense technical/project conversations rich enough; do not solve precision problems by flattening everything into 1 thought.
 
         Prefer small, targeted edits over rewriting the entire prompt.
+        """
+    ).strip()
+
+
+def propose_prompt(current_prompt, summary, attempt_index, research_program):
+    system_prompt = textwrap.dedent(
+        f"""
+        {research_program}
 
         Return exactly this format and nothing else:
         WHY:
@@ -188,6 +204,7 @@ def parse_args():
     parser.add_argument("export_path", help="Path to export zip or extracted directory")
     parser.add_argument("--eval-module", required=True, help="Path to eval-prompt.py module")
     parser.add_argument("--prompt-file", required=True, help="Mutable prompt file")
+    parser.add_argument("--program-file", help="Optional program.md; defaults to sibling of prompt file when present")
     parser.add_argument("--cases", required=True, help="Fixed case set")
     parser.add_argument("--rounds", type=int, default=3, help="Maximum rounds")
     parser.add_argument("--candidates", type=int, default=2, help="Candidates per round")
@@ -198,7 +215,9 @@ def parse_args():
 def main():
     args = parse_args()
     prompt_path = Path(args.prompt_file)
+    program_path = Path(args.program_file) if args.program_file else prompt_path.with_name("program.md")
     eval_module = load_eval_module(args.eval_module)
+    research_program = load_research_program(program_path if program_path.exists() else None)
 
     best_prompt = prompt_path.read_text().strip()
     print("baseline")
@@ -226,19 +245,57 @@ def main():
 
         for candidate_index in range(1, args.candidates + 1):
             attempt_index = (round_index - 1) * args.candidates + candidate_index
-            proposal = propose_prompt(best_prompt, best_summary, attempt_index)
+            try:
+                proposal = propose_prompt(best_prompt, best_summary, attempt_index, research_program)
+            except Exception as exc:
+                print(f"candidate {candidate_index}: proposal failed")
+                print(f"  {exc}")
+                history.append(
+                    {
+                        "round": round_index,
+                        "candidate": candidate_index,
+                        "stage": "proposal",
+                        "error": str(exc),
+                    }
+                )
+                continue
+
             candidate_prompt = proposal["prompt"]
             if candidate_prompt == best_prompt:
                 print(f"candidate {candidate_index}: identical, skipped")
+                history.append(
+                    {
+                        "round": round_index,
+                        "candidate": candidate_index,
+                        "stage": "proposal",
+                        "status": "identical",
+                        "why": proposal.get("why", []),
+                    }
+                )
                 continue
 
             print(f"candidate {candidate_index}: evaluating")
-            candidate_summary = eval_module.evaluate_prompt(
-                export_path=args.export_path,
-                cases_path=args.cases,
-                prompt_template=candidate_prompt,
-                verbose=False,
-            )
+            try:
+                candidate_summary = eval_module.evaluate_prompt(
+                    export_path=args.export_path,
+                    cases_path=args.cases,
+                    prompt_template=candidate_prompt,
+                    verbose=False,
+                )
+            except Exception as exc:
+                print(f"candidate {candidate_index}: evaluation failed")
+                print(f"  {exc}")
+                history.append(
+                    {
+                        "round": round_index,
+                        "candidate": candidate_index,
+                        "stage": "evaluation",
+                        "error": str(exc),
+                        "why": proposal.get("why", []),
+                    }
+                )
+                continue
+
             print(
                 f"  mean={candidate_summary['mean_score']} "
                 f"accepted={candidate_summary['accepted']}/{candidate_summary['case_count']}"
