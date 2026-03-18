@@ -1,0 +1,122 @@
+[
+  {
+    "title": "Canonical Boundary",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "The PRD must clearly state that PostgreSQL remains canonical and Neo4j is derived.",
+      "It must explicitly reject Neo4j as the primary write path or source of truth."
+    ]
+  },
+  {
+    "title": "Desktop Multi-Database Capability",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "The PRD must reflect that local Neo4j Desktop supports Enterprise-style multiple databases on this machine.",
+      "It should recommend restrained use of that capability, such as production plus staging, rather than per-source graph sprawl."
+    ]
+  },
+  {
+    "title": "Cross-Database Transaction Boundary",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "The PRD must account for the fact that Neo4j transactions cannot span multiple databases.",
+      "It must require asynchronous projection and must not design around synchronous cross-database writes."
+    ]
+  },
+  {
+    "title": "pgvector Canonical Justification",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "The PRD must justify keeping vectors canonical in PostgreSQL using current pgvector capability, not inertia alone.",
+      "It should stay consistent with pgvector's exact search, ANN, filtering, and hybrid-search strengths."
+    ]
+  },
+  {
+    "title": "Neo4j Vector Capability Boundary",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "The PRD must acknowledge that Neo4j now has native vector indexes for nodes and relationships.",
+      "It must still explain why Neo4j vectors are not the default v1 architecture."
+    ]
+  },
+  {
+    "title": "Neo4j Vector Operational Cost",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "The PRD must reflect the real operational cost of Neo4j vector indexes, especially OS filesystem-cache pressure.",
+      "It should not treat Neo4j vector duplication as free."
+    ]
+  },
+  {
+    "title": "Provenance-First Scope",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "Phase 1 must be provenance-first and must not depend on fuzzy entity extraction.",
+      "The rollout must not begin with an unconstrained graph-of-everything."
+    ]
+  },
+  {
+    "title": "Confidence Discipline",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "The PRD must distinguish deterministic provenance links from LLM-extracted entity links.",
+      "LLM-derived nodes or edges must carry confidence and evidence."
+    ]
+  },
+  {
+    "title": "Official GraphRAG Scope",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "The PRD must account for the existence of Neo4j's official GraphRAG package.",
+      "It should treat that package as an implementation reference rather than letting it silently define the architecture."
+    ]
+  },
+  {
+    "title": "Retrieval Integration",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "The PRD must keep PostgreSQL semantic retrieval as the default path.",
+      "Graph-assisted retrieval must be optional and evaluated, not silently replace vector retrieval."
+    ]
+  },
+  {
+    "title": "Evaluation Plan",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "The PRD must include concrete product questions or evaluation scenarios where graph should help.",
+      "Success criteria must protect grounded-answer discipline, not just graph completeness."
+    ]
+  },
+  {
+    "title": "Implementation Readiness",
+    "expected_mode": "keep",
+    "expected_min_thoughts": 1,
+    "expected_max_thoughts": 2,
+    "expectations": [
+      "The PRD must define enough initial node labels and relationship types to implement Phase 1.",
+      "It must also define projection state or equivalent operational bookkeeping."
+    ]
+  }
+]

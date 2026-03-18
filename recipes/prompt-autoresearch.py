@@ -63,30 +63,78 @@ def normalize_chat_content(content):
     return ""
 
 
-def parse_prompt_revision(text):
-    normalized = normalize_chat_content(text).strip()
-    prompt_match = re.search(
-        r"^PROMPT:\s*<<<PROMPT\s*([\s\S]*?)(?:\s*^PROMPT\s*$|\Z)",
-        normalized,
-        flags=re.MULTILINE,
-    )
-    if not prompt_match:
-        raise ValueError(f"Model returned unparseable prompt revision: {normalized[:1600]}")
+def extract_json_payload(text):
+    trimmed = text.strip()
+    trimmed = re.sub(r"^```json\s*", "", trimmed, flags=re.IGNORECASE)
+    trimmed = re.sub(r"^```\s*", "", trimmed)
+    trimmed = re.sub(r"\s*```$", "", trimmed)
 
-    prompt = prompt_match.group(1).strip()
-    why_match = re.search(r"^WHY:\s*$([\s\S]*?)^PROMPT:\s*<<<PROMPT", normalized, flags=re.MULTILINE)
-    why = []
-    if why_match:
-        for line in why_match.group(1).splitlines():
-            stripped = line.strip()
-            if stripped.startswith("- "):
-                why.append(stripped[2:].strip())
-            elif stripped:
-                break
+    try:
+        return json.loads(trimmed)
+    except json.JSONDecodeError:
+        start = trimmed.find("{")
+        end = trimmed.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(trimmed[start : end + 1])
 
+
+def extract_tool_arguments(response_json, expected_name):
+    try:
+        tool_calls = response_json["choices"][0]["message"]["tool_calls"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("Model did not return a tool call") from exc
+
+    if not isinstance(tool_calls, list) or not tool_calls:
+        raise ValueError("Model did not return a tool call")
+
+    call = None
+    for item in tool_calls:
+        if isinstance(item, dict) and item.get("function", {}).get("name") == expected_name:
+            call = item
+            break
+    if call is None:
+        call = tool_calls[0]
+
+    arguments = call.get("function", {}).get("arguments")
+    if not isinstance(arguments, str) or not arguments.strip():
+        raise ValueError("Tool call arguments were empty")
+
+    return extract_json_payload(arguments)
+
+
+def build_named_tool_choice(name):
     return {
-        "prompt": prompt,
-        "why": why[:5],
+        "type": "function",
+        "function": {
+            "name": name,
+        },
+    }
+
+
+def build_revision_tool():
+    return {
+        "type": "function",
+        "function": {
+            "name": "submit_revision",
+            "description": "Return the full revised artifact text and short reasons for the changes.",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["artifact", "why"],
+                "properties": {
+                    "artifact": {
+                        "type": "string",
+                        "description": "The full revised artifact text.",
+                    },
+                    "why": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Up to 5 short reasons for the revision.",
+                    },
+                },
+            },
+        },
     }
 
 
@@ -143,14 +191,9 @@ def propose_prompt(current_prompt, summary, attempt_index, research_program):
         f"""
         {research_program}
 
-        Return exactly this format and nothing else:
-        WHY:
-        - <short reason>
-        - <short reason>
-        PROMPT:
-        <<<PROMPT
-        <full revised prompt>
-        PROMPT
+        Return the revision by calling the submit_revision tool.
+        Put the full revised artifact in artifact.
+        Put short reasons in why.
         """
     ).strip()
 
@@ -168,11 +211,13 @@ def propose_prompt(current_prompt, summary, attempt_index, research_program):
         headers={"Content-Type": "application/json"},
         json={
             "model": LOCAL_LLM_MODEL,
-            "temperature": 0.6,
+            "temperature": 0.3,
             "max_tokens": 5000,
             "chat_template_kwargs": {
                 "enable_thinking": LOCAL_LLM_ENABLE_THINKING,
             },
+            "tools": [build_revision_tool()],
+            "tool_choice": build_named_tool_choice("submit_revision"),
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, indent=2)},
@@ -181,13 +226,18 @@ def propose_prompt(current_prompt, summary, attempt_index, research_program):
         timeout=300,
     )
     response.raise_for_status()
-    proposal = parse_prompt_revision(response.json().get("choices", [{}])[0].get("message", {}).get("content"))
-    revised_prompt = proposal.get("prompt", "").strip()
+    response_json = response.json()
+    proposal = extract_tool_arguments(response_json, "submit_revision")
+    revised_prompt = str(proposal.get("artifact", "")).strip()
+    why = proposal.get("why", [])
+    if not isinstance(why, list):
+        why = []
+
     if "{limit}" in current_prompt and "{limit}" not in revised_prompt:
         raise ValueError("Revised prompt is missing the {limit} placeholder")
     return {
         "prompt": revised_prompt,
-        "why": proposal.get("why", []),
+        "why": why[:5],
     }
 
 
