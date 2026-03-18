@@ -425,6 +425,7 @@ function conversationProjection(store, row, metadata, userMetadata, baseEdgeProp
   const claudeHash = prefer(userMetadata.claude_conversation_hash);
   const claudeId = prefer(userMetadata.claude_conversation_id);
   const thoughtId = canonicalThoughtId(row);
+  const retrievalRole = metadata.retrieval_role ?? null;
 
   if (chatgptHash || chatgptId) {
     const canonicalId = `conversation:chatgpt:${chatgptId ?? chatgptHash}`;
@@ -439,8 +440,11 @@ function conversationProjection(store, row, metadata, userMetadata, baseEdgeProp
       created_at: userMetadata.chatgpt_create_time ?? metadata.occurred_at ?? null,
       updated_at: isoTimestamp(row.updated_at),
     });
-    addEdge(store.edges, "Thought", thoughtId, "DERIVED_FROM", "Conversation", canonicalId, baseEdgeProps);
-    addEdge(store.edges, "Conversation", canonicalId, "DISTILLED_TO", "Thought", thoughtId, baseEdgeProps);
+    const linkType = retrievalRole === "source" ? "REFERENCES_SOURCE" : "DERIVED_FROM";
+    addEdge(store.edges, "Thought", thoughtId, linkType, "Conversation", canonicalId, baseEdgeProps);
+    if (linkType === "DERIVED_FROM") {
+      addEdge(store.edges, "Conversation", canonicalId, "DISTILLED_TO", "Thought", thoughtId, baseEdgeProps);
+    }
   }
 
   if (claudeHash || claudeId) {
@@ -456,8 +460,11 @@ function conversationProjection(store, row, metadata, userMetadata, baseEdgeProp
       created_at: userMetadata.claude_create_time ?? metadata.occurred_at ?? null,
       updated_at: isoTimestamp(row.updated_at),
     });
-    addEdge(store.edges, "Thought", thoughtId, "DERIVED_FROM", "Conversation", canonicalId, baseEdgeProps);
-    addEdge(store.edges, "Conversation", canonicalId, "DISTILLED_TO", "Thought", thoughtId, baseEdgeProps);
+    const linkType = retrievalRole === "source" ? "REFERENCES_SOURCE" : "DERIVED_FROM";
+    addEdge(store.edges, "Thought", thoughtId, linkType, "Conversation", canonicalId, baseEdgeProps);
+    if (linkType === "DERIVED_FROM") {
+      addEdge(store.edges, "Conversation", canonicalId, "DISTILLED_TO", "Thought", thoughtId, baseEdgeProps);
+    }
   }
 }
 
@@ -886,6 +893,81 @@ export async function graphNeighbors({
     `,
     {
       canonicalId: targetId,
+    },
+    { database, mode: "READ" },
+  );
+
+  if (result.records.length === 0) {
+    return {
+      success: true,
+      center: null,
+      neighbors: [],
+    };
+  }
+
+  const row = serializeRecord(result.records[0]);
+  return {
+    success: true,
+    center: row.center,
+    center_labels: row.center_labels,
+    neighbors: dedupeGraphItems((row.neighbors ?? []).filter(Boolean)),
+  };
+}
+
+export async function graphThoughtNeighbors({
+  thoughtId,
+  canonicalId,
+  maxHops = 2,
+  limit = 25,
+  allowedRetrievalRoles = [],
+  database = config.graph.database,
+} = {}) {
+  if (!graphEnabled()) {
+    throw new Error("Graph integration is disabled");
+  }
+
+  const resolvedHops = Math.max(1, Math.min(3, Number(maxHops) || 1));
+  const resolvedLimit = Math.max(1, Math.min(200, Number(limit) || 25));
+  const targetId = thoughtCanonicalIdFromInput({ thoughtId, canonicalId });
+  const filteredRoles = Array.isArray(allowedRetrievalRoles)
+    ? allowedRetrievalRoles.filter((value) => typeof value === "string" && value.trim())
+    : [];
+  const rolePredicate = filteredRoles.length > 0
+    ? "AND coalesce(neighbor.retrieval_role, 'unknown') in $allowedRetrievalRoles"
+    : "";
+
+  const result = await runGraph(
+    `
+      MATCH (center:Thought {canonical_id: $canonicalId})
+      OPTIONAL MATCH p=(center)-[*1..${resolvedHops}]-(neighbor:Thought)
+      WHERE neighbor.canonical_id <> center.canonical_id
+        ${rolePredicate}
+      WITH center, p, neighbor
+      ORDER BY length(p) ASC, coalesce(neighbor.updated_at, neighbor.created_at) DESC
+      LIMIT ${resolvedLimit}
+      RETURN
+        center { .* } as center,
+        labels(center) as center_labels,
+        collect(
+          CASE
+            WHEN neighbor IS NULL THEN null
+            ELSE {
+              node: neighbor { .* },
+              labels: labels(neighbor),
+              hop_count: length(p),
+              relationships: [rel in relationships(p) | {
+                type: type(rel),
+                from: startNode(rel).canonical_id,
+                to: endNode(rel).canonical_id,
+                properties: properties(rel)
+              }]
+            }
+          END
+        ) as neighbors
+    `,
+    {
+      canonicalId: targetId,
+      allowedRetrievalRoles: filteredRoles,
     },
     { database, mode: "READ" },
   );

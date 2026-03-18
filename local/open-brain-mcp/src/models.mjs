@@ -80,6 +80,10 @@ const groundedAnswerTool = {
 const SOURCE_RETRIEVAL_TYPES = new Set([
   "email",
   "document_chunk",
+  "chatgpt_conversation_source",
+  "claude_conversation_source",
+  "chatgpt_conversation_record",
+  "claude_conversation_record",
 ]);
 
 function truncateText(text, limit = 240) {
