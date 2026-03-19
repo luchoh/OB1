@@ -112,7 +112,24 @@ def build_named_tool_choice(name):
     }
 
 
-def build_revision_tool():
+def detect_artifact_kind(current_prompt):
+    try:
+        json.loads(current_prompt)
+        return "json"
+    except json.JSONDecodeError:
+        return "text"
+
+
+def build_revision_tool(artifact_kind):
+    artifact_property_name = "artifact_json" if artifact_kind == "json" else "artifact"
+    artifact_property = {
+        "type": "object",
+        "description": "The full revised artifact as a JSON object.",
+    } if artifact_kind == "json" else {
+        "type": "string",
+        "description": "The full revised artifact text.",
+    }
+
     return {
         "type": "function",
         "function": {
@@ -121,12 +138,9 @@ def build_revision_tool():
             "parameters": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["artifact", "why"],
+                "required": [artifact_property_name, "why"],
                 "properties": {
-                    "artifact": {
-                        "type": "string",
-                        "description": "The full revised artifact text.",
-                    },
+                    artifact_property_name: artifact_property,
                     "why": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -138,23 +152,70 @@ def build_revision_tool():
     }
 
 
+def extract_message_content(response_json):
+    try:
+        message = response_json["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("Model did not return a message") from exc
+
+    content = normalize_chat_content(message.get("content"))
+    if not content.strip():
+        raise ValueError("Model returned an empty message")
+    return content
+
+
+def serialize_revised_artifact(proposal, artifact_kind):
+    if artifact_kind == "json":
+        if "artifact_json" in proposal:
+            return json.dumps(proposal["artifact_json"], ensure_ascii=False, indent=2)
+        artifact_text = str(proposal.get("artifact", "")).strip()
+        if not artifact_text:
+            raise ValueError("JSON artifact proposal was empty")
+        parsed = json.loads(artifact_text)
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
+
+    artifact_text = str(proposal.get("artifact", "")).strip()
+    if not artifact_text:
+        raise ValueError("Revised artifact was empty")
+    return artifact_text
+
+
 def summarize_weak_cases(results, limit=4):
-    ranked = sorted(results, key=lambda item: (item["judgment"]["total_score"], item["case"]["title"]))
+    def truncate_text(value, limit_chars=220):
+        if not isinstance(value, str):
+            value = str(value)
+        value = value.strip()
+        if len(value) <= limit_chars:
+            return value
+        return f"{value[: limit_chars - 1]}…"
+
+    def case_label(item):
+        case = item.get("case", {})
+        return (
+            case.get("title")
+            or case.get("id")
+            or case.get("question")
+            or "untitled-case"
+        )
+
+    ranked = sorted(results, key=lambda item: (item["judgment"]["total_score"], case_label(item)))
     weak = []
     for result in ranked:
         if result["judgment"]["total_score"] >= 90 and result["judgment"]["decision"] == "accept":
             continue
+        case = result.get("case", {})
         weak.append(
             {
-                "title": result["case"]["title"],
-                "expected_mode": result["case"].get("expected_mode"),
-                "expected_min_thoughts": result["case"].get("expected_min_thoughts"),
-                "expected_max_thoughts": result["case"].get("expected_max_thoughts"),
-                "expectations": result["case"].get("expectations", []),
+                "title": case_label(result),
+                "question": case.get("question"),
+                "expected_mode": case.get("expected_mode"),
+                "expected_min_thoughts": case.get("expected_min_thoughts"),
+                "expected_max_thoughts": case.get("expected_max_thoughts"),
+                "expectations": case.get("expectations", []),
                 "score": result["judgment"]["total_score"],
                 "decision": result["judgment"]["decision"],
-                "thoughts": result["thoughts"],
-                "notes": result["judgment"]["notes"][:4],
+                "thoughts": [truncate_text(thought) for thought in result.get("thoughts", [])[:4]],
+                "notes": [truncate_text(note, 140) for note in result["judgment"]["notes"][:3]],
             }
         )
         if len(weak) >= limit:
@@ -186,18 +247,8 @@ def load_research_program(program_file):
     ).strip()
 
 
-def propose_prompt(current_prompt, summary, attempt_index, research_program):
-    system_prompt = textwrap.dedent(
-        f"""
-        {research_program}
-
-        Return the revision by calling the submit_revision tool.
-        Put the full revised artifact in artifact.
-        Put short reasons in why.
-        """
-    ).strip()
-
-    user_payload = {
+def proposal_user_payload(current_prompt, summary, attempt_index):
+    return {
         "attempt_index": attempt_index,
         "current_mean_score": summary["mean_score"],
         "current_accepted": summary["accepted"],
@@ -206,17 +257,38 @@ def propose_prompt(current_prompt, summary, attempt_index, research_program):
         "current_prompt": current_prompt,
     }
 
+
+def propose_prompt_tool(current_prompt, summary, attempt_index, research_program, proposal_temperature):
+    artifact_kind = detect_artifact_kind(current_prompt)
+    artifact_instruction = (
+        "Put the full revised artifact as a JSON object in artifact_json."
+        if artifact_kind == "json"
+        else "Put the full revised artifact text in artifact."
+    )
+    system_prompt = textwrap.dedent(
+        f"""
+        {research_program}
+
+        You must return exactly one submit_revision tool call.
+        Do not answer in prose.
+        {artifact_instruction}
+        Put short reasons in why.
+        """
+    ).strip()
+
+    user_payload = proposal_user_payload(current_prompt, summary, attempt_index)
+
     response = requests.post(
         f"{local_llm_base_url()}/chat/completions",
         headers={"Content-Type": "application/json"},
         json={
             "model": LOCAL_LLM_MODEL,
-            "temperature": 0.3,
+            "temperature": proposal_temperature,
             "max_tokens": 5000,
             "chat_template_kwargs": {
                 "enable_thinking": LOCAL_LLM_ENABLE_THINKING,
             },
-            "tools": [build_revision_tool()],
+            "tools": [build_revision_tool(artifact_kind)],
             "tool_choice": build_named_tool_choice("submit_revision"),
             "messages": [
                 {"role": "system", "content": system_prompt},
@@ -225,10 +297,13 @@ def propose_prompt(current_prompt, summary, attempt_index, research_program):
         },
         timeout=300,
     )
-    response.raise_for_status()
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"{response.status_code} {response.reason}: {normalize_chat_content(response.text)}"
+    )
     response_json = response.json()
     proposal = extract_tool_arguments(response_json, "submit_revision")
-    revised_prompt = str(proposal.get("artifact", "")).strip()
+    revised_prompt = serialize_revised_artifact(proposal, artifact_kind)
     why = proposal.get("why", [])
     if not isinstance(why, list):
         why = []
@@ -239,6 +314,89 @@ def propose_prompt(current_prompt, summary, attempt_index, research_program):
         "prompt": revised_prompt,
         "why": why[:5],
     }
+
+
+def propose_prompt_json(current_prompt, summary, attempt_index, research_program, proposal_temperature):
+    artifact_kind = detect_artifact_kind(current_prompt)
+    artifact_instruction = (
+        "Return the revised artifact in artifact_json as a JSON object."
+        if artifact_kind == "json"
+        else "Return the revised artifact in artifact as a string."
+    )
+    system_prompt = textwrap.dedent(
+        f"""
+        {research_program}
+
+        Return only a single JSON object.
+        Do not use markdown fences.
+        {artifact_instruction}
+        The JSON object must have exactly two keys:
+        - why: array of short strings
+        """
+    ).strip()
+
+    user_payload = proposal_user_payload(current_prompt, summary, attempt_index)
+
+    response = requests.post(
+        f"{local_llm_base_url()}/chat/completions",
+        headers={"Content-Type": "application/json"},
+        json={
+            "model": LOCAL_LLM_MODEL,
+            "temperature": proposal_temperature,
+            "max_tokens": 5000,
+            "chat_template_kwargs": {
+                "enable_thinking": LOCAL_LLM_ENABLE_THINKING,
+            },
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, indent=2)},
+            ],
+        },
+        timeout=300,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"{response.status_code} {response.reason}: {normalize_chat_content(response.text)}"
+        )
+
+    response_json = response.json()
+    proposal = extract_json_payload(extract_message_content(response_json))
+    revised_prompt = serialize_revised_artifact(proposal, artifact_kind)
+    why = proposal.get("why", [])
+    if not isinstance(why, list):
+        why = []
+
+    if "{limit}" in current_prompt and "{limit}" not in revised_prompt:
+        raise ValueError("Revised prompt is missing the {limit} placeholder")
+    return {
+        "prompt": revised_prompt,
+        "why": why[:5],
+    }
+
+
+def propose_prompt(
+    current_prompt,
+    summary,
+    attempt_index,
+    research_program,
+    submission_mode,
+    proposal_temperature,
+):
+    if submission_mode == "json":
+        return propose_prompt_json(
+            current_prompt,
+            summary,
+            attempt_index,
+            research_program,
+            proposal_temperature,
+        )
+    return propose_prompt_tool(
+        current_prompt,
+        summary,
+        attempt_index,
+        research_program,
+        proposal_temperature,
+    )
 
 
 def is_better(candidate, incumbent):
@@ -258,7 +416,19 @@ def parse_args():
     parser.add_argument("--cases", required=True, help="Fixed case set")
     parser.add_argument("--rounds", type=int, default=3, help="Maximum rounds")
     parser.add_argument("--candidates", type=int, default=2, help="Candidates per round")
+    parser.add_argument(
+        "--proposal-temperature",
+        type=float,
+        default=0.3,
+        help="Sampling temperature used when proposing revised artifacts",
+    )
     parser.add_argument("--report", help="Optional JSON report path")
+    parser.add_argument(
+        "--submission-mode",
+        choices=["tool", "json"],
+        default="tool",
+        help="How the proposer returns revised artifacts",
+    )
     return parser.parse_args()
 
 
@@ -296,7 +466,14 @@ def main():
         for candidate_index in range(1, args.candidates + 1):
             attempt_index = (round_index - 1) * args.candidates + candidate_index
             try:
-                proposal = propose_prompt(best_prompt, best_summary, attempt_index, research_program)
+                proposal = propose_prompt(
+                    best_prompt,
+                    best_summary,
+                    attempt_index,
+                    research_program,
+                    args.submission_mode,
+                    args.proposal_temperature,
+                )
             except Exception as exc:
                 print(f"candidate {candidate_index}: proposal failed")
                 print(f"  {exc}")
