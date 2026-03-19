@@ -7,6 +7,7 @@ This is the deployment handoff for running the local MCP service as a managed LA
 ## Canonical Runtime
 
 - repo path: [local/open-brain-mcp](/Users/luchoh/Dev/OB1/local/open-brain-mcp)
+- repo shell: [devenv.nix](/Users/luchoh/Dev/OB1/devenv.nix)
 - start wrapper: [scripts/run-open-brain-local.sh](/Users/luchoh/Dev/OB1/scripts/run-open-brain-local.sh)
 - migrations: [scripts/apply-open-brain-local-migrations.sh](/Users/luchoh/Dev/OB1/scripts/apply-open-brain-local-migrations.sh)
 - verifier: [scripts/verify-open-brain-local.sh](/Users/luchoh/Dev/OB1/scripts/verify-open-brain-local.sh)
@@ -62,6 +63,14 @@ The sysadmin-managed service should:
    - `/ingest/thought`
 4. Register in Consul only after `/health` returns `200`
 5. Advertise the host LAN hostname or FQDN in Consul, not `localhost`
+
+For local developer operation, the preferred repo-managed command is:
+
+```bash
+devenv up open_brain_local
+```
+
+Agents should not run that command unless the user explicitly instructs them to manage service lifecycle.
 
 ## Consul Registration
 

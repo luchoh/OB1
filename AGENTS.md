@@ -50,6 +50,24 @@ Local MCP runtime:
    - `cd local/open-brain-mcp && npm run check`
    - `./scripts/verify-open-brain-local.sh`
 3. Do not assume old Supabase-only guidance is still the only valid deployment path in this repo.
+4. Do not start or stop long-running OB1 services yourself unless the user explicitly instructs you to do so.
+5. When you need the local runtime, probe it first:
+   - `curl -sf http://localhost:8787/health`
+   - if it responds, proceed without asking
+   - if it does not, tell the user the service appears down and ask them to start it
+
+## Local Environment
+
+OB1 now supports a repo-managed `direnv` + `devenv` workflow.
+
+- `.envrc` uses `devenv`
+- `devenv.nix` loads `.env.open-brain-local`
+- the user-managed runtime command is:
+  - `devenv up open_brain_local`
+
+Service lifecycle rule:
+- do not run `devenv up`, `devenv down`, `npm start`, `npm run dev`, `node local/open-brain-mcp/src/index.mjs`, or similar orchestration commands unless the user explicitly instructs you
+- focus on code changes, diagnostics, health probes, and tests
 
 ## Repo Shape
 

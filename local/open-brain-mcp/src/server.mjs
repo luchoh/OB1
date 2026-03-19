@@ -57,6 +57,12 @@ const askBrainSchema = {
 };
 const askBrainInput = z.object(askBrainSchema);
 
+const updateThoughtMetadataSchema = {
+  thought_id: z.string().uuid().describe("Canonical OB1 thought UUID."),
+  metadata_patch: z.record(z.any()).describe("Metadata patch merged into the thought metadata without changing content or embeddings."),
+};
+const updateThoughtMetadataInput = z.object(updateThoughtMetadataSchema);
+
 const graphNeighborsSchema = {
   thought_id: z.string().uuid().optional().describe("Canonical OB1 thought UUID."),
   canonical_id: z.string().optional().describe("Optional graph canonical_id such as thought:<uuid>."),
@@ -143,6 +149,13 @@ function evidenceCitation(row) {
     email_subject: userMetadata.email_subject ?? userMetadata.subject ?? null,
     document_path: userMetadata.document_path ?? null,
     attachment_filename: userMetadata.attachment_filename ?? null,
+    claim_kind: userMetadata.claim_kind ?? null,
+    epistemic_status: userMetadata.epistemic_status ?? null,
+    claim_subject: userMetadata.claim_subject ?? null,
+    claim_object: userMetadata.claim_object ?? null,
+    claim_scope: userMetadata.claim_scope ?? null,
+    claim_strength: userMetadata.claim_strength ?? null,
+    claim_rationale: userMetadata.claim_rationale ?? null,
     created_at: row.created_at ?? null,
   };
 }
@@ -489,7 +502,7 @@ async function handleAskBrain(args) {
   const threshold = args.match_threshold ?? 0.4;
   const matchCount = args.match_count ?? 6;
   const filter = args.filter ?? {};
-  const { retrieval, graphExpansion, evidenceRows } = await retrieveEvidenceRows({
+  const { retrieval, graphExpansion, evidenceRows, questionIntent } = await retrieveEvidenceRows({
     queryText: args.question,
     threshold,
     count: matchCount,
@@ -509,6 +522,7 @@ async function handleAskBrain(args) {
       insufficient_evidence: true,
       retrieval_strategy: retrieval.retrieval_strategy,
       fallback_used: retrieval.fallback_used,
+      question_intent: questionIntent,
       graph_assisted: args.graph_assisted ?? false,
       graph_expansion: graphExpansion,
       evidence_count: 0,
@@ -516,7 +530,9 @@ async function handleAskBrain(args) {
     };
   }
 
-  const grounded = await answerFromEvidence(args.question, evidence);
+  const grounded = await answerFromEvidence(args.question, evidence, {
+    questionIntent,
+  });
   const citations = evidence.filter((item) => grounded.citations.includes(item.id));
 
   return {
@@ -527,10 +543,50 @@ async function handleAskBrain(args) {
     insufficient_evidence: grounded.insufficient_evidence,
     retrieval_strategy: retrieval.retrieval_strategy,
     fallback_used: retrieval.fallback_used,
+    question_intent: questionIntent,
     graph_assisted: args.graph_assisted ?? false,
     graph_expansion: graphExpansion,
     evidence_count: evidence.length,
     citations,
+  };
+}
+
+async function updateThoughtMetadata({ thoughtId, metadataPatch }) {
+  const result = await query(
+    `
+      update thoughts
+      set
+        metadata = (
+          thoughts.metadata
+          || ($2::jsonb - 'user_metadata')
+          || case
+            when $2::jsonb ? 'user_metadata' then jsonb_build_object(
+              'user_metadata',
+              coalesce(thoughts.metadata->'user_metadata', '{}'::jsonb)
+              || coalesce($2::jsonb->'user_metadata', '{}'::jsonb)
+            )
+            else '{}'::jsonb
+          end
+        ),
+        updated_at = now()
+      where id = $1::uuid
+      returning
+        id,
+        metadata,
+        updated_at
+    `,
+    [thoughtId, JSON.stringify(metadataPatch)],
+  );
+
+  if (result.rowCount !== 1) {
+    throw new Error(`Thought not found: ${thoughtId}`);
+  }
+
+  return {
+    success: true,
+    thought_id: result.rows[0].id,
+    metadata: result.rows[0].metadata,
+    updated_at: result.rows[0].updated_at,
   };
 }
 
@@ -805,6 +861,26 @@ app.post("/ask", async (c) => {
   try {
     const payload = askBrainInput.parse(await c.req.json());
     const result = await handleAskBrain(payload);
+    return c.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const status = error instanceof z.ZodError ? 400 : 500;
+    return c.json({ success: false, error: message }, status);
+  }
+});
+
+app.post("/admin/thought/metadata", async (c) => {
+  const key = authKey(c);
+  if (!key || key !== config.accessKey) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const payload = updateThoughtMetadataInput.parse(await c.req.json());
+    const result = await updateThoughtMetadata({
+      thoughtId: payload.thought_id,
+      metadataPatch: payload.metadata_patch,
+    });
     return c.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

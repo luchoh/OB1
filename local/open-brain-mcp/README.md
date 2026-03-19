@@ -30,6 +30,8 @@ This is the runnable local core service for the Open Brain Local design.
 ## Install
 
 ```bash
+direnv allow
+devenv shell
 cd local/open-brain-mcp
 npm install
 ```
@@ -47,7 +49,7 @@ This applies the SQL files in [`local/open-brain-mcp/migrations`](/Users/luchoh/
 ## Run
 
 ```bash
-./scripts/run-open-brain-local.sh
+devenv up open_brain_local
 ```
 
 Default bind:
@@ -57,6 +59,14 @@ Default bind:
 - `http://localhost:8787/mcp`
 - `http://localhost:8787/ingest/thought`
 - `http://localhost:8787/ask`
+- `http://localhost:8787/admin/thought/metadata`
+
+If you need a one-shot non-`devenv` launch and the user explicitly asks for it, the wrapper is still:
+
+```bash
+./scripts/run-open-brain-local.sh
+```
+- `http://localhost:8787/admin/thought/metadata`
 
 ## Smoke Test
 
@@ -150,6 +160,38 @@ Request body:
 ```
 
 `graph_assisted=true` keeps PostgreSQL vector search as the seed retrieval step and then expands the evidence set with related `Thought` rows from Neo4j before grounded answer synthesis.
+
+`ask_brain` also uses deterministic question-intent detection for preference/decision, comparison, and unresolved-status questions. When claim metadata is present on evidence rows, it is used only as a ranking and synthesis hint; the original text and citations remain the truth anchor.
+
+## Metadata-Only Admin Update
+
+The metadata backfill route is:
+
+```bash
+POST /admin/thought/metadata
+```
+
+Request body:
+
+```json
+{
+  "thought_id": "00000000-0000-0000-0000-000000000000",
+  "metadata_patch": {
+    "user_metadata": {
+      "claim_kind": "decision",
+      "epistemic_status": "decided"
+    }
+  }
+}
+```
+
+This route merges metadata without changing:
+- `content`
+- `embedding`
+- `embedding_model`
+- `embedding_dimension`
+
+It exists specifically for metadata-only backfills such as claim typing.
 
 ## Graph A/B Eval
 

@@ -31,10 +31,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from recipes.shared_docling import local_llm_base_url
+from recipes.claim_typing import extract_claims, load_claim_prompt
 from recipes.secret_hygiene import sanitize_text, sanitize_thoughts
 
 SYNC_LOG_PATH = Path("claude-sync-log.json")
 PROMPT_FILE_PATH = Path(__file__).with_name("prompt.md")
+CLAIM_PROMPT_FILE_PATH = REPO_ROOT / "recipes" / "claim-typing" / "prompt.md"
 
 OLLAMA_BASE = "http://localhost:11434"
 LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
@@ -737,6 +739,11 @@ Examples:
     parser.add_argument("--verbose", action="store_true", help="Show full summaries during processing")
     parser.add_argument("--report", type=str, metavar="FILE", help="Write a markdown report of everything imported")
     parser.add_argument("--prompt-file", default=str(PROMPT_FILE_PATH), help="Prompt template file (default: prompt.md)")
+    parser.add_argument(
+        "--claim-prompt-file",
+        default=str(CLAIM_PROMPT_FILE_PATH),
+        help="Claim typing prompt file (default: recipes/claim-typing/prompt.md)",
+    )
     return parser.parse_args()
 
 
@@ -774,6 +781,7 @@ def write_report(filepath, entries, stats):
 def main():
     args = parse_args()
     args.prompt_template = None if args.raw else load_prompt_template(args.prompt_file)
+    args.claim_prompt_template = None if args.raw else load_claim_prompt(args.claim_prompt_file)
 
     if not os.path.isfile(args.export_path) and not os.path.isdir(args.export_path):
         print(f"Error: Path not found: {args.export_path}")
@@ -880,6 +888,29 @@ def main():
                 preview = thought if len(thought) <= 200 else thought[:200] + "..."
                 print(f"   Thought {index}: {preview}")
 
+        claim_patches = [{} for _ in thoughts]
+        if thoughts and not args.raw:
+            try:
+                claim_patches = extract_claims(
+                    "claude",
+                    title,
+                    date_str,
+                    sanitized_full_text["text"],
+                    thoughts,
+                    model_backend=args.model,
+                    ollama_model=args.ollama_model,
+                    prompt_template=args.claim_prompt_template,
+                )
+                if args.verbose or args.dry_run:
+                    for index, patch in enumerate(claim_patches, 1):
+                        claim_kind = patch.get("claim_kind")
+                        epistemic_status = patch.get("epistemic_status")
+                        if claim_kind and epistemic_status:
+                            print(f"   Claim {index}: {claim_kind} / {epistemic_status}")
+            except Exception as exc:
+                claim_patches = [{} for _ in thoughts]
+                print(f"   Warning: Claim typing failed: {exc}")
+
         if args.report:
             report_entries.append(
                 {
@@ -918,6 +949,7 @@ def main():
             if total_redactions:
                 extra_metadata["secret_hygiene_redaction_count"] = total_redactions
                 extra_metadata["secret_hygiene_rules"] = total_rules
+            extra_metadata.update(claim_patches[index - 1] if index - 1 < len(claim_patches) else {})
             result = ingest_thought_local(content, extra_metadata, occurred_at=date_str)
 
             if result.get("ok"):

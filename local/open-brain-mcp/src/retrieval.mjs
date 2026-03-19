@@ -28,6 +28,37 @@ function normalizeKey(value) {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
+function normalizeQuestion(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+export function detectQuestionIntent(questionText) {
+  const normalized = normalizeQuestion(questionText);
+  if (!normalized) {
+    return "default";
+  }
+
+  if (
+    /\b(unresolved|still considering|still exploring|open question|open questions|undecided|not sure|uncertain|pending)\b/.test(normalized)
+  ) {
+    return "unresolved_status";
+  }
+
+  if (
+    /\b(compare|comparison|comparing|options|option|alternatives|alternative|tradeoffs|trade-offs)\b/.test(normalized)
+  ) {
+    return "comparison_options";
+  }
+
+  if (
+    /\b(best|prefer|preferred|preference|choose|chose|chosen|decide|decided|settle on|settled on|picked|pick|selected|selection|went with)\b/.test(normalized)
+  ) {
+    return "decision_preference";
+  }
+
+  return "default";
+}
+
 function hasExplicitSearchRole(filter) {
   return filter
     && typeof filter === "object"
@@ -230,7 +261,89 @@ function maxAnchorBonus(anchorTypes, policy) {
   }, fallback);
 }
 
-function graphCandidateScore(row, metadata, policy, seeds) {
+function claimMetadata(row) {
+  const userMetadata = nestedUserMetadata(row);
+  return {
+    claimKind: normalizeKey(userMetadata.claim_kind),
+    epistemicStatus: normalizeKey(userMetadata.epistemic_status),
+    claimStrength: normalizeKey(userMetadata.claim_strength),
+    claimSubject: normalizeKey(userMetadata.claim_subject),
+    claimObject: normalizeKey(userMetadata.claim_object),
+  };
+}
+
+function claimIntentBonus(row, questionIntent) {
+  if (!questionIntent || questionIntent === "default") {
+    return 0;
+  }
+
+  const claim = claimMetadata(row);
+  let bonus = 0;
+
+  if (questionIntent === "decision_preference") {
+    if (claim.claimKind === "decision") {
+      bonus += 0.28;
+    } else if (claim.claimKind === "preference") {
+      bonus += 0.24;
+    } else if (claim.claimKind === "implementation_detail") {
+      bonus += 0.06;
+    }
+
+    if (claim.epistemicStatus === "decided") {
+      bonus += 0.22;
+    } else if (claim.epistemicStatus === "preferred") {
+      bonus += 0.2;
+    } else if (claim.epistemicStatus === "implemented") {
+      bonus += 0.16;
+    } else if (claim.epistemicStatus === "considering" || claim.epistemicStatus === "unresolved") {
+      bonus -= 0.08;
+    }
+  } else if (questionIntent === "comparison_options") {
+    if (claim.claimKind === "comparison") {
+      bonus += 0.24;
+    } else if (claim.claimKind === "option") {
+      bonus += 0.22;
+    } else if (claim.claimKind === "open_question") {
+      bonus += 0.08;
+    } else if (claim.claimKind === "decision" || claim.claimKind === "preference") {
+      bonus -= 0.04;
+    }
+
+    if (claim.epistemicStatus === "considering") {
+      bonus += 0.08;
+    }
+  } else if (questionIntent === "unresolved_status") {
+    if (claim.epistemicStatus === "considering") {
+      bonus += 0.24;
+    } else if (claim.epistemicStatus === "unresolved") {
+      bonus += 0.22;
+    } else if (claim.epistemicStatus === "observed") {
+      bonus += 0.08;
+    } else if (
+      claim.epistemicStatus === "decided"
+      || claim.epistemicStatus === "preferred"
+      || claim.epistemicStatus === "implemented"
+    ) {
+      bonus -= 0.1;
+    }
+
+    if (claim.claimKind === "open_question") {
+      bonus += 0.16;
+    } else if (claim.claimKind === "option") {
+      bonus += 0.08;
+    }
+  }
+
+  if (claim.claimStrength === "strong") {
+    bonus += 0.03;
+  } else if (claim.claimStrength === "weak") {
+    bonus -= 0.01;
+  }
+
+  return bonus;
+}
+
+function graphCandidateScore(row, metadata, policy, seeds, questionIntent) {
   const ranking = policy.ranking;
   const similarity = typeof row?.similarity === "number" ? row.similarity : 0;
   const role = row?.metadata?.retrieval_role ?? "unknown";
@@ -255,10 +368,12 @@ function graphCandidateScore(row, metadata, policy, seeds) {
     score -= ranking.differentTypePenalty;
   }
 
+  score += claimIntentBonus(row, questionIntent);
+
   return score;
 }
 
-function vectorSeedScore(row, index, policy) {
+function vectorSeedScore(row, index, policy, questionIntent) {
   const ranking = policy.ranking;
   const similarity = typeof row?.similarity === "number" ? row.similarity : 0;
   const role = row?.metadata?.retrieval_role ?? "unknown";
@@ -267,6 +382,7 @@ function vectorSeedScore(row, index, policy) {
   score += ranking.seedBonus;
   score -= index * ranking.vectorRankPenalty;
   score -= ranking.retrievalRolePenalties[role] ?? ranking.retrievalRolePenalties.unknown ?? 0;
+  score += claimIntentBonus(row, questionIntent);
   return score;
 }
 
@@ -303,7 +419,15 @@ function anchorTypesForNeighbor(neighbor) {
   return [...anchorTypes];
 }
 
-function selectEvidenceRows({ seedRows, graphRows, count, policy, seeds, graphMetadataById }) {
+function selectEvidenceRows({
+  seedRows,
+  graphRows,
+  count,
+  policy,
+  seeds,
+  graphMetadataById,
+  questionIntent,
+}) {
   const scored = [];
   const graphRowIds = new Set(graphRows.map((row) => row.id));
 
@@ -311,7 +435,7 @@ function selectEvidenceRows({ seedRows, graphRows, count, policy, seeds, graphMe
     scored.push({
       origin: "seed",
       row,
-      score: vectorSeedScore(row, index, policy),
+      score: vectorSeedScore(row, index, policy, questionIntent),
     });
   });
 
@@ -319,7 +443,7 @@ function selectEvidenceRows({ seedRows, graphRows, count, policy, seeds, graphMe
     scored.push({
       origin: "graph",
       row,
-      score: graphCandidateScore(row, graphMetadataById.get(row.id), policy, seeds),
+      score: graphCandidateScore(row, graphMetadataById.get(row.id), policy, seeds, questionIntent),
     });
   });
 
@@ -442,6 +566,7 @@ export async function retrieveEvidenceRows({
   graphNeighborLimit,
   graphDatabase = config.graph.database,
 } = {}) {
+  const questionIntent = detectQuestionIntent(queryText);
   const retrieval = await retrieveThoughts({
     queryText,
     threshold,
@@ -470,6 +595,7 @@ export async function retrieveEvidenceRows({
   if (!graphAssisted) {
     return {
       retrieval,
+      questionIntent,
       graphExpansion: graphExpansion.expansion,
       evidenceRows: retrieval.results,
     };
@@ -484,10 +610,12 @@ export async function retrieveEvidenceRows({
     policy,
     seeds,
     graphMetadataById: graphExpansion.metadataById,
+    questionIntent,
   });
 
   return {
     retrieval,
+    questionIntent,
     graphExpansion: {
       ...graphExpansion.expansion,
       added_count: selected.selectedGraphIds.length,

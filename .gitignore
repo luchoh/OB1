@@ -2,6 +2,10 @@ node_modules/
 .DS_Store
 .env
 .env.open-brain-local
+.direnv/
+.devenv/
+.devenv.flake.nix
+devenv.local.nix
 .open-brain-local-smoke.log
 .mcp.json
 chatgpt-sync-log.json

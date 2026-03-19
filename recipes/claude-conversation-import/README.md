@@ -11,6 +11,12 @@ Import a Claude data export into Open Brain as distilled, searchable thoughts.
 - filters low-value conversations
 - distills each kept conversation into a selective set of durable thoughts
 - uses an adaptive thought cap: usually `1-3`, but up to `7` for dense conversations
+- derives claim metadata for each distilled thought:
+  - `claim_kind`
+  - `epistemic_status`
+  - `claim_subject`
+  - `claim_object`
+  - `claim_scope`
 - applies deterministic secret hygiene before ingest, redacting obvious literal secrets from both extracted thoughts and stored source text
 - ingests those thoughts into the local OB1 service
 
@@ -51,6 +57,7 @@ Current boundary:
 - the importer reads conversation JSON plus message-level attachment metadata
 - it does not separately ingest binary exported files or images
 - if Anthropic changes the export format materially, run a dry-run first and we can tighten the parser against the real export
+- `--raw` mode skips claim typing as well as thought distillation
 
 ## Local Run
 
@@ -73,6 +80,11 @@ If the dry run looks right:
 python import-claude.py /path/to/claude-export.zip
 ```
 
+Shared claim-typing artifacts:
+- [claim prompt](/Users/luchoh/Dev/OB1/recipes/claim-typing/prompt.md#L1)
+- [claim evaluator](/Users/luchoh/Dev/OB1/recipes/claim-typing/eval-prompt.py#L1)
+- [claim cases](/Users/luchoh/Dev/OB1/recipes/claim-typing/eval-cases.json#L1)
+
 This importer uses Qwen tool calling for thought extraction rather than `response_format`, because that is the reliable structured-output path on the current `mlx-server`. Details are in [docs/08-vllm-mlx-no-thinking.md](/Users/luchoh/Dev/OB1/docs/08-vllm-mlx-no-thinking.md#L1).
 
 ## Important Flags
@@ -83,6 +95,7 @@ This importer uses Qwen tool calling for thought extraction rather than `respons
 - `--before YYYY-MM-DD`: only import older conversations
 - `--raw`: skip summarization and ingest the user text directly
   - secret hygiene still applies before ingest
+  - claim typing is skipped in raw mode
 - `--verbose`: print the full extracted thoughts
 - `--report FILE`: write a markdown import report
 

@@ -36,12 +36,17 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 ## Recommended First Run
 
 1. Copy [`.env.open-brain-local.example`](/Users/luchoh/Dev/OB1/.env.open-brain-local.example) to your real runtime env file and fill in secrets.
-2. Run [`scripts/apply-open-brain-local-migrations.sh`](/Users/luchoh/Dev/OB1/scripts/apply-open-brain-local-migrations.sh) to apply the canonical SQL from [`local/open-brain-mcp/migrations`](/Users/luchoh/Dev/OB1/local/open-brain-mcp/migrations).
-3. Install and run the local MCP service from [`local/open-brain-mcp`](/Users/luchoh/Dev/OB1/local/open-brain-mcp).
-4. Run [`scripts/verify-open-brain-local.sh`](/Users/luchoh/Dev/OB1/scripts/verify-open-brain-local.sh) to confirm Consul registration, health, model IDs, the embedding contract, and PostgreSQL schema shape.
-5. Run [`scripts/smoke-open-brain-local-mcp.sh`](/Users/luchoh/Dev/OB1/scripts/smoke-open-brain-local-mcp.sh) to verify the local server itself end to end.
-6. Only change embedding dimensionality if you are prepared to regenerate all embeddings and adjust the schema.
-7. Keep client-side dimensionality reduction disabled unless the canonical service contract changes.
+2. If you use `direnv`, allow the repo env:
+   - `direnv allow`
+3. Enter the repo shell:
+   - `devenv shell`
+4. Run [`scripts/apply-open-brain-local-migrations.sh`](/Users/luchoh/Dev/OB1/scripts/apply-open-brain-local-migrations.sh) to apply the canonical SQL from [`local/open-brain-mcp/migrations`](/Users/luchoh/Dev/OB1/local/open-brain-mcp/migrations).
+5. Start the local MCP runtime with:
+   - `devenv up open_brain_local`
+6. Run [`scripts/verify-open-brain-local.sh`](/Users/luchoh/Dev/OB1/scripts/verify-open-brain-local.sh) to confirm Consul registration, health, model IDs, the embedding contract, and PostgreSQL schema shape.
+7. Run [`scripts/smoke-open-brain-local-mcp.sh`](/Users/luchoh/Dev/OB1/scripts/smoke-open-brain-local-mcp.sh) to verify the local server itself end to end.
+8. Only change embedding dimensionality if you are prepared to regenerate all embeddings and adjust the schema.
+9. Keep client-side dimensionality reduction disabled unless the canonical service contract changes.
 
 ## Notes
 
@@ -54,4 +59,5 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 - Document and attachment import now use an OCR-first Docling pass and automatically retry with the `vlm` pipeline when extraction quality is clearly weak.
 - Run one worker per model service and scale embeddings with batching, not worker duplication.
 - Pre-stage model artifacts locally and prefer offline startup semantics.
+- `.envrc` now points `direnv` at the repo `devenv` definition, and `devenv.nix` loads `.env.open-brain-local`.
 - If later testing proves that `halfvec(3072)` materially improves retrieval quality, that should be treated as an explicit schema migration rather than an in-place tweak.

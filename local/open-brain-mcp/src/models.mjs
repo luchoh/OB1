@@ -209,6 +209,13 @@ function sanitizeEvidenceItems(evidence) {
     email_subject: item.email_subject ?? null,
     document_path: item.document_path ?? null,
     attachment_filename: item.attachment_filename ?? null,
+    claim_kind: item.claim_kind ?? null,
+    epistemic_status: item.epistemic_status ?? null,
+    claim_subject: item.claim_subject ?? null,
+    claim_object: item.claim_object ?? null,
+    claim_scope: item.claim_scope ?? null,
+    claim_strength: item.claim_strength ?? null,
+    claim_rationale: item.claim_rationale ?? null,
   }));
 }
 
@@ -349,7 +356,8 @@ export async function extractMetadata(content, source) {
   };
 }
 
-export async function answerFromEvidence(question, evidence) {
+export async function answerFromEvidence(question, evidence, options = {}) {
+  const questionIntent = typeof options.questionIntent === "string" ? options.questionIntent : "default";
   const response = await requestJson(`${config.llmBaseUrl}/chat/completions`, {
     model: config.llmModel,
     temperature: 0,
@@ -368,6 +376,11 @@ export async function answerFromEvidence(question, evidence) {
           "If the evidence is partial, answer only the supported portion and mark the rest as missing.",
           "If the evidence does not support the question, say so plainly.",
           "Use only citation ids that appear in the evidence list.",
+          "Evidence items may include derived claim metadata such as claim_kind or epistemic_status.",
+          "Treat derived claim metadata as a secondary hint only. The summary and excerpt remain the truth anchor.",
+          "If claim metadata conflicts with the cited text, trust the cited text.",
+          "For preference or decision questions, distinguish settled choices from options that were only being explored.",
+          "Never turn a project-scoped choice into a universal 'best' claim unless the evidence clearly says that.",
           "Never include chain-of-thought or internal reasoning.",
         ].join(" "),
       },
@@ -375,6 +388,7 @@ export async function answerFromEvidence(question, evidence) {
         role: "user",
         content: [
           `Question:\n${question.trim()}`,
+          `Question intent:\n${questionIntent}`,
           `Evidence items:\n${JSON.stringify(sanitizeEvidenceItems(evidence), null, 2)}`,
         ].join("\n\n"),
       },

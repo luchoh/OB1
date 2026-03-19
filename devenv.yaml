@@ -1,0 +1,6 @@
+inputs:
+  # Pin a known-good devenv modules revision; newer revs have been flaky on this host.
+  devenv:
+    url: "github:cachix/devenv/e9f3b7808443cd3d5b492863bc9c839f357e73da?dir=src/modules"
+  nixpkgs:
+    url: github:NixOS/nixpkgs/nixos-25.05

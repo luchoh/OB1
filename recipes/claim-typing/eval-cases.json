@@ -1,0 +1,119 @@
+[
+  {
+    "id": "dac_psu_cluster",
+    "title": "PSU comparison for DACs",
+    "source_name": "chatgpt",
+    "date_str": "2025-05-14",
+    "full_text": "I am building power supplies for Hagerman Cornet3 and Noir. I decided to use Sigma 11 boards for the permanent 9V and 24V supplies, but I also discussed temporary battery options while the boards are being built. Temporary candidates included LiFePO4 packs and Eneloop AA setups.",
+    "thoughts": [
+      "I decided to use Sigma 11 PSUs for Cornet3 (9V) and Noir (24V).",
+      "I was still considering temporary LiFePO4 and Eneloop AA battery options while the permanent PSUs were being built."
+    ],
+    "expectations": [
+      {
+        "emit_claim": true,
+        "claim_kind": "decision",
+        "epistemic_status": "decided",
+        "claim_object_contains_any": ["sigma 11"],
+        "claim_scope_contains": ["cornet3", "noir"]
+      },
+      {
+        "emit_claim": true,
+        "claim_kind": "option",
+        "epistemic_status": "considering",
+        "claim_object_contains_any": ["lifepo4", "eneloop"]
+      }
+    ]
+  },
+  {
+    "id": "graph_architecture_decision",
+    "title": "Graph augmentation architecture",
+    "source_name": "claude",
+    "date_str": "2026-03-17",
+    "full_text": "For OB1 graph augmentation, I want PostgreSQL to stay canonical and Neo4j to be a derived sidecar. I do not want Neo4j to become the write path.",
+    "thoughts": [
+      "I decided to keep PostgreSQL as the canonical OB1 store and use Neo4j only as a derived sidecar graph."
+    ],
+    "expectations": [
+      {
+        "emit_claim": true,
+        "claim_kind": "decision",
+        "epistemic_status": "decided",
+        "claim_subject_contains_any": ["ob1", "graph", "store"],
+        "claim_object_contains_any": ["postgresql", "neo4j"]
+      }
+    ]
+  },
+  {
+    "id": "aws_codecommit_unresolved",
+    "title": "Troubleshooting AWS CodeCommit on macOS",
+    "source_name": "claude",
+    "date_str": "2024-12-02",
+    "full_text": "AWS CodeCommit authentication on macOS kept failing. I had not resolved whether the problem was the credential helper, keychain state, or the AWS profile wiring. I was still debugging it.",
+    "thoughts": [
+      "I was still debugging why AWS CodeCommit authentication was failing on macOS."
+    ],
+    "expectations": [
+      {
+        "emit_claim": true,
+        "claim_kind": "open_question",
+        "epistemic_status": "unresolved",
+        "claim_subject_contains_any": ["aws codecommit", "authentication"],
+        "claim_scope_contains": ["macos"]
+      }
+    ]
+  },
+  {
+    "id": "gfx_lens_comparison",
+    "title": "Telephoto lenses for Fuji GFX",
+    "source_name": "chatgpt",
+    "date_str": "2025-10-05",
+    "full_text": "I was comparing telephoto strategies for Fuji GFX. I considered adapted Canon EF glass, native GF lenses, and whether the tradeoffs in cost and weight were worth it.",
+    "thoughts": [
+      "I compared telephoto strategies for Fuji GFX, including adapted Canon EF glass and native GF lenses."
+    ],
+    "expectations": [
+      {
+        "emit_claim": true,
+        "claim_kind": "comparison",
+        "epistemic_status": "considering",
+        "claim_subject_contains_any": ["telephoto", "fuji gfx"],
+        "claim_object_contains_any": ["canon ef", "gf lenses"]
+      }
+    ]
+  },
+  {
+    "id": "generic_support_should_stay_untyped",
+    "title": "Deleting eSIM on iPhone",
+    "source_name": "chatgpt",
+    "date_str": "2025-09-01",
+    "full_text": "This was generic how-to guidance about deleting an eSIM on iPhone and did not capture a personal choice, project state, or durable preference.",
+    "thoughts": [
+      "To delete an eSIM on iPhone, go to Settings, open Cellular, and remove the plan."
+    ],
+    "expectations": [
+      {
+        "emit_claim": false
+      }
+    ]
+  },
+  {
+    "id": "regulator_values_plan",
+    "title": "Calculating LT3015 voltage regulator output values",
+    "source_name": "claude",
+    "date_str": "2024-04-11",
+    "full_text": "I worked out the LT3015 resistor values needed to get 12V and 18V outputs for an audio power supply build, and I planned to use those values in the board implementation.",
+    "thoughts": [
+      "I worked out LT3015 output resistor values for 12V and 18V rails and planned to use them in the audio PSU build."
+    ],
+    "expectations": [
+      {
+        "emit_claim": true,
+        "claim_kind": "implementation_detail",
+        "epistemic_status": "decided",
+        "claim_subject_contains_any": ["lt3015", "resistor values"],
+        "claim_scope_contains": ["12v", "18v", "audio psu"]
+      }
+    ]
+  }
+]
