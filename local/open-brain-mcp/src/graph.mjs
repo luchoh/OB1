@@ -1,6 +1,14 @@
+import { createHash } from "node:crypto";
 import neo4j from "neo4j-driver";
 import { config } from "./config.mjs";
 import { query } from "./db.mjs";
+
+export const GRAPH_SCHEMA_VARIANTS = new Set([
+  "provenance-v1",
+  "source-first-chat-v1",
+]);
+
+const GRAPH_PROJECTION_REVISION = "graph-projection-v3";
 
 const NODE_LABELS = new Set([
   "Thought",
@@ -9,6 +17,9 @@ const NODE_LABELS = new Set([
   "Attachment",
   "Document",
   "DictationArtifact",
+  "Message",
+  "Participant",
+  "AttachmentRef",
 ]);
 
 const REL_TYPES = new Set([
@@ -18,6 +29,10 @@ const REL_TYPES = new Set([
   "SUMMARIZED_AS",
   "DISTILLED_TO",
   "REFERENCES_SOURCE",
+  "HAS_MESSAGE",
+  "AUTHORED_BY",
+  "PRECEDES",
+  "HAS_ATTACHMENT_REF",
 ]);
 
 let driver;
@@ -34,6 +49,16 @@ function sleep(ms) {
 
 function graphEnabled() {
   return config.graph?.enabled === true;
+}
+
+function normalizeGraphSchemaVariant(value = config.graph.schemaVariant) {
+  const normalized = typeof value === "string" && value.trim()
+    ? value.trim().toLowerCase()
+    : "provenance-v1";
+  if (!GRAPH_SCHEMA_VARIANTS.has(normalized)) {
+    throw new Error(`Unsupported graph schema variant: ${value}`);
+  }
+  return normalized;
 }
 
 function nestedUserMetadata(row) {
@@ -181,6 +206,7 @@ export async function healthcheckGraph() {
     enabled: true,
     database: config.graph.database,
     uri: config.graph.uri,
+    schema_variant: normalizeGraphSchemaVariant(config.graph.schemaVariant),
   };
 }
 
@@ -241,6 +267,9 @@ export async function ensureGraphSchema(database = config.graph.database) {
     "CREATE CONSTRAINT ob1_attachment_canonical_id IF NOT EXISTS FOR (n:Attachment) REQUIRE n.canonical_id IS UNIQUE",
     "CREATE CONSTRAINT ob1_document_canonical_id IF NOT EXISTS FOR (n:Document) REQUIRE n.canonical_id IS UNIQUE",
     "CREATE CONSTRAINT ob1_dictation_canonical_id IF NOT EXISTS FOR (n:DictationArtifact) REQUIRE n.canonical_id IS UNIQUE",
+    "CREATE CONSTRAINT ob1_message_canonical_id IF NOT EXISTS FOR (n:Message) REQUIRE n.canonical_id IS UNIQUE",
+    "CREATE CONSTRAINT ob1_participant_canonical_id IF NOT EXISTS FOR (n:Participant) REQUIRE n.canonical_id IS UNIQUE",
+    "CREATE CONSTRAINT ob1_attachment_ref_canonical_id IF NOT EXISTS FOR (n:AttachmentRef) REQUIRE n.canonical_id IS UNIQUE",
   ];
 
   for (const statement of constraintStatements) {
@@ -258,7 +287,9 @@ function projectionRevisionSql() {
         coalesce(t.dedupe_key, '') || '|' ||
         coalesce(t.content_hash, '') || '|' ||
         coalesce(t.metadata::text, '') || '|' ||
-        coalesce(t.updated_at::text, ''),
+        coalesce(t.updated_at::text, '') || '|' ||
+        $6::text || '|' ||
+        $7::text,
         'sha256'
       ),
       'hex'
@@ -268,6 +299,7 @@ function projectionRevisionSql() {
 
 async function fetchProjectionCandidates({
   database = config.graph.database,
+  schemaVariant = config.graph.schemaVariant,
   limit = config.graph.projectorBatchSize,
   forceAll = false,
   thoughtIds = [],
@@ -296,8 +328,11 @@ async function fetchProjectionCandidates({
           or gps.thought_id is null
           or gps.projection_revision_hash is distinct from ${revisionSql}
           or gps.last_projection_status is distinct from 'projected')
-          and ($3::uuid[] is null or t.id = any($3))
-          and ($4::text[] is null or t.dedupe_key = any($4))
+          and (
+            ($3::uuid[] is null and $4::text[] is null)
+            or ($3::uuid[] is not null and t.id = any($3))
+            or ($4::text[] is not null and t.dedupe_key = any($4))
+          )
       )
       select *
       from projected
@@ -310,6 +345,8 @@ async function fetchProjectionCandidates({
       thoughtIds.length ? thoughtIds : null,
       dedupeKeys.length ? dedupeKeys : null,
       limit,
+      normalizeGraphSchemaVariant(schemaVariant),
+      GRAPH_PROJECTION_REVISION,
     ],
   );
 
@@ -417,6 +454,480 @@ function buildBaseEdgeProps(row) {
     source_type: row.metadata?.type ?? null,
     projected_at: new Date().toISOString(),
   };
+}
+
+function timestampToIso(value) {
+  if (value === undefined || value === null || value === "" || value === 0) {
+    return null;
+  }
+
+  if (typeof value === "number") {
+    const numeric = value > 10_000_000_000 ? value / 1000 : value;
+    const date = new Date(numeric * 1000);
+    return Number.isNaN(date.valueOf()) ? null : date.toISOString();
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    if (/^\d+$/.test(trimmed)) {
+      return timestampToIso(Number(trimmed));
+    }
+    const candidate = trimmed.endsWith("Z")
+      ? trimmed.slice(0, -1) + "+00:00"
+      : trimmed;
+    const parsed = new Date(candidate.includes("T") ? candidate : candidate.replace(" ", "T"));
+    return Number.isNaN(parsed.valueOf()) ? null : parsed.toISOString();
+  }
+
+  return null;
+}
+
+function normalizeChatRole(value) {
+  if (!value) {
+    return null;
+  }
+  const lowered = String(value).trim().toLowerCase();
+  if (["human", "user", "customer"].includes(lowered)) {
+    return "user";
+  }
+  if (["assistant", "claude", "model", "ai"].includes(lowered)) {
+    return "assistant";
+  }
+  return lowered || null;
+}
+
+function stableHash(value) {
+  return createHash("sha256").update(value).digest("hex");
+}
+
+function parseRawExportJson(userMetadata) {
+  const raw = prefer(userMetadata.raw_export_json);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function flattenText(value, fragments = []) {
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (text) {
+      fragments.push(text);
+    }
+    return fragments;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      flattenText(item, fragments);
+    }
+    return fragments;
+  }
+
+  if (value && typeof value === "object") {
+    for (const key of ["text", "content", "value", "body", "message", "completion", "caption"]) {
+      if (key in value) {
+        flattenText(value[key], fragments);
+      }
+    }
+  }
+
+  return fragments;
+}
+
+function dedupeStrings(values) {
+  const seen = new Set();
+  const output = [];
+  for (const value of values) {
+    const normalized = typeof value === "string" ? value.trim() : "";
+    if (!normalized || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    output.push(normalized);
+  }
+  return output;
+}
+
+function conversationAnchor(userMetadata, platform) {
+  if (platform === "chatgpt") {
+    return {
+      conversationId: prefer(userMetadata.chatgpt_conversation_id),
+      conversationHash: prefer(userMetadata.chatgpt_conversation_hash),
+      title: prefer(userMetadata.chatgpt_title),
+      createdAt: prefer(userMetadata.chatgpt_create_time),
+    };
+  }
+  if (platform === "claude") {
+    return {
+      conversationId: prefer(userMetadata.claude_conversation_id),
+      conversationHash: prefer(userMetadata.claude_conversation_hash),
+      title: prefer(userMetadata.claude_title),
+      createdAt: prefer(userMetadata.claude_create_time),
+    };
+  }
+  return {
+    conversationId: null,
+    conversationHash: null,
+    title: null,
+    createdAt: null,
+  };
+}
+
+function conversationCanonicalIdFor(platform, userMetadata) {
+  const anchor = conversationAnchor(userMetadata, platform);
+  const identifier = anchor.conversationId ?? anchor.conversationHash;
+  return identifier ? `conversation:${platform}:${identifier}` : null;
+}
+
+function chatgptWalkMessages(mapping) {
+  if (!mapping || typeof mapping !== "object") {
+    return [];
+  }
+
+  const roots = [];
+  for (const [nodeId, node] of Object.entries(mapping)) {
+    const parent = node?.parent;
+    if (parent === null || parent === undefined || !(parent in mapping)) {
+      roots.push(nodeId);
+    }
+  }
+
+  const messages = [];
+  const visited = new Set();
+
+  const walk = (nodeId) => {
+    if (visited.has(nodeId) || !mapping[nodeId]) {
+      return;
+    }
+    visited.add(nodeId);
+    const node = mapping[nodeId];
+    const message = node?.message;
+    if (message && message.content) {
+      messages.push(message);
+    }
+    for (const childId of node?.children ?? []) {
+      walk(childId);
+    }
+  };
+
+  for (const rootId of roots) {
+    walk(rootId);
+  }
+
+  return messages;
+}
+
+function chatgptAttachmentRefs(message) {
+  const attachments = [];
+  for (const item of message?.metadata?.attachments ?? []) {
+    if (!item || typeof item !== "object") {
+      continue;
+    }
+    const filename = prefer(item.name, item.filename, item.file_name, item.id);
+    if (!filename) {
+      continue;
+    }
+    attachments.push({
+      refId: prefer(item.id, item.file_id, filename),
+      filename,
+      contentType: prefer(item.mime_type, item.content_type, item.type),
+      sizeBytes: prefer(item.size_bytes, item.size),
+    });
+  }
+  return attachments;
+}
+
+function chatgptMessageText(message) {
+  const content = message?.content ?? {};
+  const contentType = content?.content_type;
+  const metadata = message?.metadata ?? {};
+
+  if (contentType === "user_editable_context") {
+    return "";
+  }
+
+  const fragments = [];
+  if ([
+    "text",
+    "code",
+    "execution_output",
+    "computer_output",
+    "system_error",
+    "tether_browsing_display",
+    "tether_quote",
+  ].includes(contentType)) {
+    for (const part of content.parts ?? []) {
+      if (typeof part === "string" && part.trim()) {
+        fragments.push(part.trim());
+      }
+    }
+  } else if (contentType === "multimodal_text") {
+    const attachmentNames = chatgptAttachmentRefs(message).map((item) => item.filename);
+    if (attachmentNames.length > 0) {
+      fragments.push(`Attachments: ${attachmentNames.join(", ")}`);
+    }
+    for (const part of content.parts ?? []) {
+      if (typeof part === "string" && part.trim()) {
+        fragments.push(part.trim());
+      }
+    }
+  }
+
+  return fragments.join("\n").trim();
+}
+
+function chatgptStructuredMessages(rawConversation) {
+  const messages = chatgptWalkMessages(rawConversation?.mapping ?? {});
+  return messages.map((message, index) => {
+    const attachments = chatgptAttachmentRefs(message);
+    const role = normalizeChatRole(message?.author?.role);
+    return {
+      canonicalKey: prefer(message?.id, `ordinal-${index + 1}`),
+      role,
+      createdAt: timestampToIso(message?.create_time),
+      updatedAt: timestampToIso(message?.update_time),
+      content: chatgptMessageText(message),
+      attachments,
+    };
+  }).filter((message) => message.content || message.attachments.length > 0);
+}
+
+function claudeAttachmentRefs(message) {
+  const attachments = [];
+  for (const key of ["attachments", "files", "file_references"]) {
+    const values = message?.[key];
+    if (!Array.isArray(values)) {
+      continue;
+    }
+    for (const item of values) {
+      if (typeof item === "string") {
+        const filename = item.trim();
+        if (!filename) {
+          continue;
+        }
+        attachments.push({
+          refId: filename,
+          filename,
+          contentType: null,
+          sizeBytes: null,
+        });
+        continue;
+      }
+      if (!item || typeof item !== "object") {
+        continue;
+      }
+      const filename = prefer(item.file_name, item.filename, item.name, item.title, item.id);
+      if (!filename) {
+        continue;
+      }
+      attachments.push({
+        refId: prefer(item.id, item.file_id, filename),
+        filename,
+        contentType: prefer(item.mime_type, item.content_type, item.type),
+        sizeBytes: prefer(item.size_bytes, item.size),
+      });
+    }
+  }
+  return attachments;
+}
+
+function claudeMessageSortValue(message) {
+  for (const key of ["created_at", "createdAt", "updated_at", "updatedAt", "timestamp"]) {
+    const iso = timestampToIso(message?.[key]);
+    if (iso) {
+      return Date.parse(iso);
+    }
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
+function claudeExtractMessages(rawConversation) {
+  const direct = Array.isArray(rawConversation?.chat_messages)
+    ? rawConversation.chat_messages
+    : Array.isArray(rawConversation?.messages)
+      ? rawConversation.messages
+      : null;
+  const nestedConversation = rawConversation?.conversation;
+  const nested = Array.isArray(nestedConversation?.chat_messages)
+    ? nestedConversation.chat_messages
+    : Array.isArray(nestedConversation?.messages)
+      ? nestedConversation.messages
+      : null;
+  const messages = (direct ?? nested ?? []).filter((message) => message && typeof message === "object");
+  return [...messages].sort((left, right) => claudeMessageSortValue(left) - claudeMessageSortValue(right));
+}
+
+function claudeMessageRole(message) {
+  return normalizeChatRole(
+    prefer(
+      message?.sender,
+      message?.role,
+      typeof message?.author === "object" ? message.author?.role : message?.author,
+      message?.from,
+    ),
+  );
+}
+
+function claudeMessageText(message) {
+  const fragments = [];
+  const attachmentNames = claudeAttachmentRefs(message).map((item) => item.filename);
+  if (attachmentNames.length > 0) {
+    fragments.push(`Attachments: ${attachmentNames.join(", ")}`);
+  }
+  for (const key of ["text", "content", "message", "body", "completion"]) {
+    if (key in (message ?? {})) {
+      fragments.push(...flattenText(message[key]));
+    }
+  }
+  return dedupeStrings(fragments).join("\n").trim();
+}
+
+function claudeStructuredMessages(rawConversation) {
+  return claudeExtractMessages(rawConversation).map((message, index) => {
+    const attachments = claudeAttachmentRefs(message);
+    return {
+      canonicalKey: prefer(message?.uuid, message?.id, `ordinal-${index + 1}`),
+      role: claudeMessageRole(message),
+      createdAt: timestampToIso(
+        prefer(
+          message?.created_at,
+          message?.createdAt,
+          message?.updated_at,
+          message?.updatedAt,
+          message?.timestamp,
+        ),
+      ),
+      updatedAt: timestampToIso(prefer(message?.updated_at, message?.updatedAt)),
+      content: claudeMessageText(message),
+      attachments,
+    };
+  }).filter((message) => message.content || message.attachments.length > 0);
+}
+
+function messageCanonicalId(platform, conversationIdentifier, messageKey) {
+  return `message:${platform}:${conversationIdentifier}:${messageKey}`;
+}
+
+function participantCanonicalId(platform, conversationIdentifier, role) {
+  return `participant:${platform}:${conversationIdentifier}:${role ?? "unknown"}`;
+}
+
+function attachmentRefCanonicalId(platform, conversationIdentifier, messageKey, attachment) {
+  const raw = stableHash(
+    JSON.stringify({
+      platform,
+      conversationIdentifier,
+      messageKey,
+      refId: attachment.refId ?? null,
+      filename: attachment.filename ?? null,
+      contentType: attachment.contentType ?? null,
+    }),
+  ).slice(0, 16);
+  return `attachment_ref:${platform}:${conversationIdentifier}:${raw}`;
+}
+
+function rawChatConversationProjection(store, row, metadata, userMetadata, baseEdgeProps, schemaVariant) {
+  if (normalizeGraphSchemaVariant(schemaVariant) !== "source-first-chat-v1") {
+    return;
+  }
+
+  const type = metadata.type ?? null;
+  if (!["chatgpt_conversation_record", "claude_conversation_record"].includes(type)) {
+    return;
+  }
+
+  const platform = metadata.source ?? (type.startsWith("claude") ? "claude" : "chatgpt");
+  const anchor = conversationAnchor(userMetadata, platform);
+  const conversationIdentifier = anchor.conversationId ?? anchor.conversationHash;
+  const conversationCanonicalId = conversationCanonicalIdFor(platform, userMetadata);
+  if (!conversationIdentifier || !conversationCanonicalId) {
+    return;
+  }
+
+  const rawConversation = parseRawExportJson(userMetadata);
+  if (!rawConversation) {
+    return;
+  }
+
+  const messages = platform === "claude"
+    ? claudeStructuredMessages(rawConversation)
+    : chatgptStructuredMessages(rawConversation);
+  if (messages.length === 0) {
+    return;
+  }
+
+  const thoughtId = canonicalThoughtId(row);
+  let previousMessageId = null;
+
+  for (let index = 0; index < messages.length; index += 1) {
+    const message = messages[index];
+    const messageId = messageCanonicalId(platform, conversationIdentifier, message.canonicalKey);
+    addNode(store.nodes, "Message", messageId, {
+      canonical_id: messageId,
+      source_system: platform,
+      source_type: "message",
+      platform,
+      conversation_id: anchor.conversationId ?? null,
+      conversation_hash: anchor.conversationHash ?? null,
+      message_key: message.canonicalKey,
+      ordinal: index + 1,
+      role: message.role ?? null,
+      attachment_count: message.attachments.length,
+      content_preview: truncateText(message.content, 420),
+      created_at: message.createdAt ?? anchor.createdAt ?? null,
+      updated_at: message.updatedAt ?? isoTimestamp(row.updated_at),
+    });
+    addEdge(store.edges, "Conversation", conversationCanonicalId, "HAS_MESSAGE", "Message", messageId, baseEdgeProps);
+    addEdge(store.edges, "Thought", thoughtId, "REFERENCES_SOURCE", "Message", messageId, baseEdgeProps);
+
+    const participantId = participantCanonicalId(platform, conversationIdentifier, message.role);
+    addNode(store.nodes, "Participant", participantId, {
+      canonical_id: participantId,
+      source_system: platform,
+      source_type: "participant",
+      platform,
+      conversation_id: anchor.conversationId ?? null,
+      conversation_hash: anchor.conversationHash ?? null,
+      role: message.role ?? null,
+      created_at: anchor.createdAt ?? isoTimestamp(row.created_at),
+      updated_at: isoTimestamp(row.updated_at),
+    });
+    addEdge(store.edges, "Message", messageId, "AUTHORED_BY", "Participant", participantId, baseEdgeProps);
+
+    if (previousMessageId) {
+      addEdge(store.edges, "Message", previousMessageId, "PRECEDES", "Message", messageId, baseEdgeProps);
+    }
+    previousMessageId = messageId;
+
+    for (const attachment of message.attachments) {
+      const attachmentId = attachmentRefCanonicalId(platform, conversationIdentifier, message.canonicalKey, attachment);
+      addNode(store.nodes, "AttachmentRef", attachmentId, {
+        canonical_id: attachmentId,
+        source_system: platform,
+        source_type: "attachment_ref",
+        platform,
+        conversation_id: anchor.conversationId ?? null,
+        conversation_hash: anchor.conversationHash ?? null,
+        message_key: message.canonicalKey,
+        ref_id: attachment.refId ?? null,
+        filename: attachment.filename ?? null,
+        content_type: attachment.contentType ?? null,
+        size_bytes: attachment.sizeBytes ?? null,
+        created_at: message.createdAt ?? anchor.createdAt ?? null,
+        updated_at: isoTimestamp(row.updated_at),
+      });
+      addEdge(store.edges, "Message", messageId, "HAS_ATTACHMENT_REF", "AttachmentRef", attachmentId, baseEdgeProps);
+    }
+  }
 }
 
 function conversationProjection(store, row, metadata, userMetadata, baseEdgeProps) {
@@ -629,7 +1140,7 @@ function artifactProjection(store, row, metadata, userMetadata, baseEdgeProps) {
   }
 }
 
-function buildProjectionPlan(row) {
+function buildProjectionPlan(row, schemaVariant = config.graph.schemaVariant) {
   const metadata = row.metadata ?? {};
   const userMetadata = nestedUserMetadata(row);
   const title = thoughtTitle(metadata, userMetadata);
@@ -659,6 +1170,7 @@ function buildProjectionPlan(row) {
   const baseEdgeProps = buildBaseEdgeProps(row);
   conversationProjection(store, row, metadata, userMetadata, baseEdgeProps);
   artifactProjection(store, row, metadata, userMetadata, baseEdgeProps);
+  rawChatConversationProjection(store, row, metadata, userMetadata, baseEdgeProps, schemaVariant);
 
   return {
     nodes: [...store.nodes.values()],
@@ -700,8 +1212,8 @@ async function upsertEdge(tx, edge) {
   );
 }
 
-async function projectThoughtRow(row, database) {
-  const plan = buildProjectionPlan(row);
+async function projectThoughtRow(row, database, schemaVariant) {
+  const plan = buildProjectionPlan(row, schemaVariant);
   await writeGraph(async (tx) => {
     for (const node of plan.nodes) {
       await upsertNode(tx, node);
@@ -714,6 +1226,7 @@ async function projectThoughtRow(row, database) {
 
 export async function projectThoughts({
   database = config.graph.database,
+  schemaVariant = config.graph.schemaVariant,
   limit = config.graph.projectorBatchSize,
   forceAll = false,
   thoughtIds = [],
@@ -729,6 +1242,7 @@ export async function projectThoughts({
 
   const rows = await fetchProjectionCandidates({
     database,
+    schemaVariant,
     limit,
     forceAll,
     thoughtIds,
@@ -737,6 +1251,7 @@ export async function projectThoughts({
 
   const summary = {
     database,
+    schema_variant: normalizeGraphSchemaVariant(schemaVariant),
     fetched: rows.length,
     projected: 0,
     failed: 0,
@@ -745,7 +1260,7 @@ export async function projectThoughts({
 
   for (const row of rows) {
     try {
-      await projectThoughtRow(row, database);
+      await projectThoughtRow(row, database, schemaVariant);
       await recordProjectionState({
         thoughtId: row.id,
         database,
@@ -860,7 +1375,7 @@ export async function graphNeighbors({
   }
 
   const resolvedHops = Math.max(1, Math.min(3, Number(maxHops) || 1));
-  const resolvedLimit = Math.max(1, Math.min(50, Number(limit) || 10));
+  const resolvedLimit = Math.max(1, Math.min(200, Number(limit) || 10));
   const targetId = thoughtCanonicalIdFromInput({ thoughtId, canonicalId });
 
   const result = await runGraph(
@@ -868,8 +1383,46 @@ export async function graphNeighbors({
       MATCH (center {canonical_id: $canonicalId})
       OPTIONAL MATCH p=(center)-[*1..${resolvedHops}]-(neighbor)
       WHERE neighbor.canonical_id <> center.canonical_id
-      WITH center, p, neighbor
-      ORDER BY length(p) ASC, coalesce(neighbor.updated_at, neighbor.created_at) DESC
+      WITH
+        center,
+        neighbor,
+        p,
+        CASE
+          WHEN 'Message' IN labels(neighbor) THEN 1
+          ELSE 0
+        END AS message_rank,
+        CASE
+          WHEN 'Conversation' IN labels(neighbor) THEN 0
+          WHEN 'Participant' IN labels(neighbor) THEN 1
+          WHEN 'AttachmentRef' IN labels(neighbor) THEN 2
+          WHEN 'Thought' IN labels(neighbor) THEN 3
+          WHEN 'Email' IN labels(neighbor) THEN 4
+          WHEN 'Attachment' IN labels(neighbor) THEN 5
+          WHEN 'Document' IN labels(neighbor) THEN 6
+          WHEN 'DictationArtifact' IN labels(neighbor) THEN 7
+          WHEN 'Message' IN labels(neighbor) THEN 99
+          ELSE 50
+        END AS label_rank
+      ORDER BY
+        message_rank ASC,
+        CASE WHEN p IS NULL THEN 999 ELSE length(p) END ASC,
+        label_rank ASC,
+        coalesce(neighbor.updated_at, neighbor.created_at) DESC
+      WITH center, neighbor, label_rank, collect(p)[0] AS sample_path
+      WITH
+        center,
+        neighbor,
+        label_rank,
+        sample_path,
+        CASE
+          WHEN sample_path IS NULL THEN null
+          ELSE length(sample_path)
+        END AS hop_count
+      ORDER BY
+        CASE WHEN label_rank = 99 THEN 1 ELSE 0 END ASC,
+        hop_count ASC,
+        label_rank ASC,
+        coalesce(neighbor.updated_at, neighbor.created_at) DESC
       LIMIT ${resolvedLimit}
       RETURN
         center { .* } as center,
@@ -880,8 +1433,8 @@ export async function graphNeighbors({
             ELSE {
               node: neighbor { .* },
               labels: labels(neighbor),
-              hop_count: length(p),
-              relationships: [rel in relationships(p) | {
+              hop_count: hop_count,
+              relationships: [rel in relationships(sample_path) | {
                 type: type(rel),
                 from: startNode(rel).canonical_id,
                 to: endNode(rel).canonical_id,
@@ -942,8 +1495,20 @@ export async function graphThoughtNeighbors({
       OPTIONAL MATCH p=(center)-[*1..${resolvedHops}]-(neighbor:Thought)
       WHERE neighbor.canonical_id <> center.canonical_id
         ${rolePredicate}
-      WITH center, p, neighbor
-      ORDER BY length(p) ASC, coalesce(neighbor.updated_at, neighbor.created_at) DESC
+      WITH center, neighbor, p
+      ORDER BY
+        CASE WHEN p IS NULL THEN 999 ELSE length(p) END ASC,
+        coalesce(neighbor.updated_at, neighbor.created_at) DESC
+      WITH center, neighbor, collect(p)[0] AS sample_path
+      WITH
+        center,
+        neighbor,
+        sample_path,
+        CASE
+          WHEN sample_path IS NULL THEN null
+          ELSE length(sample_path)
+        END AS hop_count
+      ORDER BY hop_count ASC, coalesce(neighbor.updated_at, neighbor.created_at) DESC
       LIMIT ${resolvedLimit}
       RETURN
         center { .* } as center,
@@ -954,8 +1519,8 @@ export async function graphThoughtNeighbors({
             ELSE {
               node: neighbor { .* },
               labels: labels(neighbor),
-              hop_count: length(p),
-              relationships: [rel in relationships(p) | {
+              hop_count: hop_count,
+              relationships: [rel in relationships(sample_path) | {
                 type: type(rel),
                 from: startNode(rel).canonical_id,
                 to: endNode(rel).canonical_id,
@@ -1068,6 +1633,7 @@ export function startGraphProjectorLoop() {
     try {
       await projectThoughts({
         database: config.graph.database,
+        schemaVariant: config.graph.schemaVariant,
         limit: config.graph.projectorBatchSize,
       });
     } catch (error) {

@@ -10,6 +10,7 @@ import {
 function parseArgs(argv) {
   const args = {
     database: config.graph.database,
+    schemaVariant: config.graph.schemaVariant,
     limit: config.graph.projectorBatchSize,
     forceAll: false,
     thoughtIds: [],
@@ -23,6 +24,8 @@ function parseArgs(argv) {
     const arg = argv[i];
     if (arg === "--database") {
       args.database = argv[++i];
+    } else if (arg === "--schema-variant") {
+      args.schemaVariant = argv[++i];
     } else if (arg === "--limit") {
       args.limit = Number(argv[++i]);
     } else if (arg === "--all") {
@@ -42,6 +45,7 @@ function parseArgs(argv) {
 
 Options:
   --database NAME          Graph database to project into
+  --schema-variant NAME    Projection schema variant (default: ${config.graph.schemaVariant})
   --limit N                Max thought rows to process
   --all                    Force reproject all eligible rows
   --thought-id UUID        Reproject one thought row (repeatable)

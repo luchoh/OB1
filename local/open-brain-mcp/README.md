@@ -142,9 +142,26 @@ Request body:
 {
   "question": "What units and how large is the apartment on Rayko Aleksiev?",
   "match_threshold": 0.4,
-  "match_count": 6
+  "match_count": 6,
+  "graph_assisted": true,
+  "graph_max_hops": 2,
+  "graph_neighbor_limit": 6
 }
 ```
+
+`graph_assisted=true` keeps PostgreSQL vector search as the seed retrieval step and then expands the evidence set with related `Thought` rows from Neo4j before grounded answer synthesis.
+
+## Graph A/B Eval
+
+To compare vector-only versus graph-assisted answering on a fixed question set:
+
+```bash
+node scripts/eval-open-brain-ask-ab.mjs \
+  --base-url http://localhost:8787 \
+  --output /tmp/ob1-ask-graph-ab.json
+```
+
+Default cases live in [ask-brain-graph-ab-cases.json](/Users/luchoh/Dev/OB1/local/open-brain-mcp/evals/ask-brain-graph-ab-cases.json).
 
 ## Notes
 

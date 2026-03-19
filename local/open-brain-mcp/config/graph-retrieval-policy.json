@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "default_max_hops": 2,
+  "default_added_rows": 6,
+  "per_seed_traversal_limit": 64,
+  "allowed_node_labels": [
+    "Thought"
+  ],
+  "allowed_retrieval_roles": [
+    "distilled"
+  ],
+  "ranking": {
+    "similarity_weight": 1000,
+    "seed_bonus": 40,
+    "vector_rank_penalty": 55,
+    "hop_penalty": 110,
+    "retrieval_role_penalties": {
+      "distilled": 0,
+      "source": 120,
+      "unknown": 180
+    },
+    "anchor_type_bonuses": {
+      "conversation": 70,
+      "email": 45,
+      "dictation": 40,
+      "attachment": 10,
+      "document": 0,
+      "unknown": 0
+    },
+    "same_title_bonus": 30,
+    "same_source_bonus": 10,
+    "same_type_bonus": 8,
+    "different_type_penalty": 25
+  }
+}

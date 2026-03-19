@@ -284,6 +284,7 @@ async function loadConfig() {
       password: envString("NEO4J_PASSWORD", undefined),
       database: envOptionalString("OPEN_BRAIN_GRAPH_DATABASE") ?? "ob1-graph",
       stagingDatabase: envOptionalString("OPEN_BRAIN_GRAPH_STAGING_DATABASE") ?? "ob1-graph-stage",
+      schemaVariant: envOptionalString("OPEN_BRAIN_GRAPH_SCHEMA_VARIANT") ?? "provenance-v1",
       projectorIntervalSeconds: envOptionalNumber("OPEN_BRAIN_GRAPH_PROJECTOR_INTERVAL_SECONDS", 60) ?? 60,
       projectorBatchSize: envOptionalNumber("OPEN_BRAIN_GRAPH_PROJECTOR_BATCH_SIZE", 100) ?? 100,
     };
@@ -296,6 +297,7 @@ async function loadConfig() {
       password: undefined,
       database: envOptionalString("OPEN_BRAIN_GRAPH_DATABASE") ?? "ob1-graph",
       stagingDatabase: envOptionalString("OPEN_BRAIN_GRAPH_STAGING_DATABASE") ?? "ob1-graph-stage",
+      schemaVariant: envOptionalString("OPEN_BRAIN_GRAPH_SCHEMA_VARIANT") ?? "provenance-v1",
       projectorIntervalSeconds: envOptionalNumber("OPEN_BRAIN_GRAPH_PROJECTOR_INTERVAL_SECONDS", 60) ?? 60,
       projectorBatchSize: envOptionalNumber("OPEN_BRAIN_GRAPH_PROJECTOR_BATCH_SIZE", 100) ?? 100,
     };

@@ -1,0 +1,64 @@
+[
+  {
+    "id": "chatgpt_psu_structure",
+    "seed_dedupe_key": "chatgpt:conversation_record:71faddaaf6d47fb5",
+    "projection_dedupe_keys": [
+      "chatgpt:conversation_record:71faddaaf6d47fb5",
+      "chatgpt:conversation_source:71faddaaf6d47fb5"
+    ],
+    "max_hops": 2,
+    "limit": 140,
+    "required_neighbor_labels": {
+      "Conversation": 1,
+      "Message": 4,
+      "Participant": 2
+    }
+  },
+  {
+    "id": "chatgpt_icebreaker_attachment_structure",
+    "seed_dedupe_key": "chatgpt:conversation_record:dbccb9701d7f43ff",
+    "projection_dedupe_keys": [
+      "chatgpt:conversation_record:dbccb9701d7f43ff",
+      "chatgpt:conversation_source:dbccb9701d7f43ff"
+    ],
+    "max_hops": 2,
+    "limit": 200,
+    "required_neighbor_labels": {
+      "Conversation": 1,
+      "Message": 4,
+      "Participant": 2,
+      "AttachmentRef": 1
+    }
+  },
+  {
+    "id": "claude_schema_attachment_structure",
+    "seed_dedupe_key": "claude:conversation_record:dadac685edaea35b",
+    "projection_dedupe_keys": [
+      "claude:conversation_record:dadac685edaea35b",
+      "claude:conversation_source:dadac685edaea35b"
+    ],
+    "max_hops": 2,
+    "limit": 120,
+    "required_neighbor_labels": {
+      "Conversation": 1,
+      "Message": 4,
+      "Participant": 2,
+      "AttachmentRef": 1
+    }
+  },
+  {
+    "id": "claude_auth_models_structure",
+    "seed_dedupe_key": "claude:conversation_record:4353e5ea670dbae5",
+    "projection_dedupe_keys": [
+      "claude:conversation_record:4353e5ea670dbae5",
+      "claude:conversation_source:4353e5ea670dbae5"
+    ],
+    "max_hops": 2,
+    "limit": 80,
+    "required_neighbor_labels": {
+      "Conversation": 1,
+      "Message": 4,
+      "Participant": 2
+    }
+  }
+]

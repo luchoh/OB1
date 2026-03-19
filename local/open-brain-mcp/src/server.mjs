@@ -17,6 +17,10 @@ import {
   healthcheckUpstreams,
   normalizeMetadata,
 } from "./models.mjs";
+import {
+  retrieveThoughts as retrieveThoughtRows,
+  retrieveEvidenceRows,
+} from "./retrieval.mjs";
 
 const captureThoughtSchema = {
   content: z.string().min(1).describe("The thought or note to store."),
@@ -47,6 +51,9 @@ const askBrainSchema = {
   match_threshold: z.number().min(0).max(1).optional().describe("Minimum similarity threshold for retrieval."),
   match_count: z.number().int().min(1).max(12).optional().describe("Maximum number of evidence items to consider."),
   filter: z.record(z.any()).optional().describe("Optional JSONB containment filter for retrieval."),
+  graph_assisted: z.boolean().optional().describe("Whether to expand the retrieved evidence set with related thought rows from the Neo4j graph."),
+  graph_max_hops: z.number().int().min(1).max(3).optional().describe("Maximum graph hop count when graph-assisted retrieval is enabled."),
+  graph_neighbor_limit: z.number().int().min(1).max(24).optional().describe("Maximum number of additional graph-related thought rows to add when graph-assisted retrieval is enabled."),
 };
 const askBrainInput = z.object(askBrainSchema);
 
@@ -207,6 +214,141 @@ async function retrieveThoughts({ queryText, threshold, count, filter }) {
   };
 }
 
+function thoughtIdFromCanonicalId(canonicalId) {
+  if (typeof canonicalId !== "string" || !canonicalId.startsWith("thought:")) {
+    return null;
+  }
+
+  const thoughtId = canonicalId.slice("thought:".length).trim();
+  return thoughtId || null;
+}
+
+function graphThoughtSortValue(row, metadata) {
+  const retrievalRole = row?.metadata?.retrieval_role ?? null;
+  return [
+    metadata?.hopCount ?? 99,
+    retrievalRole === "distilled" ? 0 : 1,
+    row?.created_at ? -Date.parse(row.created_at) : 0,
+  ];
+}
+
+function compareGraphThoughtRows(a, b, metadataById) {
+  const aSort = graphThoughtSortValue(a, metadataById.get(a.id));
+  const bSort = graphThoughtSortValue(b, metadataById.get(b.id));
+
+  for (let index = 0; index < aSort.length; index += 1) {
+    if (aSort[index] < bSort[index]) {
+      return -1;
+    }
+    if (aSort[index] > bSort[index]) {
+      return 1;
+    }
+  }
+
+  return a.id.localeCompare(b.id);
+}
+
+async function fetchThoughtRowsByIds({ ids, filter }) {
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return [];
+  }
+
+  const result = await query(
+    `
+      select
+        t.id,
+        t.content,
+        t.embedding_model,
+        t.embedding_dimension,
+        t.metadata,
+        null::float as similarity,
+        t.created_at,
+        t.updated_at
+      from thoughts t
+      where t.id = any($1::uuid[])
+        and ($2::jsonb = '{}'::jsonb or t.metadata @> $2::jsonb)
+    `,
+    [ids, JSON.stringify(filter ?? {})],
+  );
+
+  const byId = new Map(result.rows.map((row) => [row.id, row]));
+  return ids.map((id) => byId.get(id)).filter(Boolean);
+}
+
+async function expandThoughtsWithGraph({
+  seedRows,
+  filter,
+  maxHops = 2,
+  limit = 6,
+}) {
+  if (!config.graph.enabled) {
+    throw new Error("Graph-assisted retrieval requested but graph integration is disabled");
+  }
+
+  if (!Array.isArray(seedRows) || seedRows.length === 0 || limit <= 0) {
+    return {
+      rows: [],
+      expansion: {
+        enabled: true,
+        seed_count: Array.isArray(seedRows) ? seedRows.length : 0,
+        candidate_count: 0,
+        added_count: 0,
+        max_hops: maxHops,
+        limit,
+      },
+    };
+  }
+
+  const seedIds = new Set(seedRows.map((row) => row.id));
+  const candidateIds = [];
+  const metadataById = new Map();
+  const perSeedTraversalLimit = Math.min(Math.max(limit, 6), 24);
+
+  for (const row of seedRows) {
+    const neighborResult = await graphNeighbors({
+      thoughtId: row.id,
+      maxHops,
+      limit: perSeedTraversalLimit,
+    });
+
+    for (const neighbor of neighborResult.neighbors ?? []) {
+      if (!Array.isArray(neighbor.labels) || !neighbor.labels.includes("Thought")) {
+        continue;
+      }
+
+      const graphThoughtId = thoughtIdFromCanonicalId(neighbor.node?.canonical_id);
+      if (!graphThoughtId || seedIds.has(graphThoughtId) || metadataById.has(graphThoughtId)) {
+        continue;
+      }
+
+      metadataById.set(graphThoughtId, {
+        hopCount: neighbor.hop_count ?? 99,
+      });
+      candidateIds.push(graphThoughtId);
+    }
+  }
+
+  const fetchedRows = await fetchThoughtRowsByIds({
+    ids: candidateIds,
+    filter,
+  });
+
+  const sortedRows = [...fetchedRows].sort((a, b) => compareGraphThoughtRows(a, b, metadataById));
+  const limitedRows = sortedRows.slice(0, limit);
+
+  return {
+    rows: limitedRows,
+    expansion: {
+      enabled: true,
+      seed_count: seedRows.length,
+      candidate_count: candidateIds.length,
+      added_count: limitedRows.length,
+      max_hops: maxHops,
+      limit,
+    },
+  };
+}
+
 function mergeUniqueThoughtRows(...groups) {
   const seen = new Set();
   const merged = [];
@@ -326,7 +468,7 @@ async function handleSearchThoughts(args) {
   const threshold = args.match_threshold ?? 0.4;
   const matchCount = args.match_count ?? 10;
   const filter = args.filter ?? {};
-  const retrieval = await retrieveThoughts({
+  const retrieval = await retrieveThoughtRows({
     queryText: args.query,
     threshold,
     count: matchCount,
@@ -347,13 +489,16 @@ async function handleAskBrain(args) {
   const threshold = args.match_threshold ?? 0.4;
   const matchCount = args.match_count ?? 6;
   const filter = args.filter ?? {};
-  const retrieval = await retrieveThoughts({
+  const { retrieval, graphExpansion, evidenceRows } = await retrieveEvidenceRows({
     queryText: args.question,
     threshold,
     count: matchCount,
     filter,
+    graphAssisted: args.graph_assisted ?? false,
+    graphMaxHops: args.graph_max_hops ?? 2,
+    graphNeighborLimit: args.graph_neighbor_limit ?? matchCount,
   });
-  const evidence = retrieval.results.map(evidenceCitation);
+  const evidence = evidenceRows.map(evidenceCitation);
 
   if (evidence.length === 0) {
     return {
@@ -364,6 +509,8 @@ async function handleAskBrain(args) {
       insufficient_evidence: true,
       retrieval_strategy: retrieval.retrieval_strategy,
       fallback_used: retrieval.fallback_used,
+      graph_assisted: args.graph_assisted ?? false,
+      graph_expansion: graphExpansion,
       evidence_count: 0,
       citations: [],
     };
@@ -380,6 +527,8 @@ async function handleAskBrain(args) {
     insufficient_evidence: grounded.insufficient_evidence,
     retrieval_strategy: retrieval.retrieval_strategy,
     fallback_used: retrieval.fallback_used,
+    graph_assisted: args.graph_assisted ?? false,
+    graph_expansion: graphExpansion,
     evidence_count: evidence.length,
     citations,
   };

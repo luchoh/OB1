@@ -1,0 +1,235 @@
+[
+  {
+    "id": "psu_dac_cluster",
+    "question": "What PSU comparisons have I made for DACs?",
+    "match_count": 6,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "1f5b504e-e90d-4aa1-86da-46ccebc08214",
+      "6b7382f8-bb13-41b8-a3b5-2af0b01292aa",
+      "d3e6866c-1238-43f7-b5b6-0d15e5a48dac",
+      "50a0db55-368a-4e8c-810a-fc7375e6b46c"
+    ],
+    "expected_vector_ids": [
+      "50a0db55-368a-4e8c-810a-fc7375e6b46c",
+      "6b7382f8-bb13-41b8-a3b5-2af0b01292aa"
+    ],
+    "min_expected_vector_hits": 2,
+    "expected_graph_result_ids": [
+      "50a0db55-368a-4e8c-810a-fc7375e6b46c",
+      "6b7382f8-bb13-41b8-a3b5-2af0b01292aa",
+      "1f5b504e-e90d-4aa1-86da-46ccebc08214"
+    ],
+    "min_expected_graph_hits": 3,
+    "expected_graph_added_ids": [
+      "1f5b504e-e90d-4aa1-86da-46ccebc08214"
+    ],
+    "min_expected_graph_added_hits": 1,
+    "max_unexpected_graph_added": 1
+  },
+  {
+    "id": "replica_schema_graph_help",
+    "question": "How did I handle evolving CSV schemas in the replica index tracker?",
+    "match_count": 4,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "57761098-99b6-432e-a532-5c0c8dd2d6cf",
+      "c745f2bd-1bb5-444c-a40f-42a60162d0a0",
+      "d63a86e0-bace-4bc8-bbb5-f580c536b77e",
+      "674a5da1-47fa-413e-9e98-c0aa2826167a",
+      "5274e39c-aac3-41f0-bd36-d70b0e66ab5b",
+      "503b91ce-2a8d-46b8-81f4-29c83f6dc89a"
+    ],
+    "expected_vector_ids": [
+      "5274e39c-aac3-41f0-bd36-d70b0e66ab5b",
+      "d63a86e0-bace-4bc8-bbb5-f580c536b77e",
+      "674a5da1-47fa-413e-9e98-c0aa2826167a"
+    ],
+    "min_expected_vector_hits": 3,
+    "expected_graph_result_ids": [
+      "5274e39c-aac3-41f0-bd36-d70b0e66ab5b",
+      "d63a86e0-bace-4bc8-bbb5-f580c536b77e",
+      "674a5da1-47fa-413e-9e98-c0aa2826167a",
+      "c745f2bd-1bb5-444c-a40f-42a60162d0a0"
+    ],
+    "min_expected_graph_hits": 4,
+    "expected_graph_added_ids": [
+      "c745f2bd-1bb5-444c-a40f-42a60162d0a0"
+    ],
+    "min_expected_graph_added_hits": 1,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "rayko_property_control",
+    "question": "What units and how large is the apartment on Rayko Aleksiev?",
+    "match_count": 6,
+    "match_threshold": 0.4,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "73d7c127-6e8c-46d9-a8ab-2d0be851d61e",
+      "3c7a8c1d-a3df-4017-bc54-2251cc47419a",
+      "e00a0e26-e159-419f-8d49-dac5b4a77ccd",
+      "f83c479d-6d72-4639-98fc-6ac999178316",
+      "e1ecb846-6617-4918-8b84-46b7f88f2c46",
+      "4e46973f-83a7-4d26-bbc3-b7654a135c04",
+      "fc1f7156-01cd-40da-b931-e1dce945e445"
+    ],
+    "expected_vector_ids": [
+      "73d7c127-6e8c-46d9-a8ab-2d0be851d61e",
+      "e00a0e26-e159-419f-8d49-dac5b4a77ccd"
+    ],
+    "min_expected_vector_hits": 2,
+    "expected_graph_result_ids": [
+      "73d7c127-6e8c-46d9-a8ab-2d0be851d61e",
+      "e00a0e26-e159-419f-8d49-dac5b4a77ccd"
+    ],
+    "min_expected_graph_hits": 2,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "dac_voltage_control",
+    "question": "What rails does the CM4 power supply schematic generate for I2S DAC applications?",
+    "match_count": 6,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "eddc1b63-c472-459c-8324-2a68b4c95f44",
+      "28974b5f-49ec-4ee8-81c8-68f36fd9d8dc",
+      "6d9f76e6-0549-494d-918a-c2c255b262a2",
+      "b16caf13-87df-400f-a0ec-819ab3ed5672",
+      "389868f8-6570-4db9-a131-c657537f0216",
+      "0a233030-c40c-463f-8e8b-1adf252dfa2f"
+    ],
+    "expected_vector_ids": [
+      "eddc1b63-c472-459c-8324-2a68b4c95f44",
+      "28974b5f-49ec-4ee8-81c8-68f36fd9d8dc"
+    ],
+    "min_expected_vector_hits": 2,
+    "expected_graph_result_ids": [
+      "eddc1b63-c472-459c-8324-2a68b4c95f44",
+      "28974b5f-49ec-4ee8-81c8-68f36fd9d8dc"
+    ],
+    "min_expected_graph_hits": 2,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "db_schema_control",
+    "question": "How did I structure the schema for the replica index tracker?",
+    "match_count": 4,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "57761098-99b6-432e-a532-5c0c8dd2d6cf",
+      "c745f2bd-1bb5-444c-a40f-42a60162d0a0",
+      "d63a86e0-bace-4bc8-bbb5-f580c536b77e",
+      "674a5da1-47fa-413e-9e98-c0aa2826167a",
+      "5274e39c-aac3-41f0-bd36-d70b0e66ab5b",
+      "503b91ce-2a8d-46b8-81f4-29c83f6dc89a"
+    ],
+    "expected_vector_ids": [
+      "674a5da1-47fa-413e-9e98-c0aa2826167a",
+      "57761098-99b6-432e-a532-5c0c8dd2d6cf"
+    ],
+    "min_expected_vector_hits": 2,
+    "expected_graph_result_ids": [
+      "674a5da1-47fa-413e-9e98-c0aa2826167a",
+      "57761098-99b6-432e-a532-5c0c8dd2d6cf"
+    ],
+    "min_expected_graph_hits": 2,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "orm_align_control",
+    "question": "How did I safely align ORM models with the existing database schema?",
+    "match_count": 6,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "10d306a5-00f3-49c0-be03-37e464640320",
+      "97e980d4-056d-41dc-9502-bb8bc75170a9",
+      "f6e2b250-ba4f-4b33-83d3-cff46baac7b3",
+      "d24bc870-aea1-4188-a5b8-af48c7cc9e4f",
+      "947f39b1-1865-48f7-9ca8-654579eae8f3",
+      "6c0e295a-9742-4140-bf71-45194d8bea46"
+    ],
+    "expected_vector_ids": [
+      "10d306a5-00f3-49c0-be03-37e464640320",
+      "97e980d4-056d-41dc-9502-bb8bc75170a9",
+      "f6e2b250-ba4f-4b33-83d3-cff46baac7b3"
+    ],
+    "min_expected_vector_hits": 3,
+    "expected_graph_result_ids": [
+      "10d306a5-00f3-49c0-be03-37e464640320",
+      "97e980d4-056d-41dc-9502-bb8bc75170a9",
+      "f6e2b250-ba4f-4b33-83d3-cff46baac7b3"
+    ],
+    "min_expected_graph_hits": 3,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "audio_technica_control",
+    "question": "What did I work out about the Audio-Technica VM740ML bass issue on the Technics SL-50c?",
+    "match_count": 6,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "275c64c3-9add-4182-84a3-f293c6a68fc1",
+      "e9efeba8-860f-459a-b6df-c13765f4e720",
+      "d4eca42a-158e-4895-a22f-61900120e27a",
+      "7eb1848a-e3cd-44b1-bf9a-2f7e9aa79dcd",
+      "10e4bfc5-8f27-4cd4-ac17-195cd67adfec",
+      "b3eed86b-d2e4-4397-bfa1-1a6c34053fde"
+    ],
+    "expected_vector_ids": [
+      "e9efeba8-860f-459a-b6df-c13765f4e720",
+      "d4eca42a-158e-4895-a22f-61900120e27a",
+      "275c64c3-9add-4182-84a3-f293c6a68fc1"
+    ],
+    "min_expected_vector_hits": 3,
+    "expected_graph_result_ids": [
+      "e9efeba8-860f-459a-b6df-c13765f4e720",
+      "d4eca42a-158e-4895-a22f-61900120e27a",
+      "275c64c3-9add-4182-84a3-f293c6a68fc1"
+    ],
+    "min_expected_graph_hits": 3,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "qrng_buttons_control",
+    "question": "What did I decide about QRNG button mapping and LED feedback?",
+    "match_count": 6,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "b3679320-4ce4-4ea2-9795-67d305b70773",
+      "4b3c6191-7c0e-4e45-bd80-d4e5fdad4184",
+      "2617729e-3f91-45cb-9aa1-203cb0eeb6f3",
+      "ef7ae5f8-7a01-46f9-8b8c-7a88e6ce37f2",
+      "892ac697-9578-4c12-942a-f995536ccf54",
+      "12358bc6-dd5a-4a6c-a1fd-73db40d147bb"
+    ],
+    "expected_vector_ids": [
+      "4b3c6191-7c0e-4e45-bd80-d4e5fdad4184",
+      "b3679320-4ce4-4ea2-9795-67d305b70773",
+      "2617729e-3f91-45cb-9aa1-203cb0eeb6f3"
+    ],
+    "min_expected_vector_hits": 3,
+    "expected_graph_result_ids": [
+      "4b3c6191-7c0e-4e45-bd80-d4e5fdad4184",
+      "b3679320-4ce4-4ea2-9795-67d305b70773",
+      "2617729e-3f91-45cb-9aa1-203cb0eeb6f3"
+    ],
+    "min_expected_graph_hits": 3,
+    "max_unexpected_graph_added": 0
+  }
+]

@@ -1,0 +1,56 @@
+[
+  {
+    "id": "email_sender_abfa",
+    "question": "Who sent the sketches and schemes from ABFA Investments?",
+    "expect_graph_helpful": false,
+    "note": "Control: direct semantic retrieval should already answer this without graph expansion."
+  },
+  {
+    "id": "apartment_size_rayko",
+    "question": "What units and how large is the apartment on Rayko Aleksiev?",
+    "expect_graph_helpful": false,
+    "note": "Control: the apartment summary should already be retrievable without Neo4j expansion."
+  },
+  {
+    "id": "source_email_rayko",
+    "question": "Which email produced the apartment summary for Rayko Aleksiev 26?",
+    "expect_graph_helpful": true,
+    "note": "Graph expansion should help trace the summary back to the forwarding email."
+  },
+  {
+    "id": "attachments_rayko",
+    "question": "What attachments support the Rayko Aleksiev apartment facts?",
+    "expect_graph_helpful": true,
+    "note": "Graph expansion should surface attachment-linked thought rows."
+  },
+  {
+    "id": "garage_supporting_artifacts",
+    "question": "What source artifacts support the garage details from the forwarded email attachments?",
+    "expect_graph_helpful": true,
+    "note": "Graph expansion should help pull together the garage summary and its supporting source artifacts."
+  },
+  {
+    "id": "abfa_related_artifacts",
+    "question": "What else is directly connected to the ABFA Investments email?",
+    "expect_graph_helpful": true,
+    "note": "This is a provenance-neighborhood question and should benefit from graph expansion."
+  },
+  {
+    "id": "maria_buying",
+    "question": "What is Maria buying?",
+    "expect_graph_helpful": false,
+    "note": "Control: the answer should remain insufficient evidence even with graph expansion."
+  },
+  {
+    "id": "lightning_permissions",
+    "question": "Why did I reject Lightning AI permissions?",
+    "expect_graph_helpful": false,
+    "note": "Control: this should already be answerable from ChatGPT-derived memories without graph assistance."
+  },
+  {
+    "id": "fuji_gfx_telephoto",
+    "question": "What telephoto strategy am I considering for Fuji GFX?",
+    "expect_graph_helpful": false,
+    "note": "Control: graph expansion should not be required for this single-conversation memory."
+  }
+]
