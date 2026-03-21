@@ -133,7 +133,8 @@ function scoreCase(testCase, vectorRows, graphRows, graphExpansion) {
     notes.push(`graph expansion added ${addedHits}/${minAddedHits} expected new ids`);
   }
 
-  const allowedAddedIds = new Set([...expectedGraphIds, ...expectedAddedIds]);
+  const allowedRelatedAddedIds = testCase.allowed_related_graph_added_ids ?? [];
+  const allowedAddedIds = new Set([...expectedGraphIds, ...expectedAddedIds, ...allowedRelatedAddedIds]);
   const unexpectedAddedIds = graphAddedIds.filter((id) => !allowedAddedIds.has(id));
   if (typeof testCase.max_unexpected_graph_added === "number" && unexpectedAddedIds.length > testCase.max_unexpected_graph_added) {
     score -= Math.min(25, 10 * (unexpectedAddedIds.length - testCase.max_unexpected_graph_added));

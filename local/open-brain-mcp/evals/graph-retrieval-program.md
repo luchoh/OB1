@@ -41,6 +41,7 @@ Optimize for:
 - surfacing claim-linked rows from other conversations when the entity match is clearly relevant
 - rewarding anchors that cover more of the entity phrase in the question, not just any shared device name
 - preserving direct vector wins on control questions
+- allowing narrow answers to carry a small amount of adjacent troubleshooting context when it is part of the same real-world diagnostic chain
 - minimizing unexpected graph-added rows
 - stable, deterministic policy changes rather than ad hoc heuristics
 

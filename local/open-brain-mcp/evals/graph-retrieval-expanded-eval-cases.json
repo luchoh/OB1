@@ -201,6 +201,9 @@
       "275c64c3-9add-4182-84a3-f293c6a68fc1"
     ],
     "min_expected_graph_hits": 3,
+    "allowed_related_graph_added_ids": [
+      "951e8def-db60-4990-ad6f-e0654cfb3f97"
+    ],
     "max_unexpected_graph_added": 0
   },
   {
