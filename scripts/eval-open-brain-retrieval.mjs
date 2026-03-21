@@ -141,6 +141,17 @@ function scoreCase(testCase, vectorRows, graphRows, graphExpansion) {
     notes.push(`graph expansion added ${unexpectedAddedIds.length} unexpected ids`);
   }
 
+  const allowedRelatedGraphResultIds = testCase.allowed_related_graph_result_ids ?? [];
+  const allowedGraphResultIds = new Set([...expectedGraphIds, ...allowedRelatedGraphResultIds]);
+  const unexpectedGraphResultIds = graphIds.filter((id) => !allowedGraphResultIds.has(id));
+  if (
+    typeof testCase.max_unexpected_graph_results === "number"
+    && unexpectedGraphResultIds.length > testCase.max_unexpected_graph_results
+  ) {
+    score -= Math.min(30, 10 * (unexpectedGraphResultIds.length - testCase.max_unexpected_graph_results));
+    notes.push(`graph retrieval returned ${unexpectedGraphResultIds.length} unexpected ids`);
+  }
+
   if (graphAddedIds.length === 0 && expectedAddedIds.length > 0) {
     score -= 10;
     notes.push("graph expansion added no new rows");
@@ -160,6 +171,7 @@ function scoreCase(testCase, vectorRows, graphRows, graphExpansion) {
     graph_ids: graphIds,
     graph_added_ids: graphAddedIds,
     unexpected_graph_added_ids: unexpectedAddedIds,
+    unexpected_graph_result_ids: unexpectedGraphResultIds,
   };
 }
 

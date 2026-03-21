@@ -324,7 +324,37 @@ function seedContext(seedRows) {
     titles: new Set(seedRows.map((row) => normalizeKey(preferredRowTitle(row))).filter(Boolean)),
     sources: new Set(seedRows.map((row) => normalizeKey(row?.metadata?.source)).filter(Boolean)),
     types: new Set(seedRows.map((row) => normalizeKey(row?.metadata?.type)).filter(Boolean)),
+    bundleKeys: new Set(seedRows.map((row) => bundleKeyForRow(row)).filter(Boolean)),
   };
+}
+
+function bundleKeyForRow(row) {
+  const userMetadata = nestedUserMetadata(row);
+  const chatHash = normalizeKey(userMetadata.chatgpt_conversation_hash);
+  if (chatHash) {
+    return `chat:${chatHash}`;
+  }
+
+  const claudeHash = normalizeKey(userMetadata.claude_conversation_hash);
+  if (claudeHash) {
+    return `claude:${claudeHash}`;
+  }
+
+  const titleKey = normalizeKey(preferredRowTitle(row));
+  if (titleKey) {
+    return `title:${titleKey}`;
+  }
+
+  const sourceKey = normalizeKey(row?.metadata?.source);
+  const typeKey = normalizeKey(row?.metadata?.type);
+  if (sourceKey && typeKey) {
+    return `source:${typeKey}:${sourceKey}`;
+  }
+  if (sourceKey) {
+    return `source:${sourceKey}`;
+  }
+
+  return row?.id ? `id:${row.id}` : "";
 }
 
 function maxAnchorBonus(anchorTypes, policy) {
@@ -553,6 +583,93 @@ function compareScoredRows(a, b) {
   return a.row.id.localeCompare(b.row.id);
 }
 
+function buildBundleStats(scored, policy, seedBundleKeys) {
+  const bundleMap = new Map();
+
+  for (const item of scored) {
+    const bundleKey = bundleKeyForRow(item.row);
+    item.bundleKey = bundleKey;
+    if (!bundleKey) {
+      continue;
+    }
+
+    let stats = bundleMap.get(bundleKey);
+    if (!stats) {
+      stats = {
+        key: bundleKey,
+        itemCount: 0,
+        graphCount: 0,
+        seedCount: 0,
+        maxScore: Number.NEGATIVE_INFINITY,
+        scoreTotal: 0,
+      };
+      bundleMap.set(bundleKey, stats);
+    }
+
+    stats.itemCount += 1;
+    stats.scoreTotal += item.score;
+    if (item.origin === "graph") {
+      stats.graphCount += 1;
+    } else {
+      stats.seedCount += 1;
+    }
+    if (item.score > stats.maxScore) {
+      stats.maxScore = item.score;
+    }
+  }
+
+  const ranking = policy.ranking;
+  for (const stats of bundleMap.values()) {
+    let priority = stats.maxScore;
+    priority += Math.max(0, stats.itemCount - 1) * ranking.bundleCountBonus;
+    if (stats.graphCount > 0) {
+      priority += ranking.bundleGraphSupportBonus;
+    }
+    if (stats.seedCount > 0 && stats.graphCount > 0) {
+      priority += ranking.bundleSeedGraphBridgeBonus;
+    }
+    if (seedBundleKeys.has(stats.key)) {
+      priority += ranking.bundleSeedGraphBridgeBonus;
+    }
+    stats.priority = priority;
+  }
+
+  return bundleMap;
+}
+
+function choosePrimaryBundle(bundleMap, policy) {
+  const minItems = Math.max(2, Number(policy.ranking.primaryBundleMinItems) || 2);
+  let best = null;
+
+  for (const stats of bundleMap.values()) {
+    if (stats.itemCount < minItems) {
+      continue;
+    }
+    if (!best || stats.priority > best.priority) {
+      best = stats;
+    }
+  }
+
+  return best?.key ?? null;
+}
+
+function shouldPrefillPrimaryBundle({
+  primaryBundleStats,
+  count,
+  policy,
+  questionIntent,
+}) {
+  if (!primaryBundleStats) {
+    return false;
+  }
+  if (!questionIntent || questionIntent === "default") {
+    return false;
+  }
+
+  const minItems = Math.max(2, Number(policy.ranking.primaryBundleMinItems) || 2);
+  return primaryBundleStats.itemCount >= minItems && primaryBundleStats.itemCount <= count;
+}
+
 function anchorTypesForNeighbor(neighbor) {
   const anchorTypes = new Set();
   for (const relationship of neighbor?.relationships ?? []) {
@@ -618,11 +735,43 @@ function selectEvidenceRows({
     });
   });
 
+  const bundleMap = buildBundleStats(scored, policy, seeds.bundleKeys);
+  const primaryBundleKey = choosePrimaryBundle(bundleMap, policy);
+  const primaryBundleStats = primaryBundleKey ? bundleMap.get(primaryBundleKey) : null;
+  if (primaryBundleKey) {
+    for (const item of scored) {
+      if (item.bundleKey === primaryBundleKey) {
+        item.score += policy.ranking.primaryBundleRowBonus;
+      }
+    }
+  }
+
   scored.sort(compareScoredRows);
 
   const selected = [];
   const selectedGraphIds = [];
   const seen = new Set();
+
+  if (shouldPrefillPrimaryBundle({
+    primaryBundleStats,
+    count,
+    policy,
+    questionIntent,
+  })) {
+    for (const item of scored) {
+      if (item.bundleKey !== primaryBundleKey || !item.row?.id || seen.has(item.row.id)) {
+        continue;
+      }
+      seen.add(item.row.id);
+      selected.push(item.row);
+      if (graphRowIds.has(item.row.id)) {
+        selectedGraphIds.push(item.row.id);
+      }
+      if (selected.length >= count) {
+        break;
+      }
+    }
+  }
 
   for (const item of scored) {
     if (!item.row?.id || seen.has(item.row.id)) {

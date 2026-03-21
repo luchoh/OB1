@@ -1,0 +1,179 @@
+[
+  {
+    "id": "unifi_access_setup_graph_help",
+    "question": "What did I decide about the UniFi camera and access control setup?",
+    "match_count": 6,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "e70b37ba-0f64-48c4-9c68-9f18019d3ba7",
+      "032a1af1-e7dc-44ee-b588-3898b2c74b09",
+      "ea8d918f-a698-4d55-b609-0a65ecd01dc4",
+      "d998e8ce-0347-4b40-a0b1-42973cdba98b",
+      "52888dc3-8973-461c-9f57-c07763df0348"
+    ],
+    "expected_vector_ids": [
+      "e70b37ba-0f64-48c4-9c68-9f18019d3ba7",
+      "52888dc3-8973-461c-9f57-c07763df0348",
+      "032a1af1-e7dc-44ee-b588-3898b2c74b09"
+    ],
+    "min_expected_vector_hits": 3,
+    "expected_graph_result_ids": [
+      "e70b37ba-0f64-48c4-9c68-9f18019d3ba7",
+      "52888dc3-8973-461c-9f57-c07763df0348",
+      "032a1af1-e7dc-44ee-b588-3898b2c74b09",
+      "ea8d918f-a698-4d55-b609-0a65ecd01dc4"
+    ],
+    "min_expected_graph_hits": 4,
+    "expected_graph_added_ids": [
+      "ea8d918f-a698-4d55-b609-0a65ecd01dc4"
+    ],
+    "min_expected_graph_added_hits": 1,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "ev_lease_entity_graph_help",
+    "question": "What were my EV lease constraints, preferences, and unresolved questions?",
+    "match_count": 6,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "8c035ec2-6eb8-4ad4-abd8-e5f9638adce8",
+      "2a317b13-dfba-4662-98fc-2927deed8c7a",
+      "e197526a-9cde-411b-ad73-385df5eec883"
+    ],
+    "expected_vector_ids": [
+      "8c035ec2-6eb8-4ad4-abd8-e5f9638adce8",
+      "ef48c9a3-2a41-49e8-a20a-c1e9c4e73ef5",
+      "2ddb5c8c-0230-4890-ae9a-2ed4ef58490b"
+    ],
+    "min_expected_vector_hits": 2,
+    "expected_graph_result_ids": [
+      "8c035ec2-6eb8-4ad4-abd8-e5f9638adce8",
+      "2a317b13-dfba-4662-98fc-2927deed8c7a",
+      "e197526a-9cde-411b-ad73-385df5eec883"
+    ],
+    "min_expected_graph_hits": 3,
+    "expected_graph_added_ids": [
+      "2a317b13-dfba-4662-98fc-2927deed8c7a",
+      "e197526a-9cde-411b-ad73-385df5eec883"
+    ],
+    "min_expected_graph_added_hits": 2,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "leica_projector_graph_help",
+    "question": "What constraints and decision did I make when replacing the Leica Cine Play 1 projector?",
+    "match_count": 6,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "74332df1-f98b-465b-b33b-fa450f0ae763",
+      "4996fa9f-6673-43f0-b03a-6c3c192a65ce",
+      "bdc0e819-3fb7-44f9-bff0-4ece7499b6be"
+    ],
+    "expected_vector_ids": [
+      "bdc0e819-3fb7-44f9-bff0-4ece7499b6be",
+      "4996fa9f-6673-43f0-b03a-6c3c192a65ce",
+      "47092464-3d92-4978-8cfe-88ae8ef96554"
+    ],
+    "min_expected_vector_hits": 3,
+    "expected_graph_result_ids": [
+      "bdc0e819-3fb7-44f9-bff0-4ece7499b6be",
+      "4996fa9f-6673-43f0-b03a-6c3c192a65ce",
+      "47092464-3d92-4978-8cfe-88ae8ef96554",
+      "74332df1-f98b-465b-b33b-fa450f0ae763"
+    ],
+    "min_expected_graph_hits": 4,
+    "expected_graph_added_ids": [
+      "74332df1-f98b-465b-b33b-fa450f0ae763"
+    ],
+    "min_expected_graph_added_hits": 1,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "qdrant_aws_control",
+    "question": "What did I work out while deploying Qdrant on AWS?",
+    "match_count": 6,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "1f209c4f-1093-4287-a115-d203af4a0007",
+      "baf6a1cf-9b51-46ab-9262-a3722fe6e804",
+      "e0cb3805-b644-42e6-81b3-c076b3268358",
+      "9644b031-645b-49f2-a593-5bbf5de118d0",
+      "f46dabd1-09bf-45ba-b55e-4f26c8c439e7"
+    ],
+    "expected_vector_ids": [
+      "1f209c4f-1093-4287-a115-d203af4a0007",
+      "baf6a1cf-9b51-46ab-9262-a3722fe6e804",
+      "f46dabd1-09bf-45ba-b55e-4f26c8c439e7",
+      "e0cb3805-b644-42e6-81b3-c076b3268358"
+    ],
+    "min_expected_vector_hits": 4,
+    "expected_graph_result_ids": [
+      "1f209c4f-1093-4287-a115-d203af4a0007",
+      "baf6a1cf-9b51-46ab-9262-a3722fe6e804",
+      "f46dabd1-09bf-45ba-b55e-4f26c8c439e7",
+      "e0cb3805-b644-42e6-81b3-c076b3268358"
+    ],
+    "min_expected_graph_hits": 4,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "dietpi_usb_dac_control",
+    "question": "How did I configure DietPi to use the USB DAC instead of HDMI audio?",
+    "match_count": 6,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "4944c57f-7a6a-4ba2-8300-f25c582fcd05",
+      "0269992c-228d-4f89-89ed-4b98b693dedd",
+      "058cb713-b69d-4a72-b963-bdae62fb92c3"
+    ],
+    "expected_vector_ids": [
+      "4944c57f-7a6a-4ba2-8300-f25c582fcd05",
+      "0269992c-228d-4f89-89ed-4b98b693dedd",
+      "058cb713-b69d-4a72-b963-bdae62fb92c3"
+    ],
+    "min_expected_vector_hits": 3,
+    "expected_graph_result_ids": [
+      "4944c57f-7a6a-4ba2-8300-f25c582fcd05",
+      "0269992c-228d-4f89-89ed-4b98b693dedd",
+      "058cb713-b69d-4a72-b963-bdae62fb92c3"
+    ],
+    "min_expected_graph_hits": 3,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "dinner_choice_control",
+    "question": "What restaurant did I choose in Palo Alto, and what wine constraint mattered?",
+    "match_count": 6,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "ea599224-7385-4cd9-adcf-9c8c1d238a4c",
+      "43f3480e-a9ee-487d-967c-c038c986a703",
+      "95cb8e28-f7d6-4fa5-97ec-1c365610a0cb"
+    ],
+    "expected_vector_ids": [
+      "ea599224-7385-4cd9-adcf-9c8c1d238a4c",
+      "43f3480e-a9ee-487d-967c-c038c986a703",
+      "95cb8e28-f7d6-4fa5-97ec-1c365610a0cb"
+    ],
+    "min_expected_vector_hits": 3,
+    "expected_graph_result_ids": [
+      "ea599224-7385-4cd9-adcf-9c8c1d238a4c",
+      "43f3480e-a9ee-487d-967c-c038c986a703",
+      "95cb8e28-f7d6-4fa5-97ec-1c365610a0cb"
+    ],
+    "min_expected_graph_hits": 3,
+    "max_unexpected_graph_added": 0
+  }
+]

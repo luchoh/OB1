@@ -1,0 +1,112 @@
+[
+  {
+    "id": "psu_dac_precision",
+    "question": "What PSU decisions, temporary options, and transformer planning did I work out for my DAC-related audio builds?",
+    "match_count": 4,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "50a0db55-368a-4e8c-810a-fc7375e6b46c",
+      "6b7382f8-bb13-41b8-a3b5-2af0b01292aa",
+      "1f5b504e-e90d-4aa1-86da-46ccebc08214",
+      "d3e6866c-1238-43f7-b5b6-0d15e5a48dac"
+    ],
+    "expected_graph_result_ids": [
+      "50a0db55-368a-4e8c-810a-fc7375e6b46c",
+      "6b7382f8-bb13-41b8-a3b5-2af0b01292aa",
+      "1f5b504e-e90d-4aa1-86da-46ccebc08214",
+      "d3e6866c-1238-43f7-b5b6-0d15e5a48dac"
+    ],
+    "min_expected_graph_hits": 4,
+    "expected_graph_added_ids": [
+      "1f5b504e-e90d-4aa1-86da-46ccebc08214"
+    ],
+    "min_expected_graph_added_hits": 1,
+    "max_unexpected_graph_results": 0,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "unifi_access_setup_precision",
+    "question": "What were my concrete setup decisions and constraints for the UniFi camera and access control installation?",
+    "match_count": 4,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "e70b37ba-0f64-48c4-9c68-9f18019d3ba7",
+      "032a1af1-e7dc-44ee-b588-3898b2c74b09",
+      "ea8d918f-a698-4d55-b609-0a65ecd01dc4",
+      "d998e8ce-0347-4b40-a0b1-42973cdba98b"
+    ],
+    "expected_graph_result_ids": [
+      "e70b37ba-0f64-48c4-9c68-9f18019d3ba7",
+      "032a1af1-e7dc-44ee-b588-3898b2c74b09",
+      "ea8d918f-a698-4d55-b609-0a65ecd01dc4",
+      "d998e8ce-0347-4b40-a0b1-42973cdba98b"
+    ],
+    "min_expected_graph_hits": 4,
+    "expected_graph_added_ids": [
+      "ea8d918f-a698-4d55-b609-0a65ecd01dc4"
+    ],
+    "min_expected_graph_added_hits": 1,
+    "max_unexpected_graph_results": 0,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "ev_lease_precision",
+    "question": "What were my EV lease constraints, preferences, and unresolved questions?",
+    "match_count": 4,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "8c035ec2-6eb8-4ad4-abd8-e5f9638adce8",
+      "2a317b13-dfba-4662-98fc-2927deed8c7a",
+      "e197526a-9cde-411b-ad73-385df5eec883"
+    ],
+    "expected_graph_result_ids": [
+      "8c035ec2-6eb8-4ad4-abd8-e5f9638adce8",
+      "2a317b13-dfba-4662-98fc-2927deed8c7a",
+      "e197526a-9cde-411b-ad73-385df5eec883"
+    ],
+    "min_expected_graph_hits": 3,
+    "expected_graph_added_ids": [
+      "2a317b13-dfba-4662-98fc-2927deed8c7a",
+      "e197526a-9cde-411b-ad73-385df5eec883"
+    ],
+    "min_expected_graph_added_hits": 2,
+    "allowed_related_graph_result_ids": [
+      "8c035ec2-6eb8-4ad4-abd8-e5f9638adce8"
+    ],
+    "max_unexpected_graph_results": 1,
+    "max_unexpected_graph_added": 0
+  },
+  {
+    "id": "leica_projector_precision",
+    "question": "What were my projector replacement decision, mounting constraint, and unresolved fallback consideration for the Leica Cine Play 1 replacement?",
+    "match_count": 4,
+    "match_threshold": 0.35,
+    "graph_max_hops": 2,
+    "graph_neighbor_limit": 8,
+    "projection_ids": [
+      "bdc0e819-3fb7-44f9-bff0-4ece7499b6be",
+      "4996fa9f-6673-43f0-b03a-6c3c192a65ce",
+      "47092464-3d92-4978-8cfe-88ae8ef96554",
+      "74332df1-f98b-465b-b33b-fa450f0ae763"
+    ],
+    "expected_graph_result_ids": [
+      "bdc0e819-3fb7-44f9-bff0-4ece7499b6be",
+      "4996fa9f-6673-43f0-b03a-6c3c192a65ce",
+      "47092464-3d92-4978-8cfe-88ae8ef96554",
+      "74332df1-f98b-465b-b33b-fa450f0ae763"
+    ],
+    "min_expected_graph_hits": 4,
+    "expected_graph_added_ids": [
+      "74332df1-f98b-465b-b33b-fa450f0ae763"
+    ],
+    "min_expected_graph_added_hits": 1,
+    "max_unexpected_graph_results": 0,
+    "max_unexpected_graph_added": 0
+  }
+]

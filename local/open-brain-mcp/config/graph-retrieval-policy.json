@@ -40,6 +40,11 @@
       "Place": 15,
       "unknown": 0
     },
+    "bundle_count_bonus": 40,
+    "bundle_graph_support_bonus": 45,
+    "bundle_seed_graph_bridge_bonus": 60,
+    "primary_bundle_row_bonus": 120,
+    "primary_bundle_min_items": 2,
     "same_title_bonus": 30,
     "same_source_bonus": 10,
     "same_type_bonus": 8,

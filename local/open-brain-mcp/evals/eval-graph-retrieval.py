@@ -92,12 +92,13 @@ def evaluate_policy(policy_text, cases_path, verbose=False):
         report_path = Path(temp_dir) / "graph-retrieval-report.json"
         policy_path.write_text(policy_text)
 
-        env = os.environ.copy()
         load_env_file(REPO_ROOT / ".env")
         load_env_file(REPO_ROOT / ".env.open-brain-local")
+        env = os.environ.copy()
         env.setdefault("OPEN_BRAIN_GRAPH_ENABLED", "true")
-        env.setdefault("OPEN_BRAIN_GRAPH_DATABASE", "ob1-graph-stage")
-        env.setdefault("OPEN_BRAIN_GRAPH_STAGING_DATABASE", "ob1-graph-stage")
+        eval_database = env.get("OB1_GRAPH_RETRIEVAL_EVAL_DATABASE", "").strip() or env.get("OPEN_BRAIN_GRAPH_DATABASE", "ob1-graph-stage")
+        env["OPEN_BRAIN_GRAPH_DATABASE"] = eval_database
+        env["OPEN_BRAIN_GRAPH_STAGING_DATABASE"] = eval_database
         env.setdefault("NEO4J_URI", "bolt://localhost:7687")
         env.setdefault("OPEN_BRAIN_RUNTIME_ROLE", "graph-projector")
         embedding_root = discover_consul_service_root(env.get("OPEN_BRAIN_EMBEDDING_SERVICE_NAME", "ob1-embedding"))
@@ -111,10 +112,16 @@ def evaluate_policy(policy_text, cases_path, verbose=False):
             "--cases",
             str(cases_path),
             "--database",
-            env["OPEN_BRAIN_GRAPH_DATABASE"],
+            eval_database,
             "--output",
             str(report_path),
         ]
+        schema_variant = env.get("OB1_GRAPH_RETRIEVAL_EVAL_SCHEMA_VARIANT", "").strip()
+        if schema_variant:
+            command.extend(["--schema-variant", schema_variant])
+        include_chat_sources = env.get("OB1_GRAPH_RETRIEVAL_EVAL_INCLUDE_CHAT_SOURCES", "").strip().lower()
+        if include_chat_sources in {"1", "true", "yes", "on"}:
+            command.append("--include-chat-sources")
         if verbose:
             command.append("--verbose")
 
@@ -156,8 +163,18 @@ def main():
         default=str(REPO_ROOT / "local/open-brain-mcp/config/graph-retrieval-policy.json"),
     )
     parser.add_argument("--cases", default=str(CASE_FILE_PATH))
+    parser.add_argument("--database", help="Neo4j database override for evaluation")
+    parser.add_argument("--schema-variant", help="Graph schema variant override for evaluation")
+    parser.add_argument("--include-chat-sources", action="store_true")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+
+    if args.database:
+        os.environ["OB1_GRAPH_RETRIEVAL_EVAL_DATABASE"] = args.database
+    if args.schema_variant:
+        os.environ["OB1_GRAPH_RETRIEVAL_EVAL_SCHEMA_VARIANT"] = args.schema_variant
+    if args.include_chat_sources:
+        os.environ["OB1_GRAPH_RETRIEVAL_EVAL_INCLUDE_CHAT_SOURCES"] = "true"
 
     policy_text = Path(args.policy_file).read_text()
     summary = evaluate_prompt(
