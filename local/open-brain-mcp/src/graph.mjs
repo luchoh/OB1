@@ -6,9 +6,10 @@ import { query } from "./db.mjs";
 export const GRAPH_SCHEMA_VARIANTS = new Set([
   "provenance-v1",
   "source-first-chat-v1",
+  "source-first-chat-claims-v1",
 ]);
 
-const GRAPH_PROJECTION_REVISION = "graph-projection-v3";
+const GRAPH_PROJECTION_REVISION = "graph-projection-v4";
 
 const NODE_LABELS = new Set([
   "Thought",
@@ -20,6 +21,13 @@ const NODE_LABELS = new Set([
   "Message",
   "Participant",
   "AttachmentRef",
+  "Person",
+  "Organization",
+  "Project",
+  "Device",
+  "Place",
+  "Property",
+  "Concept",
 ]);
 
 const REL_TYPES = new Set([
@@ -33,6 +41,14 @@ const REL_TYPES = new Set([
   "AUTHORED_BY",
   "PRECEDES",
   "HAS_ATTACHMENT_REF",
+  "MENTIONS",
+  "ABOUT",
+  "USES",
+  "LOCATED_AT",
+  "OWNED_BY",
+  "SENT_BY",
+  "ASSOCIATED_WITH",
+  "RELATED_TO",
 ]);
 
 let driver;
@@ -270,6 +286,13 @@ export async function ensureGraphSchema(database = config.graph.database) {
     "CREATE CONSTRAINT ob1_message_canonical_id IF NOT EXISTS FOR (n:Message) REQUIRE n.canonical_id IS UNIQUE",
     "CREATE CONSTRAINT ob1_participant_canonical_id IF NOT EXISTS FOR (n:Participant) REQUIRE n.canonical_id IS UNIQUE",
     "CREATE CONSTRAINT ob1_attachment_ref_canonical_id IF NOT EXISTS FOR (n:AttachmentRef) REQUIRE n.canonical_id IS UNIQUE",
+    "CREATE CONSTRAINT ob1_person_canonical_id IF NOT EXISTS FOR (n:Person) REQUIRE n.canonical_id IS UNIQUE",
+    "CREATE CONSTRAINT ob1_organization_canonical_id IF NOT EXISTS FOR (n:Organization) REQUIRE n.canonical_id IS UNIQUE",
+    "CREATE CONSTRAINT ob1_project_canonical_id IF NOT EXISTS FOR (n:Project) REQUIRE n.canonical_id IS UNIQUE",
+    "CREATE CONSTRAINT ob1_device_canonical_id IF NOT EXISTS FOR (n:Device) REQUIRE n.canonical_id IS UNIQUE",
+    "CREATE CONSTRAINT ob1_place_canonical_id IF NOT EXISTS FOR (n:Place) REQUIRE n.canonical_id IS UNIQUE",
+    "CREATE CONSTRAINT ob1_property_canonical_id IF NOT EXISTS FOR (n:Property) REQUIRE n.canonical_id IS UNIQUE",
+    "CREATE CONSTRAINT ob1_concept_canonical_id IF NOT EXISTS FOR (n:Concept) REQUIRE n.canonical_id IS UNIQUE",
   ];
 
   for (const statement of constraintStatements) {
@@ -835,8 +858,17 @@ function attachmentRefCanonicalId(platform, conversationIdentifier, messageKey, 
   return `attachment_ref:${platform}:${conversationIdentifier}:${raw}`;
 }
 
+function schemaIncludesRawChatStructure(schemaVariant) {
+  const normalized = normalizeGraphSchemaVariant(schemaVariant);
+  return normalized === "source-first-chat-v1" || normalized === "source-first-chat-claims-v1";
+}
+
+function schemaIncludesClaimEntities(schemaVariant) {
+  return normalizeGraphSchemaVariant(schemaVariant) === "source-first-chat-claims-v1";
+}
+
 function rawChatConversationProjection(store, row, metadata, userMetadata, baseEdgeProps, schemaVariant) {
-  if (normalizeGraphSchemaVariant(schemaVariant) !== "source-first-chat-v1") {
+  if (!schemaIncludesRawChatStructure(schemaVariant)) {
     return;
   }
 
@@ -926,6 +958,281 @@ function rawChatConversationProjection(store, row, metadata, userMetadata, baseE
         updated_at: isoTimestamp(row.updated_at),
       });
       addEdge(store.edges, "Message", messageId, "HAS_ATTACHMENT_REF", "AttachmentRef", attachmentId, baseEdgeProps);
+    }
+  }
+}
+
+function normalizedEntityName(value) {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized || null;
+}
+
+function entityCanonicalId(label, name) {
+  const normalized = normalizedEntityName(name);
+  if (!normalized) {
+    return null;
+  }
+  return `${label.toLowerCase()}:${stableHash(`${label}:${normalized.toLowerCase()}`).slice(0, 20)}`;
+}
+
+function claimStrengthConfidence(strength) {
+  const normalized = typeof strength === "string" ? strength.trim().toLowerCase() : "";
+  if (normalized === "strong") {
+    return 0.95;
+  }
+  if (normalized === "weak") {
+    return 0.72;
+  }
+  return 0.85;
+}
+
+function ensureArray(value) {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (value === undefined || value === null || value === "") {
+    return [];
+  }
+  return [value];
+}
+
+function preferredEntityRelationship(claimKind, claimObject) {
+  if (!claimObject) {
+    return null;
+  }
+
+  const normalized = typeof claimKind === "string" ? claimKind.trim().toLowerCase() : "";
+  if (["decision", "preference", "implementation_detail", "plan"].includes(normalized)) {
+    return "USES";
+  }
+  if (["comparison", "option", "constraint", "diagnosis", "fact"].includes(normalized)) {
+    return "RELATED_TO";
+  }
+  return "RELATED_TO";
+}
+
+function scopeKeyEntityLabel(key) {
+  const normalized = typeof key === "string" ? key.trim().toLowerCase() : "";
+  if (!normalized) {
+    return null;
+  }
+
+  if (["project", "projects"].includes(normalized)) {
+    return "Project";
+  }
+
+  if ([
+    "device",
+    "devices",
+    "current_device",
+    "reference_device",
+    "target_device",
+    "device_type",
+    "motherboard",
+    "camera",
+    "amplifier",
+    "headphones",
+    "dac_options",
+  ].includes(normalized)) {
+    return "Device";
+  }
+
+  if ([
+    "location",
+    "locations",
+    "region",
+    "country",
+    "city",
+    "address",
+    "home_location",
+    "office_location",
+    "airport",
+    "location_preference",
+    "room",
+    "area",
+  ].includes(normalized)) {
+    return "Place";
+  }
+
+  if ([
+    "company",
+    "companies",
+    "provider",
+    "providers",
+    "vendor",
+    "brand",
+    "brands",
+    "agency",
+    "designer",
+  ].includes(normalized)) {
+    return "Organization";
+  }
+
+  if ([
+    "system",
+    "systems",
+    "platform",
+    "service",
+    "services",
+    "tool",
+    "tools",
+    "application",
+    "software",
+    "database",
+    "model",
+    "models",
+    "package",
+    "packages",
+    "library",
+    "libraries",
+    "framework",
+    "frameworks",
+    "component",
+    "components",
+    "module",
+    "modules",
+    "hardware",
+    "protocol",
+    "protocols",
+    "feature",
+    "features",
+    "product",
+    "products",
+    "service_name",
+    "source_system",
+    "platforms",
+    "ecosystem",
+    "api",
+    "endpoint",
+    "endpoints",
+    "api_endpoint",
+    "package_manager",
+    "package_managers",
+    "shell",
+    "language",
+    "languages",
+    "os",
+    "interface",
+    "network",
+    "networks",
+    "vlan",
+    "vlans",
+    "route",
+    "filesystem",
+    "format",
+    "file_format",
+    "file_type",
+    "file_types",
+    "query_type",
+    "method",
+    "methods",
+    "function",
+    "functions",
+    "workflow",
+    "architecture",
+  ].includes(normalized)) {
+    return "Concept";
+  }
+
+  return null;
+}
+
+function addEntityNode(store, label, canonicalId, properties) {
+  addNode(store, label, canonicalId, {
+    entity_type: label,
+    ...properties,
+  });
+}
+
+function addClaimEntityProjection(store, row, metadata, userMetadata, baseEdgeProps, schemaVariant) {
+  if (!schemaIncludesClaimEntities(schemaVariant)) {
+    return;
+  }
+
+  const thoughtId = canonicalThoughtId(row);
+  const claimKind = prefer(userMetadata.claim_kind);
+  const claimSubject = normalizedEntityName(userMetadata.claim_subject);
+  const claimObject = normalizedEntityName(userMetadata.claim_object);
+  const claimStrength = prefer(userMetadata.claim_strength);
+  const confidence = claimStrengthConfidence(claimStrength);
+  const evidenceText = truncateText(row.content, 280);
+  const claimScope = userMetadata.claim_scope;
+  const entityBaseProps = {
+    extraction_method: "claim_metadata",
+    confidence,
+    evidence_text: evidenceText,
+    created_at: isoTimestamp(row.created_at),
+    updated_at: isoTimestamp(row.updated_at),
+  };
+  const edgeBaseProps = {
+    ...baseEdgeProps,
+    extraction_method: "claim_metadata",
+    confidence,
+    evidence_text: evidenceText,
+    claim_kind: claimKind ?? null,
+  };
+
+  if (claimSubject) {
+    const canonicalId = entityCanonicalId("Concept", claimSubject);
+    addEntityNode(store.nodes, "Concept", canonicalId, {
+      canonical_id: canonicalId,
+      canonical_name: claimSubject,
+      normalized_name: claimSubject.toLowerCase(),
+      ...entityBaseProps,
+    });
+    addEdge(store.edges, "Thought", thoughtId, "ABOUT", "Concept", canonicalId, edgeBaseProps);
+  }
+
+  if (claimObject) {
+    const canonicalId = entityCanonicalId("Concept", claimObject);
+    addEntityNode(store.nodes, "Concept", canonicalId, {
+      canonical_id: canonicalId,
+      canonical_name: claimObject,
+      normalized_name: claimObject.toLowerCase(),
+      ...entityBaseProps,
+    });
+    const relationship = preferredEntityRelationship(claimKind, claimObject) ?? "RELATED_TO";
+    addEdge(store.edges, "Thought", thoughtId, relationship, "Concept", canonicalId, edgeBaseProps);
+  }
+
+  if (!claimScope || typeof claimScope !== "object" || Array.isArray(claimScope)) {
+    return;
+  }
+
+  for (const [scopeKey, rawValues] of Object.entries(claimScope)) {
+    const label = scopeKeyEntityLabel(scopeKey);
+    if (!label) {
+      continue;
+    }
+
+    for (const rawValue of ensureArray(rawValues)) {
+      const value = normalizedEntityName(typeof rawValue === "string" ? rawValue : String(rawValue ?? ""));
+      if (!value) {
+        continue;
+      }
+
+      const canonicalId = entityCanonicalId(label, value);
+      addEntityNode(store.nodes, label, canonicalId, {
+        canonical_id: canonicalId,
+        canonical_name: value,
+        normalized_name: value.toLowerCase(),
+        source_scope_key: scopeKey,
+        ...entityBaseProps,
+      });
+
+      const relationship = label === "Place"
+        ? "LOCATED_AT"
+        : label === "Concept"
+          ? "MENTIONS"
+          : "ASSOCIATED_WITH";
+
+      addEdge(store.edges, "Thought", thoughtId, relationship, label, canonicalId, {
+        ...edgeBaseProps,
+        source_scope_key: scopeKey,
+      });
     }
   }
 }
@@ -1171,6 +1478,7 @@ function buildProjectionPlan(row, schemaVariant = config.graph.schemaVariant) {
   conversationProjection(store, row, metadata, userMetadata, baseEdgeProps);
   artifactProjection(store, row, metadata, userMetadata, baseEdgeProps);
   rawChatConversationProjection(store, row, metadata, userMetadata, baseEdgeProps, schemaVariant);
+  addClaimEntityProjection(store, row, metadata, userMetadata, baseEdgeProps, schemaVariant);
 
   return {
     nodes: [...store.nodes.values()],
@@ -1420,11 +1728,18 @@ export async function graphNeighbors({
           WHEN 'Conversation' IN labels(neighbor) THEN 0
           WHEN 'Participant' IN labels(neighbor) THEN 1
           WHEN 'AttachmentRef' IN labels(neighbor) THEN 2
-          WHEN 'Thought' IN labels(neighbor) THEN 3
-          WHEN 'Email' IN labels(neighbor) THEN 4
-          WHEN 'Attachment' IN labels(neighbor) THEN 5
-          WHEN 'Document' IN labels(neighbor) THEN 6
-          WHEN 'DictationArtifact' IN labels(neighbor) THEN 7
+          WHEN 'Concept' IN labels(neighbor) THEN 3
+          WHEN 'Project' IN labels(neighbor) THEN 4
+          WHEN 'Device' IN labels(neighbor) THEN 5
+          WHEN 'Organization' IN labels(neighbor) THEN 6
+          WHEN 'Place' IN labels(neighbor) THEN 7
+          WHEN 'Property' IN labels(neighbor) THEN 8
+          WHEN 'Person' IN labels(neighbor) THEN 9
+          WHEN 'Thought' IN labels(neighbor) THEN 10
+          WHEN 'Email' IN labels(neighbor) THEN 11
+          WHEN 'Attachment' IN labels(neighbor) THEN 12
+          WHEN 'Document' IN labels(neighbor) THEN 13
+          WHEN 'DictationArtifact' IN labels(neighbor) THEN 14
           WHEN 'Message' IN labels(neighbor) THEN 99
           ELSE 50
         END AS label_rank

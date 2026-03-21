@@ -1,0 +1,53 @@
+[
+  {
+    "id": "dac_psu_claim_entities",
+    "seed_dedupe_key": "5233dec9d82367ee4761b435377659d8e35be9c65debf715d37375652eb540e7",
+    "projection_dedupe_keys": [
+      "5233dec9d82367ee4761b435377659d8e35be9c65debf715d37375652eb540e7"
+    ],
+    "max_hops": 1,
+    "limit": 20,
+    "required_neighbor_labels": {
+      "Concept": 2,
+      "Device": 2
+    }
+  },
+  {
+    "id": "restaurant_claim_entities",
+    "seed_dedupe_key": "619338914f231fddc44c2dff76640d8e5c0ffa352f37b613ff85f9b6ce597211",
+    "projection_dedupe_keys": [
+      "619338914f231fddc44c2dff76640d8e5c0ffa352f37b613ff85f9b6ce597211"
+    ],
+    "max_hops": 1,
+    "limit": 20,
+    "required_neighbor_labels": {
+      "Concept": 2,
+      "Place": 1
+    }
+  },
+  {
+    "id": "wiim_claim_entities",
+    "seed_dedupe_key": "490fdd14e61f2b99a722d69a96dee4dd2ef52d495dfe3f6a1e17168ecc02bc7b",
+    "projection_dedupe_keys": [
+      "490fdd14e61f2b99a722d69a96dee4dd2ef52d495dfe3f6a1e17168ecc02bc7b"
+    ],
+    "max_hops": 1,
+    "limit": 20,
+    "required_neighbor_labels": {
+      "Concept": 1,
+      "Device": 1
+    }
+  },
+  {
+    "id": "noir_transformer_claim_entities",
+    "seed_dedupe_key": "921362c57109df15dc9e72f71c3068450dd8555e69133aaa903c37fd13c217a6",
+    "projection_dedupe_keys": [
+      "921362c57109df15dc9e72f71c3068450dd8555e69133aaa903c37fd13c217a6"
+    ],
+    "max_hops": 1,
+    "limit": 20,
+    "required_neighbor_labels": {
+      "Concept": 2
+    }
+  }
+]

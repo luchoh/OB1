@@ -108,6 +108,14 @@ NEO4J_URI=bolt://localhost:7687 \
 ./scripts/project-open-brain-graph.sh --database ob1-graph-stage --all --verbose
 ```
 
+Supported schema variants:
+
+- `provenance-v1`
+- `source-first-chat-v1`
+- `source-first-chat-claims-v1`
+
+`source-first-chat-claims-v1` keeps the source-first chat structure and additionally projects conservative claim-derived entities from `claim_subject`, `claim_object`, and stable `claim_scope` fields into `Concept`, `Project`, `Device`, `Place`, and `Organization` nodes.
+
 The runtime also exposes:
 
 - `POST /graph/neighbors`
