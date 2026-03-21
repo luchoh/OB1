@@ -32,6 +32,72 @@ function normalizeQuestion(value) {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
 }
 
+const QUESTION_STOPWORDS = new Set([
+  "a",
+  "about",
+  "an",
+  "and",
+  "did",
+  "do",
+  "does",
+  "for",
+  "have",
+  "how",
+  "i",
+  "in",
+  "is",
+  "it",
+  "learn",
+  "made",
+  "my",
+  "of",
+  "on",
+  "out",
+  "the",
+  "to",
+  "what",
+  "which",
+  "with",
+  "work",
+  "worked",
+]);
+
+function questionTerms(questionText) {
+  const normalized = normalizeQuestion(questionText);
+  if (!normalized) {
+    return [];
+  }
+
+  return [...new Set(
+    normalized
+      .split(/[^a-z0-9.+-]+/i)
+      .map((value) => value.trim())
+      .filter((value) => value.length >= 4 || /\d/.test(value))
+      .filter((value) => !QUESTION_STOPWORDS.has(value)),
+  )];
+}
+
+function textTerms(value, minLength = 3) {
+  const normalized = normalizeKey(value);
+  if (!normalized) {
+    return [];
+  }
+
+  return [...new Set(
+    normalized
+      .split(/[^a-z0-9.+-]+/i)
+      .map((term) => term.trim())
+      .filter((term) => term.length >= minLength || /\d/.test(term)),
+  )];
+}
+
+function questionSignal(questionText) {
+  return {
+    normalized: normalizeQuestion(questionText),
+    terms: questionTerms(questionText),
+  };
+}
+
 export function detectQuestionIntent(questionText) {
   const normalized = normalizeQuestion(questionText);
   if (!normalized) {
@@ -356,7 +422,74 @@ function claimIntentBonus(row, questionIntent) {
   return bonus;
 }
 
-function graphCandidateScore(row, metadata, policy, seeds, questionIntent) {
+function anchorEntityLabelBonus(labels, policy) {
+  const bonuses = policy.ranking.entityAnchorLabelBonuses ?? {};
+  const fallback = bonuses.unknown ?? 0;
+  if (!Array.isArray(labels) || labels.length === 0) {
+    return fallback;
+  }
+
+  return labels.reduce((best, label) => {
+    const current = bonuses[label] ?? fallback;
+    return current > best ? current : best;
+  }, fallback);
+}
+
+function anchorEntityMatchBonus(metadata, signal, policy) {
+  const normalizedQuestion = signal?.normalized ?? "";
+  const terms = signal?.terms ?? [];
+  if (!normalizedQuestion || terms.length === 0) {
+    return 0;
+  }
+
+  const anchors = Array.isArray(metadata?.anchorEntities) ? metadata.anchorEntities : [];
+  if (anchors.length === 0) {
+    return 0;
+  }
+
+  const exactBonus = policy.ranking.entityAnchorExactBonus ?? 0;
+  const partialBonus = policy.ranking.entityAnchorPartialBonus ?? 0;
+  const exactBaseBonus = policy.ranking.entityAnchorExactBaseBonus ?? exactBonus;
+  const exactPerMatchedTermBonus = policy.ranking.entityAnchorExactPerMatchedTermBonus ?? 0;
+  const residualQuestionPenalty = policy.ranking.entityAnchorResidualQuestionPenalty ?? 0;
+  let best = 0;
+
+  for (const anchor of anchors) {
+    const normalizedName = normalizeKey(anchor?.normalizedName ?? anchor?.canonicalName);
+    if (!normalizedName || normalizedName.length < 4) {
+      continue;
+    }
+
+    const anchorTerms = textTerms(normalizedName);
+    const matchedTerms = anchorTerms.filter((term) => (
+      terms.includes(term)
+      || normalizedQuestion.includes(term)
+    ));
+    const matchedCount = matchedTerms.length;
+    const unmatchedQuestionCount = Math.max(0, terms.length - matchedCount);
+    let matchBonus = 0;
+    if (normalizedQuestion.includes(normalizedName)) {
+      matchBonus = exactBaseBonus
+        + (matchedCount * exactPerMatchedTermBonus)
+        - (unmatchedQuestionCount * residualQuestionPenalty);
+    } else if (terms.some((term) => normalizedName.includes(term) || term.includes(normalizedName))) {
+      matchBonus = partialBonus;
+    }
+
+    if (matchBonus <= 0) {
+      continue;
+    }
+
+    matchBonus += anchorEntityLabelBonus(anchor?.labels, policy);
+    if (matchBonus > best) {
+      best = matchBonus;
+    }
+  }
+
+  return best;
+}
+
+function graphCandidateScore(row, metadata, policy, seeds, questionIntent, signal) {
   const ranking = policy.ranking;
   const similarity = typeof row?.similarity === "number" ? row.similarity : 0;
   const role = row?.metadata?.retrieval_role ?? "unknown";
@@ -382,6 +515,7 @@ function graphCandidateScore(row, metadata, policy, seeds, questionIntent) {
   }
 
   score += claimIntentBonus(row, questionIntent);
+  score += anchorEntityMatchBonus(metadata, signal, policy);
 
   return score;
 }
@@ -432,6 +566,29 @@ function anchorTypesForNeighbor(neighbor) {
   return [...anchorTypes];
 }
 
+function anchorEntitiesForNeighbor(neighbor) {
+  if (!Array.isArray(neighbor?.anchors)) {
+    return [];
+  }
+
+  const seen = new Set();
+  const entities = [];
+  for (const anchor of neighbor.anchors) {
+    const canonicalId = typeof anchor?.canonical_id === "string" ? anchor.canonical_id : "";
+    if (!canonicalId || seen.has(canonicalId)) {
+      continue;
+    }
+    seen.add(canonicalId);
+    entities.push({
+      canonicalId,
+      canonicalName: typeof anchor?.canonical_name === "string" ? anchor.canonical_name : "",
+      normalizedName: typeof anchor?.normalized_name === "string" ? anchor.normalized_name : "",
+      labels: Array.isArray(anchor?.labels) ? anchor.labels.filter((value) => typeof value === "string") : [],
+    });
+  }
+  return entities;
+}
+
 function selectEvidenceRows({
   seedRows,
   graphRows,
@@ -440,6 +597,7 @@ function selectEvidenceRows({
   seeds,
   graphMetadataById,
   questionIntent,
+  signal,
 }) {
   const scored = [];
   const graphRowIds = new Set(graphRows.map((row) => row.id));
@@ -456,7 +614,7 @@ function selectEvidenceRows({
     scored.push({
       origin: "graph",
       row,
-      score: graphCandidateScore(row, graphMetadataById.get(row.id), policy, seeds, questionIntent),
+      score: graphCandidateScore(row, graphMetadataById.get(row.id), policy, seeds, questionIntent, signal),
     });
   });
 
@@ -541,6 +699,7 @@ export async function expandThoughtsWithGraph({
       metadataById.set(graphThoughtId, {
         hopCount: neighbor.hop_count ?? 99,
         anchorTypes: anchorTypesForNeighbor(neighbor),
+        anchorEntities: anchorEntitiesForNeighbor(neighbor),
       });
       candidateIds.push(graphThoughtId);
     }
@@ -580,6 +739,7 @@ export async function retrieveEvidenceRows({
   graphDatabase = config.graph.database,
 } = {}) {
   const questionIntent = detectQuestionIntent(queryText);
+  const signal = questionSignal(queryText);
   const retrieval = await retrieveThoughts({
     queryText,
     threshold,
@@ -624,6 +784,7 @@ export async function retrieveEvidenceRows({
     seeds,
     graphMetadataById: graphExpansion.metadataById,
     questionIntent,
+    signal,
   });
 
   return {
@@ -660,6 +821,7 @@ export async function expandContextRows({
   }
 
   const questionIntent = detectQuestionIntent(questionText);
+  const signal = questionSignal(questionText);
   const graphExpansion = await expandThoughtsWithGraph({
     seedRows,
     filter,
@@ -678,6 +840,7 @@ export async function expandContextRows({
     seeds,
     graphMetadataById: graphExpansion.metadataById,
     questionIntent,
+    signal,
   });
 
   const relatedRows = selected.evidenceRows

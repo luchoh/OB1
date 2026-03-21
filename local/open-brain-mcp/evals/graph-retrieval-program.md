@@ -9,7 +9,7 @@ Fixed evaluator:
 - `local/open-brain-mcp/evals/eval-graph-retrieval.py`
 
 Fixed case set:
-- `local/open-brain-mcp/evals/graph-retrieval-eval-cases.json`
+- `local/open-brain-mcp/evals/graph-retrieval-expanded-eval-cases.json`
 
 Scope:
 - Only change the retrieval policy JSON.
@@ -19,6 +19,7 @@ Goal:
 - maximize `mean_score`
 - maximize `accepted`
 - improve graph-added retrieval of related thought rows on the fixed helpful cases
+- improve entity-linked cross-conversation retrieval on the fixed claim-entity cases
 - preserve low-noise behavior on the fixed control cases
 
 Loop:
@@ -37,6 +38,8 @@ Do not optimize for:
 
 Optimize for:
 - surfacing sibling distilled thoughts from the same conversation or provenance cluster
+- surfacing claim-linked rows from other conversations when the entity match is clearly relevant
+- rewarding anchors that cover more of the entity phrase in the question, not just any shared device name
 - preserving direct vector wins on control questions
 - minimizing unexpected graph-added rows
 - stable, deterministic policy changes rather than ad hoc heuristics

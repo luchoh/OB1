@@ -27,6 +27,19 @@
       "document": 0,
       "unknown": 0
     },
+    "entity_anchor_exact_bonus": 160,
+    "entity_anchor_partial_bonus": 70,
+    "entity_anchor_exact_base_bonus": 90,
+    "entity_anchor_exact_per_matched_term_bonus": 55,
+    "entity_anchor_residual_question_penalty": 30,
+    "entity_anchor_label_bonuses": {
+      "Concept": 25,
+      "Device": 35,
+      "Project": 25,
+      "Organization": 20,
+      "Place": 15,
+      "unknown": 0
+    },
     "same_title_bonus": 30,
     "same_source_bonus": 10,
     "same_type_bonus": 8,

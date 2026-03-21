@@ -27,6 +27,19 @@ const defaultPolicy = Object.freeze({
       document: 0,
       unknown: 0,
     },
+    entityAnchorExactBonus: 160,
+    entityAnchorPartialBonus: 70,
+    entityAnchorExactBaseBonus: 90,
+    entityAnchorExactPerMatchedTermBonus: 55,
+    entityAnchorResidualQuestionPenalty: 30,
+    entityAnchorLabelBonuses: {
+      Concept: 25,
+      Device: 35,
+      Project: 25,
+      Organization: 20,
+      Place: 15,
+      unknown: 0,
+    },
     sameTitleBonus: 30,
     sameSourceBonus: 10,
     sameTypeBonus: 8,
@@ -85,6 +98,22 @@ function normalizeAnchorBonuses(values) {
   return normalized;
 }
 
+function normalizeEntityAnchorLabelBonuses(values) {
+  const fallback = defaultPolicy.ranking.entityAnchorLabelBonuses;
+  if (!values || typeof values !== "object" || Array.isArray(values)) {
+    return { ...fallback };
+  }
+
+  const normalized = { ...fallback };
+  for (const [key, value] of Object.entries(values)) {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      normalized[key] = value;
+    }
+  }
+
+  return normalized;
+}
+
 function normalizePolicy(raw) {
   const ranking = raw?.ranking ?? {};
 
@@ -102,6 +131,12 @@ function normalizePolicy(raw) {
       hopPenalty: Number(ranking.hop_penalty) || defaultPolicy.ranking.hopPenalty,
       retrievalRolePenalties: normalizeRoleWeights(ranking.retrieval_role_penalties),
       anchorTypeBonuses: normalizeAnchorBonuses(ranking.anchor_type_bonuses),
+      entityAnchorExactBonus: Number(ranking.entity_anchor_exact_bonus) || defaultPolicy.ranking.entityAnchorExactBonus,
+      entityAnchorPartialBonus: Number(ranking.entity_anchor_partial_bonus) || defaultPolicy.ranking.entityAnchorPartialBonus,
+      entityAnchorExactBaseBonus: Number(ranking.entity_anchor_exact_base_bonus) || defaultPolicy.ranking.entityAnchorExactBaseBonus,
+      entityAnchorExactPerMatchedTermBonus: Number(ranking.entity_anchor_exact_per_matched_term_bonus) || defaultPolicy.ranking.entityAnchorExactPerMatchedTermBonus,
+      entityAnchorResidualQuestionPenalty: Number(ranking.entity_anchor_residual_question_penalty) || defaultPolicy.ranking.entityAnchorResidualQuestionPenalty,
+      entityAnchorLabelBonuses: normalizeEntityAnchorLabelBonuses(ranking.entity_anchor_label_bonuses),
       sameTitleBonus: Number(ranking.same_title_bonus) || defaultPolicy.ranking.sameTitleBonus,
       sameSourceBonus: Number(ranking.same_source_bonus) || defaultPolicy.ranking.sameSourceBonus,
       sameTypeBonus: Number(ranking.same_type_bonus) || defaultPolicy.ranking.sameTypeBonus,

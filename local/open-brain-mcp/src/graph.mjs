@@ -1774,6 +1774,16 @@ export async function graphNeighbors({
               node: neighbor { .* },
               labels: labels(neighbor),
               hop_count: hop_count,
+              anchors: [pathNode in nodes(sample_path)
+                WHERE pathNode.canonical_id <> center.canonical_id
+                  AND pathNode.canonical_id <> neighbor.canonical_id
+                | {
+                  canonical_id: pathNode.canonical_id,
+                  labels: labels(pathNode),
+                  canonical_name: coalesce(pathNode.canonical_name, pathNode.title, null),
+                  normalized_name: coalesce(pathNode.normalized_name, toLower(coalesce(pathNode.canonical_name, pathNode.title, '')))
+                }
+              ],
               relationships: [rel in relationships(sample_path) | {
                 type: type(rel),
                 from: startNode(rel).canonical_id,
@@ -1860,6 +1870,16 @@ export async function graphThoughtNeighbors({
               node: neighbor { .* },
               labels: labels(neighbor),
               hop_count: hop_count,
+              anchors: [pathNode in nodes(sample_path)
+                WHERE pathNode.canonical_id <> center.canonical_id
+                  AND pathNode.canonical_id <> neighbor.canonical_id
+                | {
+                  canonical_id: pathNode.canonical_id,
+                  labels: labels(pathNode),
+                  canonical_name: coalesce(pathNode.canonical_name, pathNode.title, null),
+                  normalized_name: coalesce(pathNode.normalized_name, toLower(coalesce(pathNode.canonical_name, pathNode.title, '')))
+                }
+              ],
               relationships: [rel in relationships(sample_path) | {
                 type: type(rel),
                 from: startNode(rel).canonical_id,

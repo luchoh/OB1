@@ -258,10 +258,42 @@ def proposal_user_payload(current_prompt, summary, attempt_index):
     }
 
 
+def proposal_user_content(current_prompt, summary, attempt_index, artifact_kind):
+    payload = proposal_user_payload(current_prompt, summary, attempt_index)
+    if artifact_kind != "json":
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    weak_cases = summarize_weak_cases(summary["results"])
+    weak_lines = []
+    for case in weak_cases:
+        weak_lines.append(f"- {case['title']}: score={case['score']} decision={case['decision']}")
+        if case.get("question"):
+            weak_lines.append(f"  question: {case['question']}")
+        if case.get("notes"):
+            weak_lines.append(f"  notes: {'; '.join(case['notes'])}")
+
+    weak_text = "\n".join(weak_lines) if weak_lines else "- none"
+    return textwrap.dedent(
+        f"""
+        Attempt index: {attempt_index}
+        Current mean score: {summary["mean_score"]}
+        Current accepted: {summary["accepted"]}/{summary["case_count"]}
+
+        Weak cases:
+        {weak_text}
+
+        Current artifact JSON:
+        ```json
+        {current_prompt}
+        ```
+        """
+    ).strip()
+
+
 def propose_prompt_tool(current_prompt, summary, attempt_index, research_program, proposal_temperature):
     artifact_kind = detect_artifact_kind(current_prompt)
     artifact_instruction = (
-        "Put the full revised artifact as a JSON object in artifact_json."
+        "Put the full revised artifact as a JSON object in artifact_json. artifact_json must be a real JSON object, not a quoted string."
         if artifact_kind == "json"
         else "Put the full revised artifact text in artifact."
     )
@@ -276,7 +308,7 @@ def propose_prompt_tool(current_prompt, summary, attempt_index, research_program
         """
     ).strip()
 
-    user_payload = proposal_user_payload(current_prompt, summary, attempt_index)
+    user_content = proposal_user_content(current_prompt, summary, attempt_index, artifact_kind)
 
     response = requests.post(
         f"{local_llm_base_url()}/chat/completions",
@@ -292,7 +324,7 @@ def propose_prompt_tool(current_prompt, summary, attempt_index, research_program
             "tool_choice": build_named_tool_choice("submit_revision"),
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, indent=2)},
+                {"role": "user", "content": user_content},
             ],
         },
         timeout=300,
@@ -319,7 +351,7 @@ def propose_prompt_tool(current_prompt, summary, attempt_index, research_program
 def propose_prompt_json(current_prompt, summary, attempt_index, research_program, proposal_temperature):
     artifact_kind = detect_artifact_kind(current_prompt)
     artifact_instruction = (
-        "Return the revised artifact in artifact_json as a JSON object."
+        "Return the revised artifact in artifact_json as a JSON object. artifact_json must be a real JSON object, not a quoted string."
         if artifact_kind == "json"
         else "Return the revised artifact in artifact as a string."
     )
@@ -335,7 +367,7 @@ def propose_prompt_json(current_prompt, summary, attempt_index, research_program
         """
     ).strip()
 
-    user_payload = proposal_user_payload(current_prompt, summary, attempt_index)
+    user_content = proposal_user_content(current_prompt, summary, attempt_index, artifact_kind)
 
     response = requests.post(
         f"{local_llm_base_url()}/chat/completions",
@@ -349,7 +381,7 @@ def propose_prompt_json(current_prompt, summary, attempt_index, research_program
             },
             "messages": [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False, indent=2)},
+                {"role": "user", "content": user_content},
             ],
         },
         timeout=300,
