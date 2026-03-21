@@ -39,6 +39,10 @@ except ImportError:
     sys.exit(1)
 
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+
+
 def load_eval_module(path):
     spec = importlib.util.spec_from_file_location("prompt_eval_module", path)
     module = importlib.util.module_from_spec(spec)
@@ -464,6 +468,26 @@ def parse_args():
     return parser.parse_args()
 
 
+def build_report_payload(best_summary, history, best_prompt):
+    return {
+        "best_summary": best_summary,
+        "history": history,
+        "final_prompt": best_prompt,
+    }
+
+
+def maybe_write_report(report_path, best_summary, history, best_prompt):
+    if not report_path:
+        return
+    with open(report_path, "w") as handle:
+        json.dump(
+            build_report_payload(best_summary, history, best_prompt),
+            handle,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
 def main():
     args = parse_args()
     prompt_path = Path(args.prompt_file)
@@ -472,7 +496,7 @@ def main():
     research_program = load_research_program(program_path if program_path.exists() else None)
 
     best_prompt = prompt_path.read_text().strip()
-    print("baseline")
+    print("baseline", flush=True)
     best_summary = eval_module.evaluate_prompt(
         export_path=args.export_path,
         cases_path=args.cases,
@@ -489,14 +513,20 @@ def main():
             "summary": best_summary,
         }
     ]
+    maybe_write_report(args.report, best_summary, history, best_prompt)
 
     for round_index in range(1, args.rounds + 1):
-        print("=" * 60)
-        print(f"round {round_index}")
+        print("=" * 60, flush=True)
+        print(f"round {round_index}", flush=True)
         improved = False
 
         for candidate_index in range(1, args.candidates + 1):
             attempt_index = (round_index - 1) * args.candidates + candidate_index
+            print(
+                f"candidate {candidate_index}: proposing "
+                f"(attempt {attempt_index}, mode={args.submission_mode})",
+                flush=True,
+            )
             try:
                 proposal = propose_prompt(
                     best_prompt,
@@ -507,8 +537,8 @@ def main():
                     args.proposal_temperature,
                 )
             except Exception as exc:
-                print(f"candidate {candidate_index}: proposal failed")
-                print(f"  {exc}")
+                print(f"candidate {candidate_index}: proposal failed", flush=True)
+                print(f"  {exc}", flush=True)
                 history.append(
                     {
                         "round": round_index,
@@ -517,11 +547,12 @@ def main():
                         "error": str(exc),
                     }
                 )
+                maybe_write_report(args.report, best_summary, history, best_prompt)
                 continue
 
             candidate_prompt = proposal["prompt"]
             if candidate_prompt == best_prompt:
-                print(f"candidate {candidate_index}: identical, skipped")
+                print(f"candidate {candidate_index}: identical, skipped", flush=True)
                 history.append(
                     {
                         "round": round_index,
@@ -531,9 +562,11 @@ def main():
                         "why": proposal.get("why", []),
                     }
                 )
+                maybe_write_report(args.report, best_summary, history, best_prompt)
                 continue
 
-            print(f"candidate {candidate_index}: evaluating")
+            print(f"candidate {candidate_index}: proposal ready", flush=True)
+            print(f"candidate {candidate_index}: evaluating", flush=True)
             try:
                 candidate_summary = eval_module.evaluate_prompt(
                     export_path=args.export_path,
@@ -542,8 +575,8 @@ def main():
                     verbose=False,
                 )
             except Exception as exc:
-                print(f"candidate {candidate_index}: evaluation failed")
-                print(f"  {exc}")
+                print(f"candidate {candidate_index}: evaluation failed", flush=True)
+                print(f"  {exc}", flush=True)
                 history.append(
                     {
                         "round": round_index,
@@ -553,11 +586,13 @@ def main():
                         "why": proposal.get("why", []),
                     }
                 )
+                maybe_write_report(args.report, best_summary, history, best_prompt)
                 continue
 
             print(
                 f"  mean={candidate_summary['mean_score']} "
-                f"accepted={candidate_summary['accepted']}/{candidate_summary['case_count']}"
+                f"accepted={candidate_summary['accepted']}/{candidate_summary['case_count']}",
+                flush=True,
             )
             history.append(
                 {
@@ -570,38 +605,30 @@ def main():
                     "prompt": candidate_prompt,
                 }
             )
+            maybe_write_report(args.report, best_summary, history, best_prompt)
 
             if is_better(candidate_summary, best_summary):
                 best_prompt = candidate_prompt
                 best_summary = candidate_summary
                 prompt_path.write_text(best_prompt.rstrip() + "\n")
                 improved = True
-                print("  accepted")
+                print("  accepted", flush=True)
                 for note in proposal["why"][:4]:
-                    print(f"    - {note}")
+                    print(f"    - {note}", flush=True)
+                maybe_write_report(args.report, best_summary, history, best_prompt)
 
         if not improved:
-            print("plateau")
+            print("plateau", flush=True)
             break
 
-    print("=" * 60)
-    print(f"final mean_score: {best_summary['mean_score']}")
-    print(f"final accepted: {best_summary['accepted']}/{best_summary['case_count']}")
-    print(f"prompt file: {prompt_path}")
+    print("=" * 60, flush=True)
+    print(f"final mean_score: {best_summary['mean_score']}", flush=True)
+    print(f"final accepted: {best_summary['accepted']}/{best_summary['case_count']}", flush=True)
+    print(f"prompt file: {prompt_path}", flush=True)
 
     if args.report:
-        with open(args.report, "w") as handle:
-            json.dump(
-                {
-                    "best_summary": best_summary,
-                    "history": history,
-                    "final_prompt": best_prompt,
-                },
-                handle,
-                indent=2,
-                ensure_ascii=False,
-            )
-        print(f"report: {args.report}")
+        maybe_write_report(args.report, best_summary, history, best_prompt)
+        print(f"report: {args.report}", flush=True)
 
 
 if __name__ == "__main__":
