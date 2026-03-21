@@ -166,6 +166,19 @@ function thoughtIdFromCanonicalId(canonicalId) {
   return thoughtId || null;
 }
 
+function resolveThoughtIdInput({ thoughtId, canonicalId }) {
+  if (typeof thoughtId === "string" && thoughtId.trim()) {
+    return thoughtId.trim();
+  }
+
+  const resolvedFromCanonical = thoughtIdFromCanonicalId(canonicalId);
+  if (resolvedFromCanonical) {
+    return resolvedFromCanonical;
+  }
+
+  throw new Error("expand_context requires thought_id or a thought:<uuid> canonical_id");
+}
+
 function canonicalKind(canonicalId) {
   if (typeof canonicalId !== "string") {
     return "unknown";
@@ -622,5 +635,64 @@ export async function retrieveEvidenceRows({
       added_ids: selected.selectedGraphIds,
     },
     evidenceRows: selected.evidenceRows,
+  };
+}
+
+export async function expandContextRows({
+  thoughtId,
+  canonicalId,
+  questionText = "",
+  filter,
+  maxHops,
+  limit,
+  graphDatabase = config.graph.database,
+} = {}) {
+  const policy = loadGraphRetrievalPolicy();
+  const resolvedLimit = Math.max(1, Math.min(24, Number(limit) || policy.defaultAddedRows));
+  const resolvedThoughtId = resolveThoughtIdInput({ thoughtId, canonicalId });
+  const seedRows = await fetchThoughtRowsByIds({
+    ids: [resolvedThoughtId],
+    filter: {},
+  });
+
+  if (seedRows.length === 0) {
+    throw new Error(`Thought not found: ${resolvedThoughtId}`);
+  }
+
+  const questionIntent = detectQuestionIntent(questionText);
+  const graphExpansion = await expandThoughtsWithGraph({
+    seedRows,
+    filter,
+    embedding: null,
+    maxHops,
+    limit: resolvedLimit,
+    database: graphDatabase,
+  });
+
+  const seeds = seedContext(seedRows);
+  const selected = selectEvidenceRows({
+    seedRows,
+    graphRows: graphExpansion.rows,
+    count: seedRows.length + resolvedLimit,
+    policy,
+    seeds,
+    graphMetadataById: graphExpansion.metadataById,
+    questionIntent,
+  });
+
+  const relatedRows = selected.evidenceRows
+    .filter((row) => row.id !== resolvedThoughtId)
+    .slice(0, resolvedLimit);
+
+  return {
+    seedRow: seedRows[0],
+    questionIntent,
+    graphExpansion: {
+      ...graphExpansion.expansion,
+      added_count: relatedRows.length,
+      added_ids: relatedRows.map((row) => row.id),
+    },
+    relatedRows,
+    metadataById: graphExpansion.metadataById,
   };
 }

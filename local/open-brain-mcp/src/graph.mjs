@@ -1363,6 +1363,31 @@ function dedupeGraphItems(items) {
   return deduped;
 }
 
+async function fetchGraphNode(canonicalId, database = config.graph.database) {
+  const result = await runGraph(
+    `
+      OPTIONAL MATCH (node {canonical_id: $canonicalId})
+      RETURN
+        CASE
+          WHEN node IS NULL THEN null
+          ELSE node { .* }
+        END AS node,
+        CASE
+          WHEN node IS NULL THEN []
+          ELSE labels(node)
+        END AS labels
+    `,
+    { canonicalId },
+    { database, mode: "READ" },
+  );
+
+  const row = result.records[0] ? serializeRecord(result.records[0]) : null;
+  return {
+    node: row?.node ?? null,
+    labels: Array.isArray(row?.labels) ? row.labels : [],
+  };
+}
+
 export async function graphNeighbors({
   thoughtId,
   canonicalId,
@@ -1551,6 +1576,130 @@ export async function graphThoughtNeighbors({
     center: row.center,
     center_labels: row.center_labels,
     neighbors: dedupeGraphItems((row.neighbors ?? []).filter(Boolean)),
+  };
+}
+
+export async function whyConnected({
+  fromThoughtId,
+  fromCanonicalId,
+  toThoughtId,
+  toCanonicalId,
+  maxHops = 4,
+  limit = 3,
+  database = config.graph.database,
+} = {}) {
+  if (!graphEnabled()) {
+    throw new Error("Graph integration is disabled");
+  }
+
+  const resolvedHops = Math.max(1, Math.min(6, Number(maxHops) || 4));
+  const resolvedLimit = Math.max(1, Math.min(8, Number(limit) || 3));
+  const fromId = thoughtCanonicalIdFromInput({ thoughtId: fromThoughtId, canonicalId: fromCanonicalId });
+  const toId = thoughtCanonicalIdFromInput({ thoughtId: toThoughtId, canonicalId: toCanonicalId });
+
+  const [fromNode, toNode] = await Promise.all([
+    fetchGraphNode(fromId, database),
+    fetchGraphNode(toId, database),
+  ]);
+
+  if (!fromNode.node || !toNode.node) {
+    return {
+      success: true,
+      connected: false,
+      from: fromNode.node,
+      from_labels: fromNode.labels,
+      to: toNode.node,
+      to_labels: toNode.labels,
+      paths: [],
+    };
+  }
+
+  if (fromId === toId) {
+    return {
+      success: true,
+      connected: true,
+      from: fromNode.node,
+      from_labels: fromNode.labels,
+      to: toNode.node,
+      to_labels: toNode.labels,
+      paths: [
+        {
+          hop_count: 0,
+          nodes: [
+            {
+              canonical_id: fromNode.node.canonical_id,
+              labels: fromNode.labels,
+              properties: fromNode.node,
+            },
+          ],
+          relationships: [],
+        },
+      ],
+    };
+  }
+
+  const result = await runGraph(
+    `
+      MATCH (from {canonical_id: $fromCanonicalId})
+      MATCH (to {canonical_id: $toCanonicalId})
+      OPTIONAL MATCH p = allShortestPaths((from)-[*..${resolvedHops}]-(to))
+      WITH from, to, p
+      ORDER BY CASE WHEN p IS NULL THEN 999 ELSE length(p) END ASC
+      LIMIT ${resolvedLimit}
+      RETURN
+        from { .* } AS from_node,
+        labels(from) AS from_labels,
+        to { .* } AS to_node,
+        labels(to) AS to_labels,
+        collect(
+          CASE
+            WHEN p IS NULL THEN null
+            ELSE {
+              hop_count: length(p),
+              nodes: [node in nodes(p) | {
+                canonical_id: node.canonical_id,
+                labels: labels(node),
+                properties: properties(node)
+              }],
+              relationships: [rel in relationships(p) | {
+                type: type(rel),
+                from: startNode(rel).canonical_id,
+                to: endNode(rel).canonical_id,
+                properties: properties(rel)
+              }]
+            }
+          END
+        ) AS paths
+    `,
+    {
+      fromCanonicalId: fromId,
+      toCanonicalId: toId,
+    },
+    { database, mode: "READ" },
+  );
+
+  if (result.records.length === 0) {
+    return {
+      success: true,
+      connected: false,
+      from: fromNode.node,
+      from_labels: fromNode.labels,
+      to: toNode.node,
+      to_labels: toNode.labels,
+      paths: [],
+    };
+  }
+
+  const row = serializeRecord(result.records[0]);
+  const paths = (row.paths ?? []).filter(Boolean);
+  return {
+    success: true,
+    connected: paths.length > 0,
+    from: row.from_node,
+    from_labels: row.from_labels,
+    to: row.to_node,
+    to_labels: row.to_labels,
+    paths,
   };
 }
 

@@ -9,6 +9,7 @@ import {
   graphProjectionStats,
   healthcheckGraph,
   sourceLineage,
+  whyConnected,
 } from "./graph.mjs";
 import {
   answerFromEvidence,
@@ -18,6 +19,7 @@ import {
   normalizeMetadata,
 } from "./models.mjs";
 import {
+  expandContextRows,
   retrieveThoughts as retrieveThoughtRows,
   retrieveEvidenceRows,
 } from "./retrieval.mjs";
@@ -75,6 +77,24 @@ const sourceLineageSchema = {
   canonical_id: z.string().optional().describe("Optional graph canonical_id such as thought:<uuid>."),
   max_depth: z.number().int().min(1).max(6).optional().describe("Maximum source-lineage depth."),
   limit: z.number().int().min(1).max(50).optional().describe("Maximum lineage paths to return."),
+};
+
+const whyConnectedSchema = {
+  from_thought_id: z.string().uuid().optional().describe("Canonical OB1 thought UUID for the left-hand node."),
+  from_canonical_id: z.string().optional().describe("Optional graph canonical_id for the left-hand node."),
+  to_thought_id: z.string().uuid().optional().describe("Canonical OB1 thought UUID for the right-hand node."),
+  to_canonical_id: z.string().optional().describe("Optional graph canonical_id for the right-hand node."),
+  max_hops: z.number().int().min(1).max(6).optional().describe("Maximum path length to consider."),
+  limit: z.number().int().min(1).max(8).optional().describe("Maximum number of shortest paths to return."),
+};
+
+const expandContextSchema = {
+  thought_id: z.string().uuid().optional().describe("Canonical OB1 thought UUID used as the seed context row."),
+  canonical_id: z.string().optional().describe("Optional graph canonical_id such as thought:<uuid>."),
+  question: z.string().optional().describe("Optional natural-language question used to rank expanded context rows."),
+  filter: z.record(z.any()).optional().describe("Optional JSONB containment filter applied to expanded thought rows."),
+  max_hops: z.number().int().min(1).max(3).optional().describe("Maximum graph hop count."),
+  limit: z.number().int().min(1).max(24).optional().describe("Maximum number of expanded thought rows to return."),
 };
 
 function authKey(c) {
@@ -157,6 +177,16 @@ function evidenceCitation(row) {
     claim_strength: userMetadata.claim_strength ?? null,
     claim_rationale: userMetadata.claim_rationale ?? null,
     created_at: row.created_at ?? null,
+  };
+}
+
+function graphContextItem(row, graphMetadata) {
+  return {
+    ...evidenceCitation(row),
+    graph: {
+      hop_count: graphMetadata?.hopCount ?? null,
+      anchor_types: Array.isArray(graphMetadata?.anchorTypes) ? graphMetadata.anchorTypes : [],
+    },
   };
 }
 
@@ -688,6 +718,48 @@ async function handleSourceLineage(args) {
   });
 }
 
+async function handleWhyConnected(args) {
+  const hasFrom = Boolean(args.from_thought_id || args.from_canonical_id);
+  const hasTo = Boolean(args.to_thought_id || args.to_canonical_id);
+  if (!hasFrom || !hasTo) {
+    throw new Error("Both a from-node and a to-node are required");
+  }
+
+  return whyConnected({
+    fromThoughtId: args.from_thought_id,
+    fromCanonicalId: args.from_canonical_id,
+    toThoughtId: args.to_thought_id,
+    toCanonicalId: args.to_canonical_id,
+    maxHops: args.max_hops ?? 4,
+    limit: args.limit ?? 3,
+  });
+}
+
+async function handleExpandContext(args) {
+  if (!args.thought_id && !args.canonical_id) {
+    throw new Error("Either thought_id or canonical_id is required");
+  }
+
+  const result = await expandContextRows({
+    thoughtId: args.thought_id,
+    canonicalId: args.canonical_id,
+    questionText: args.question ?? "",
+    filter: args.filter ?? {},
+    maxHops: args.max_hops ?? 2,
+    limit: args.limit ?? 6,
+  });
+
+  return {
+    success: true,
+    seed: evidenceCitation(result.seedRow),
+    question: args.question ?? null,
+    question_intent: result.questionIntent,
+    graph_expansion: result.graphExpansion,
+    count: result.relatedRows.length,
+    results: result.relatedRows.map((row) => graphContextItem(row, result.metadataById.get(row.id))),
+  };
+}
+
 function buildMcpServer() {
   const server = new McpServer({
     name: config.serviceName,
@@ -779,6 +851,32 @@ function buildMcpServer() {
     async (args) => {
       try {
         return jsonToolResult(await handleSourceLineage(args));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "why_connected",
+    "Explain the shortest graph path between two thoughts or graph nodes.",
+    whyConnectedSchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleWhyConnected(args));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "expand_context",
+    "Expand graph-related thought context from a seed thought without invoking answer synthesis.",
+    expandContextSchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleExpandContext(args));
       } catch (error) {
         return errorToolResult(error);
       }
@@ -914,6 +1012,38 @@ app.post("/graph/source-lineage", async (c) => {
   try {
     const payload = await c.req.json();
     const result = await handleSourceLineage(payload);
+    return c.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ success: false, error: message }, 500);
+  }
+});
+
+app.post("/graph/why-connected", async (c) => {
+  const key = authKey(c);
+  if (!key || key !== config.accessKey) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const payload = await c.req.json();
+    const result = await handleWhyConnected(payload);
+    return c.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return c.json({ success: false, error: message }, 500);
+  }
+});
+
+app.post("/graph/expand-context", async (c) => {
+  const key = authKey(c);
+  if (!key || key !== config.accessKey) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const payload = await c.req.json();
+    const result = await handleExpandContext(payload);
     return c.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

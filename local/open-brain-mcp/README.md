@@ -16,6 +16,8 @@ This is the runnable local core service for the Open Brain Local design.
   - `ask_brain`
   - `graph_neighbors`
   - `source_lineage`
+  - `why_connected`
+  - `expand_context`
 
 ## Prerequisites
 
@@ -60,6 +62,10 @@ Default bind:
 - `http://localhost:8787/ingest/thought`
 - `http://localhost:8787/ask`
 - `http://localhost:8787/admin/thought/metadata`
+- `http://localhost:8787/graph/neighbors`
+- `http://localhost:8787/graph/source-lineage`
+- `http://localhost:8787/graph/why-connected`
+- `http://localhost:8787/graph/expand-context`
 
 If you need a one-shot non-`devenv` launch and the user explicitly asks for it, the wrapper is still:
 
@@ -106,6 +112,8 @@ The runtime also exposes:
 
 - `POST /graph/neighbors`
 - `POST /graph/source-lineage`
+- `POST /graph/why-connected`
+- `POST /graph/expand-context`
 
 ## Auth
 
@@ -204,6 +212,19 @@ node scripts/eval-open-brain-ask-ab.mjs \
 ```
 
 Default cases live in [ask-brain-graph-ab-cases.json](/Users/luchoh/Dev/OB1/local/open-brain-mcp/evals/ask-brain-graph-ab-cases.json).
+
+## Graph Read APIs
+
+The graph layer now exposes four read-only inspection surfaces:
+
+- `graph_neighbors`
+- `source_lineage`
+- `why_connected`
+- `expand_context`
+
+`why_connected` explains the shortest path between two thoughts or graph nodes.
+
+`expand_context` returns graph-related `Thought` rows from a seed thought using the same graph ranking policy used by graph-assisted retrieval, but without invoking answer synthesis.
 
 ## Notes
 
