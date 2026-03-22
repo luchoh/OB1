@@ -1,0 +1,19 @@
+{
+  "name": "Telegram Capture",
+  "description": "Telegram bot inbox for typed capture and voice/audio handoff into OB1 via dictation.",
+  "category": "integrations",
+  "author": {
+    "name": "OB1 Team"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": ["Telegram Bot API", "MinIO", "dictation", "mlx-server"],
+    "tools": ["Python 3.10+"]
+  },
+  "tags": ["telegram", "capture", "bot", "dictation", "minio"],
+  "difficulty": "intermediate",
+  "estimated_time": "30 minutes",
+  "created": "2026-03-21",
+  "updated": "2026-03-21"
+}

@@ -1,0 +1,90 @@
+# Dictation Import
+
+> Import canonical dictation artifacts from MinIO into OB1 as searchable source notes and distilled thoughts.
+
+## What It Does
+
+Consumes canonical markdown artifacts produced by the separate `dictation` service, then ingests them into the local OB1 runtime as:
+
+- `dictation_note` source rows
+- `dictation_thought` distilled rows
+
+The preferred source is the MinIO artifact bucket described in [docs/11-local-dictation-ingest-prd.md](/Users/luchoh/Dev/OB1/docs/11-local-dictation-ingest-prd.md#L1).
+
+## Prerequisites
+
+- Working Open Brain local runtime
+- Access key for `POST /ingest/thought`
+- MinIO access to the canonical dictation artifact bucket
+- Local `mlx-server` available for thought distillation
+
+## Install
+
+```bash
+cd /Users/luchoh/Dev/OB1/recipes/dictation-import
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Required Env
+
+```bash
+export MCP_ACCESS_KEY=...
+export MINIO_ENDPOINT=...
+export MINIO_ACCESS_KEY=...
+export MINIO_SECRET_KEY=...
+export DICTATION_MINIO_BUCKET=dictation-artifacts
+```
+
+Optional:
+
+```bash
+export OPEN_BRAIN_BASE_URL=http://localhost:8787
+export DICTATION_MINIO_PREFIX=canonical/
+export MINIO_SECURE=true
+```
+
+## One-Shot Import
+
+```bash
+python import-dictation.py \
+  --minio-endpoint "$MINIO_ENDPOINT" \
+  --bucket "$DICTATION_MINIO_BUCKET" \
+  --prefix "${DICTATION_MINIO_PREFIX:-canonical/}"
+```
+
+## Polling Mode
+
+```bash
+python import-dictation.py \
+  --minio-endpoint "$MINIO_ENDPOINT" \
+  --bucket "$DICTATION_MINIO_BUCKET" \
+  --prefix "${DICTATION_MINIO_PREFIX:-canonical/}" \
+  --poll \
+  --poll-interval 30
+```
+
+## Dry-Run On A Local Artifact
+
+```bash
+python import-dictation.py \
+  --artifact-file /path/to/sample-artifact.md \
+  --dry-run \
+  --verbose
+```
+
+## Expected Outcome
+
+For each imported artifact:
+
+- one `dictation_note` source row is stored in OB1
+- up to 3 `dictation_thought` rows are stored
+- artifact provenance is preserved in `metadata.user_metadata`
+- `dictation-sync-log.json` records the processed artifact identity
+
+## Notes
+
+- Source-row dedupe identity prefers `audio_sha256`, then `artifact_id`.
+- The importer trusts the canonical markdown artifact contents, not MinIO object metadata.
+- This importer does not require direct filesystem access to the dictation producer host.

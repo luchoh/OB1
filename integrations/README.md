@@ -8,6 +8,7 @@ MCP server extensions, webhook receivers, and capture sources beyond your AI too
 | ----------- | ------------ |
 | [Slack Capture](slack-capture/) | Type thoughts in a Slack channel, automatically embedded and stored |
 | [Discord Capture](discord-capture/) | Capture thoughts from a Discord server |
+| [Telegram Capture](telegram-capture/) | Use a Telegram bot as a private capture inbox for typed notes and dictation handoff |
 
 ## Contributing
 

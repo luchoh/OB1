@@ -11,6 +11,7 @@ Step-by-step builds that add a new capability to your Open Brain. Follow the ins
 | [Claude Conversation Import](claude-conversation-import/) | Ingest your Claude data export |
 | [Claim Typing](claim-typing/) | Evaluate and tune derived claim metadata for distilled chat memories |
 | [Document Import](document-import/) | Convert local documents with Docling and ingest searchable chunks into OB1 |
+| [Dictation Import](dictation-import/) | Import canonical dictation artifacts from MinIO into OB1 as source notes and distilled thoughts |
 | [Daily Digest](daily-digest/) | Automated summary of recent thoughts via email or Slack |
 
 Utilities:
