@@ -36,7 +36,7 @@ from recipes.shared_docling import (
 
 
 RECIPE_DIR = Path(__file__).resolve().parent
-SYNC_LOG_PATH = RECIPE_DIR / "dictation-sync-log.json"
+DEFAULT_SYNC_LOG_PATH = Path(os.environ.get("DICTATION_SYNC_LOG_FILE") or (RECIPE_DIR / "dictation-sync-log.json"))
 SYNC_SCHEMA_VERSION = 1
 
 DEFAULT_BASE_URL = (os.environ.get("OPEN_BRAIN_BASE_URL") or f"http://127.0.0.1:{os.environ.get('OPEN_BRAIN_PORT', '8787')}").rstrip("/")
@@ -121,9 +121,11 @@ def parse_args():
     parser.add_argument("--limit", type=int, default=0, help="Optional max artifact count.")
     parser.add_argument("--poll", action="store_true", help="Continuously poll MinIO for new artifacts.")
     parser.add_argument("--poll-interval", type=int, default=30, help="Polling interval in seconds.")
+    parser.add_argument("--sync-log-file", default=str(DEFAULT_SYNC_LOG_PATH), help="Path to importer sync state JSON.")
     parser.add_argument("--dry-run", action="store_true", help="Parse and report without ingesting.")
     parser.add_argument("--verbose", action="store_true", help="Print per-artifact progress.")
     args = parser.parse_args()
+    args.sync_log_file = Path(args.sync_log_file)
 
     if not args.dry_run and not args.access_key:
         parser.error("Missing access key. Set MCP_ACCESS_KEY or pass --access-key.")
@@ -137,9 +139,9 @@ def parse_args():
     return args
 
 
-def load_sync_log():
+def load_sync_log(path: Path):
     try:
-        with open(SYNC_LOG_PATH, "r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except (FileNotFoundError, json.JSONDecodeError):
         return {"schema_version": SYNC_SCHEMA_VERSION, "processed": {}}
@@ -151,8 +153,9 @@ def load_sync_log():
     return payload
 
 
-def save_sync_log(payload):
-    with open(SYNC_LOG_PATH, "w", encoding="utf-8") as handle:
+def save_sync_log(path: Path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
 
 
@@ -485,7 +488,7 @@ def run_once(args, log: dict):
 def poll_loop(args, log: dict):
     while True:
         stats = run_once(args, log)
-        save_sync_log(log)
+        save_sync_log(args.sync_log_file, log)
         if args.verbose:
             print(f"Poll cycle complete: processed={stats['processed']} skipped={stats['skipped']}")
         time.sleep(max(args.poll_interval, 1))
@@ -493,18 +496,18 @@ def poll_loop(args, log: dict):
 
 def main():
     args = parse_args()
-    log = load_sync_log()
+    log = load_sync_log(args.sync_log_file)
 
     if args.poll:
         try:
             poll_loop(args, log)
         except KeyboardInterrupt:
-            save_sync_log(log)
+            save_sync_log(args.sync_log_file, log)
             return 0
         return 0
 
     stats = run_once(args, log)
-    save_sync_log(log)
+    save_sync_log(args.sync_log_file, log)
     print(json.dumps(stats, indent=2))
     return 0
 

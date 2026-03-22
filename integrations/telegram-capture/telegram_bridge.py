@@ -36,7 +36,7 @@ from recipes.shared_docling import (
 
 
 INTEGRATION_DIR = Path(__file__).resolve().parent
-STATE_PATH = INTEGRATION_DIR / "telegram-bridge-state.json"
+DEFAULT_STATE_PATH = Path(os.environ.get("TELEGRAM_BRIDGE_STATE_FILE") or (INTEGRATION_DIR / "telegram-bridge-state.json"))
 
 DEFAULT_OPEN_BRAIN_BASE = (os.environ.get("OPEN_BRAIN_BASE_URL") or f"http://127.0.0.1:{os.environ.get('OPEN_BRAIN_PORT', '8787')}").rstrip("/")
 DEFAULT_OPEN_BRAIN_ACCESS_KEY = os.environ.get("MCP_ACCESS_KEY") or os.environ.get("OPEN_BRAIN_ACCESS_KEY") or ""
@@ -65,6 +65,12 @@ DEFAULT_DICTATION_BASE = (os.environ.get("DICTATION_BASE_URL") or "https://dicta
 DEFAULT_DICTATION_ACCESS_KEY = os.environ.get("DICTATION_ACCESS_KEY") or ""
 DEFAULT_DICTATION_SUBMIT_URL = (os.environ.get("DICTATION_OBJECT_SUBMIT_URL") or f"{DEFAULT_DICTATION_BASE}/v1/dictation/notes/from-object").rstrip("/")
 DEFAULT_DICTATION_CLEANUP_MODE = os.environ.get("DICTATION_CLEANUP_MODE") or "llm"
+DEFAULT_ENSURE_BUCKET = (os.environ.get("TELEGRAM_ENSURE_RAW_BUCKET") or "false").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 DEFAULT_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
     "1",
@@ -134,6 +140,13 @@ def parse_args():
     parser.add_argument("--dictation-submit-url", default=DEFAULT_DICTATION_SUBMIT_URL, help="Dictation object-submission endpoint.")
     parser.add_argument("--dictation-access-key", default=DEFAULT_DICTATION_ACCESS_KEY, help="Dictation access key.")
     parser.add_argument("--cleanup-mode", default=DEFAULT_DICTATION_CLEANUP_MODE, help="Cleanup mode forwarded to dictation.")
+    parser.add_argument("--state-file", default=str(DEFAULT_STATE_PATH), help="Path to persistent bridge state JSON.")
+    parser.add_argument(
+        "--ensure-bucket",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_ENSURE_BUCKET,
+        help="Create the raw MinIO bucket if it does not already exist.",
+    )
     parser.add_argument("--once", action="store_true", help="Fetch one batch of Telegram updates and exit.")
     parser.add_argument("--update-file", help="Process a saved Telegram update payload from disk and exit.")
     parser.add_argument("--max-updates", type=int, default=0, help="Optional max updates to process before exit.")
@@ -154,12 +167,13 @@ def parse_args():
     if not args.dry_run and not args.dictation_access_key:
         parser.error("Missing dictation access key. Set DICTATION_ACCESS_KEY or pass --dictation-access-key.")
 
+    args.state_file = Path(args.state_file)
     return args
 
 
-def load_state():
+def load_state(path: Path):
     try:
-        with open(STATE_PATH, "r", encoding="utf-8") as handle:
+        with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except (FileNotFoundError, json.JSONDecodeError):
         return {"offset": 0, "updated_at": None}
@@ -170,8 +184,9 @@ def load_state():
     return payload
 
 
-def save_state(payload):
-    with open(STATE_PATH, "w", encoding="utf-8") as handle:
+def save_state(path: Path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
 
 
@@ -446,7 +461,8 @@ def upload_audio_object(args, message: dict, descriptor: dict, file_bytes: bytes
     )
 
     client = minio_client(args)
-    ensure_bucket(client, args.raw_bucket)
+    if args.ensure_bucket:
+        ensure_bucket(client, args.raw_bucket)
     client.put_object(
         args.raw_bucket,
         object_key,
@@ -636,13 +652,13 @@ def run_once(args, state):
             state["offset"] = max(int(state.get("offset", 0)), int(update_id) + 1)
 
     state["updated_at"] = datetime.now(timezone.utc).isoformat()
-    save_state(state)
+    save_state(args.state_file, state)
     return {"handled": handled, "skipped": skipped, "offset": state.get("offset", 0)}
 
 
 def main():
     args = parse_args()
-    state = load_state()
+    state = load_state(args.state_file)
 
     if args.update_file or args.once:
         result = run_once(args, state)
