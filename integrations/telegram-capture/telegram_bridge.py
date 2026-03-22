@@ -15,6 +15,7 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import sys
 import time
 from datetime import datetime, timezone
@@ -71,6 +72,9 @@ DEFAULT_ENSURE_BUCKET = (os.environ.get("TELEGRAM_ENSURE_RAW_BUCKET") or "false"
     "yes",
     "on",
 )
+DEFAULT_REVIEW_MATCH_THRESHOLD = float(os.environ.get("TELEGRAM_REVIEW_MATCH_THRESHOLD", "0.78"))
+DEFAULT_REVIEW_MATCH_COUNT = int(os.environ.get("TELEGRAM_REVIEW_MATCH_COUNT", "3"))
+DEFAULT_PENDING_ACTION_TTL_SECONDS = int(os.environ.get("TELEGRAM_PENDING_ACTION_TTL_SECONDS", "86400"))
 
 DEFAULT_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
     "1",
@@ -93,6 +97,41 @@ THOUGHTS_TOOL = {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Up to 3 standalone thought strings.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Short explanation when nothing should be stored automatically.",
+                },
+            },
+        },
+    },
+}
+
+NOVELTY_REVIEW_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_review",
+        "description": "Review whether candidate thoughts are novel enough to store automatically.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["reviews"],
+            "properties": {
+                "reviews": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["thought", "decision", "reason"],
+                        "properties": {
+                            "thought": {"type": "string"},
+                            "decision": {
+                                "type": "string",
+                                "enum": ["record", "duplicate", "uncertain"],
+                            },
+                            "reason": {"type": "string"},
+                        },
+                    },
                 }
             },
         },
@@ -119,8 +158,27 @@ Each thought must:
 - be 1-3 sentences
 
 Return a JSON object with exactly one key: "thoughts".
-The value must be an array of 0-3 real thought strings.
-If the message has no durable value, return {"thoughts": []}.
+You may also include an optional "reason" string.
+The value of "thoughts" must be an array of 0-3 real thought strings.
+If the message has no durable value, return {"thoughts": [], "reason": "<short explanation>"}.
+"""
+
+TELEGRAM_NOVELTY_PROMPT = """\
+You are reviewing candidate Telegram memory thoughts before they are stored automatically.
+
+Decide whether each candidate thought should be recorded automatically.
+
+Use these decisions:
+- "record": materially new or meaningfully sharper than the existing nearby memories
+- "duplicate": already represented closely enough by existing memories
+- "uncertain": too ambiguous to auto-record safely
+
+Important:
+- Paraphrases can still be duplicates.
+- A thought is still "record" if it adds new scope, new constraint, new decision, or new factual detail.
+- Be conservative. If unsure, choose "uncertain".
+
+Return one review object per candidate thought.
 """
 
 
@@ -140,6 +198,9 @@ def parse_args():
     parser.add_argument("--dictation-submit-url", default=DEFAULT_DICTATION_SUBMIT_URL, help="Dictation object-submission endpoint.")
     parser.add_argument("--dictation-access-key", default=DEFAULT_DICTATION_ACCESS_KEY, help="Dictation access key.")
     parser.add_argument("--cleanup-mode", default=DEFAULT_DICTATION_CLEANUP_MODE, help="Cleanup mode forwarded to dictation.")
+    parser.add_argument("--review-match-threshold", type=float, default=DEFAULT_REVIEW_MATCH_THRESHOLD, help="Similarity threshold for Telegram novelty review.")
+    parser.add_argument("--review-match-count", type=int, default=DEFAULT_REVIEW_MATCH_COUNT, help="Max similar rows per candidate for Telegram novelty review.")
+    parser.add_argument("--pending-action-ttl-seconds", type=int, default=DEFAULT_PENDING_ACTION_TTL_SECONDS, help="How long review prompts remain actionable.")
     parser.add_argument("--state-file", default=str(DEFAULT_STATE_PATH), help="Path to persistent bridge state JSON.")
     parser.add_argument(
         "--ensure-bucket",
@@ -176,11 +237,13 @@ def load_state(path: Path):
         with path.open("r", encoding="utf-8") as handle:
             payload = json.load(handle)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"offset": 0, "updated_at": None}
+        return {"offset": 0, "updated_at": None, "pending_actions": {}}
     if not isinstance(payload, dict):
-        return {"offset": 0, "updated_at": None}
+        return {"offset": 0, "updated_at": None, "pending_actions": {}}
     payload.setdefault("offset", 0)
     payload.setdefault("updated_at", None)
+    if not isinstance(payload.get("pending_actions"), dict):
+        payload["pending_actions"] = {}
     return payload
 
 
@@ -188,6 +251,28 @@ def save_state(path: Path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def prune_pending_actions(state: dict, ttl_seconds: int):
+    pending = state.setdefault("pending_actions", {})
+    if ttl_seconds <= 0:
+        return
+    now = datetime.now(timezone.utc).timestamp()
+    expired_tokens = []
+    for token, entry in pending.items():
+        created_at = entry.get("created_at")
+        try:
+            created_ts = datetime.fromisoformat(created_at).timestamp() if created_at else 0
+        except ValueError:
+            created_ts = 0
+        if not created_ts or (now - created_ts) > ttl_seconds:
+            expired_tokens.append(token)
+    for token in expired_tokens:
+        pending.pop(token, None)
+
+
+def pending_action_token():
+    return secrets.token_hex(8)
 
 
 def minio_client(args):
@@ -229,7 +314,7 @@ def get_updates(token: str, offset: int, timeout_seconds: int):
     return telegram_api_call(
         token,
         "getUpdates",
-        {"offset": offset, "timeout": timeout_seconds, "allowed_updates": ["message"]},
+        {"offset": offset, "timeout": timeout_seconds, "allowed_updates": ["message", "callback_query"]},
         timeout=timeout_seconds + 20,
     )
 
@@ -255,6 +340,44 @@ def send_reply(token: str, chat_id: str, reply_to_message_id: int, text: str):
             "allow_sending_without_reply": True,
         },
     )
+
+
+def send_action_prompt(token: str, chat_id: str, reply_to_message_id: int, text: str, action_token: str):
+    return telegram_api_call(
+        token,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "reply_to_message_id": reply_to_message_id,
+            "text": text,
+            "allow_sending_without_reply": True,
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {"text": "Record", "callback_data": f"ob1:record:{action_token}"},
+                    {"text": "Ignore", "callback_data": f"ob1:ignore:{action_token}"},
+                ]]
+            },
+        },
+    )
+
+
+def edit_message(token: str, chat_id: str, message_id: int, text: str):
+    telegram_api_call(
+        token,
+        "editMessageText",
+        {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+        },
+    )
+
+
+def answer_callback_query(token: str, callback_query_id: str, text: str | None = None):
+    payload = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text
+    telegram_api_call(token, "answerCallbackQuery", payload)
 
 
 def normalize_text(text: str) -> str:
@@ -292,8 +415,9 @@ def summarize_text_message(text: str, title_hint: str | None, llm_model: str):
     payload = response.json()
     parsed = extract_tool_arguments(payload, "submit_thoughts")
     thoughts = parsed.get("thoughts", [])
+    reason = normalize_text(parsed.get("reason", "")) if isinstance(parsed, dict) else ""
     if not isinstance(thoughts, list):
-        return []
+        return {"thoughts": [], "reason": reason or "The model did not return usable thought candidates."}
 
     normalized = []
     seen = set()
@@ -310,7 +434,105 @@ def summarize_text_message(text: str, title_hint: str | None, llm_model: str):
         normalized.append(cleaned)
         if len(normalized) >= 3:
             break
-    return normalized
+    return {
+        "thoughts": normalized,
+        "reason": reason,
+    }
+
+
+def lookup_similar_thoughts(base_url: str, access_key: str, queries: list[str], *, match_threshold: float, match_count: int):
+    response = requests.post(
+        f"{base_url.rstrip('/')}/admin/thought/similar",
+        headers={
+            "Content-Type": "application/json",
+            "x-access-key": access_key,
+            "x-ingest-key": access_key,
+        },
+        json={
+            "queries": queries,
+            "match_threshold": match_threshold,
+            "match_count": match_count,
+        },
+        timeout=300,
+    )
+    body_text = response.text
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"{response.status_code} {response.reason}: {body_text}")
+    payload = response.json()
+    results = payload.get("results", [])
+    return {item.get("query"): item.get("matches", []) for item in results if isinstance(item, dict)}
+
+
+def review_thought_novelty(candidate_thoughts: list[str], similar_matches: dict[str, list[dict]], llm_model: str):
+    if not candidate_thoughts:
+        return []
+
+    lines = []
+    for index, thought in enumerate(candidate_thoughts, start=1):
+        lines.append(f"Candidate {index}: {thought}")
+        matches = similar_matches.get(thought, [])[:3]
+        if not matches:
+            lines.append("Nearby existing memories: (none)")
+        else:
+            lines.append("Nearby existing memories:")
+            for match_index, match in enumerate(matches, start=1):
+                lines.append(
+                    f"- {match_index}. similarity={match.get('similarity')} type={match.get('type')} "
+                    f"source={match.get('source')} summary={match.get('summary')}"
+                )
+        lines.append("")
+
+    response = http_post_with_retry(
+        f"{local_llm_base_url()}/chat/completions",
+        headers={"Content-Type": "application/json"},
+        json_body={
+            "model": llm_model,
+            "temperature": 0.1,
+            "max_tokens": 1200,
+            "chat_template_kwargs": {"enable_thinking": DEFAULT_ENABLE_THINKING},
+            "messages": [
+                {"role": "system", "content": TELEGRAM_NOVELTY_PROMPT},
+                {"role": "user", "content": "\n".join(lines).strip()},
+            ],
+            "tools": [NOVELTY_REVIEW_TOOL],
+            "tool_choice": {"type": "function", "function": {"name": "submit_review"}},
+        },
+        timeout=300,
+    )
+    if response is None:
+        raise RuntimeError("LLM novelty review returned no response")
+
+    payload = response.json()
+    parsed = extract_tool_arguments(payload, "submit_review")
+    reviews = parsed.get("reviews", [])
+    if not isinstance(reviews, list):
+        return []
+
+    by_thought = {}
+    for item in reviews:
+        if not isinstance(item, dict):
+            continue
+        thought = normalize_text(item.get("thought", ""))
+        decision = normalize_text(item.get("decision", "")).lower()
+        reason = normalize_text(item.get("reason", ""))
+        if thought not in candidate_thoughts:
+            continue
+        if decision not in {"record", "duplicate", "uncertain"}:
+            continue
+        by_thought[thought] = {
+            "thought": thought,
+            "decision": decision,
+            "reason": reason,
+        }
+
+    ordered = []
+    for thought in candidate_thoughts:
+        ordered.append(by_thought.get(thought, {
+            "thought": thought,
+            "decision": "uncertain",
+            "reason": "Novelty review did not return a usable decision.",
+        }))
+    return ordered
 
 
 def ingest_row(base_url: str, access_key: str, payload: dict):
@@ -410,6 +632,39 @@ def message_text(message: dict) -> str | None:
     if not cleaned or cleaned.startswith("/"):
         return None
     return cleaned
+
+
+def ingest_text_capture(args, source_payload: dict, thought_payloads: list[dict]):
+    ingest_row(args.base_url, args.access_key, source_payload)
+    for payload in thought_payloads:
+        ingest_row(args.base_url, args.access_key, payload)
+
+
+def register_pending_action(state: dict, args, message: dict, *, kind: str, prompt_text: str, source_payload: dict, thought_payloads: list[dict]):
+    token = pending_action_token()
+    prompt_result = None
+
+    if args.telegram_token and not args.dry_run:
+        prompt_result = send_action_prompt(
+            args.telegram_token,
+            str(message["chat"]["id"]),
+            message["message_id"],
+            prompt_text,
+            token,
+        )
+
+    pending_entry = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "kind": kind,
+        "chat_id": str(message["chat"]["id"]),
+        "message_id": message["message_id"],
+        "review_message_id": prompt_result.get("message_id") if isinstance(prompt_result, dict) else None,
+        "source_payload": source_payload,
+        "thought_payloads": thought_payloads,
+    }
+    state.setdefault("pending_actions", {})[token] = pending_entry
+    save_state(args.state_file, state)
+    return token
 
 
 def message_audio_descriptor(message: dict):
@@ -518,36 +773,128 @@ def submit_dictation_object(args, message: dict, descriptor: dict, object_key: s
         return {"raw_response": body_text}
 
 
-def process_text_message(args, message: dict):
+def process_text_message(args, state: dict, message: dict):
     text = message_text(message)
     if not text:
         return {"handled": False, "reason": "no_text"}
 
     source_payload = build_text_source_payload(message, text)
-    thoughts = summarize_text_message(text, truncate_text(text, 80), args.llm_model)
+    summary = summarize_text_message(text, truncate_text(text, 80), args.llm_model)
+    thoughts = summary.get("thoughts", [])
+    ignored_reason = summary.get("reason") or "It does not look like a durable memory worth storing automatically."
     thought_payloads = [
         build_text_thought_payload(message, thought, source_payload["dedupe_key"], index)
         for index, thought in enumerate(thoughts)
     ]
 
+    if not thoughts:
+        prompt_text = (
+            "I did not auto-record this.\n\n"
+            f"Reason: {ignored_reason}\n\n"
+            "Record the raw message anyway, or ignore it?"
+        )
+        token = register_pending_action(
+            state,
+            args,
+            message,
+            kind="no_durable_thought",
+            prompt_text=prompt_text,
+            source_payload=source_payload,
+            thought_payloads=[],
+        )
+        return {
+            "handled": True,
+            "path": "text",
+            "decision": "review_required",
+            "review_kind": "no_durable_thought",
+            "action_token": token,
+            "reason": ignored_reason,
+            "thought_count": 0,
+            "source_dedupe_key": source_payload["dedupe_key"],
+        }
+
+    similar_matches = {}
+    novelty_reviews = []
     if not args.dry_run:
-        ingest_row(args.base_url, args.access_key, source_payload)
-        for payload in thought_payloads:
-            ingest_row(args.base_url, args.access_key, payload)
+        similar_matches = lookup_similar_thoughts(
+            args.base_url,
+            args.access_key,
+            thoughts,
+            match_threshold=args.review_match_threshold,
+            match_count=args.review_match_count,
+        )
+        novelty_reviews = review_thought_novelty(thoughts, similar_matches, args.llm_model)
+    else:
+        novelty_reviews = [{"thought": thought, "decision": "record", "reason": "dry-run"} for thought in thoughts]
+
+    review_by_thought = {item["thought"]: item for item in novelty_reviews}
+    approved_payloads = []
+    duplicate_count = 0
+    uncertain_count = 0
+    for payload in thought_payloads:
+        decision = review_by_thought.get(payload["content"], {}).get("decision", "uncertain")
+        if decision == "record":
+            approved_payloads.append(payload)
+        elif decision == "duplicate":
+            duplicate_count += 1
+        else:
+            uncertain_count += 1
+
+    if not approved_payloads:
+        review_kind = "duplicate" if duplicate_count else "uncertain"
+        prompt_text = (
+            "This looks like it may already be recorded. Record it anyway or ignore it?"
+            if duplicate_count
+            else "I am not confident this should be recorded automatically. Record it anyway or ignore it?"
+        )
+        token = register_pending_action(
+            state,
+            args,
+            message,
+            kind=review_kind,
+            prompt_text=prompt_text,
+            source_payload=source_payload,
+            thought_payloads=thought_payloads,
+        )
+        return {
+            "handled": True,
+            "path": "text",
+            "decision": "review_required",
+            "review_kind": review_kind,
+            "action_token": token,
+            "thought_count": len(thought_payloads),
+            "source_dedupe_key": source_payload["dedupe_key"],
+            "duplicate_count": duplicate_count,
+            "uncertain_count": uncertain_count,
+        }
+
+    if not args.dry_run:
+        ingest_text_capture(args, source_payload, approved_payloads)
 
     if args.telegram_token and not args.dry_run:
+        status = f"Thought recorded. Stored 1 source row and {len(approved_payloads)} thought rows."
+        skipped = []
+        if duplicate_count:
+            skipped.append(f"{duplicate_count} duplicate")
+        if uncertain_count:
+            skipped.append(f"{uncertain_count} uncertain")
+        if skipped:
+            status += f" Skipped {', '.join(skipped)}."
         send_reply(
             args.telegram_token,
             str(message["chat"]["id"]),
             message["message_id"],
-            f"Captured text note. Stored 1 source row and {len(thought_payloads)} thought rows.",
+            status,
         )
 
     return {
         "handled": True,
         "path": "text",
-        "thought_count": len(thought_payloads),
+        "decision": "recorded",
+        "thought_count": len(approved_payloads),
         "source_dedupe_key": source_payload["dedupe_key"],
+        "duplicate_count": duplicate_count,
+        "uncertain_count": uncertain_count,
     }
 
 
@@ -596,7 +943,75 @@ def process_audio_message(args, message: dict):
     }
 
 
-def process_message(args, message: dict):
+def process_callback_query(args, state: dict, callback_query: dict):
+    callback_id = callback_query.get("id")
+    data = callback_query.get("data") or ""
+    from_user = callback_query.get("from") or {}
+    message = callback_query.get("message") or {}
+    chat = message.get("chat") or {}
+    chat_id = str(chat.get("id"))
+
+    if args.allowed_chat_ids and chat_id not in args.allowed_chat_ids:
+        if args.telegram_token and callback_id:
+            answer_callback_query(args.telegram_token, callback_id, "This chat is not allowed.")
+        return {"handled": False, "reason": "chat_not_allowed"}
+
+    match = re.fullmatch(r"ob1:(record|ignore):([0-9a-f]+)", data.strip())
+    if not match:
+        if args.telegram_token and callback_id:
+            answer_callback_query(args.telegram_token, callback_id, "Unknown action.")
+        return {"handled": False, "reason": "unknown_callback"}
+
+    action, token = match.groups()
+    pending = state.setdefault("pending_actions", {}).get(token)
+    if not pending:
+        if args.telegram_token and callback_id:
+            answer_callback_query(args.telegram_token, callback_id, "This review prompt expired.")
+        return {"handled": False, "reason": "missing_pending_action"}
+
+    if str(pending.get("chat_id")) != chat_id:
+        if args.telegram_token and callback_id:
+            answer_callback_query(args.telegram_token, callback_id, "This review prompt belongs to a different chat.")
+        return {"handled": False, "reason": "chat_mismatch"}
+
+    source_payload = pending.get("source_payload") or {}
+    thought_payloads = pending.get("thought_payloads") or []
+    review_message_id = pending.get("review_message_id")
+    kind = pending.get("kind") or "review"
+
+    if action == "record" and not args.dry_run:
+        ingest_text_capture(args, source_payload, thought_payloads)
+
+    if args.telegram_token and callback_id:
+        answer_callback_query(
+            args.telegram_token,
+            callback_id,
+            "Recorded." if action == "record" else "Ignored.",
+        )
+
+    if args.telegram_token and review_message_id and not args.dry_run:
+        final_text = (
+            f"Recorded by request. Stored 1 source row and {len(thought_payloads)} thought rows."
+            if action == "record"
+            else f"Ignored. Nothing was stored from this {kind.replace('_', ' ')} capture."
+        )
+        edit_message(args.telegram_token, chat_id, int(review_message_id), final_text)
+
+    state.setdefault("pending_actions", {}).pop(token, None)
+    save_state(args.state_file, state)
+
+    return {
+        "handled": True,
+        "path": "callback",
+        "decision": action,
+        "review_kind": kind,
+        "source_dedupe_key": source_payload.get("dedupe_key"),
+        "thought_count": len(thought_payloads),
+        "telegram_user_id": from_user.get("id"),
+    }
+
+
+def process_message(args, state: dict, message: dict):
     chat = message.get("chat") or {}
     chat_id = str(chat.get("id"))
     if chat.get("type") != "private":
@@ -605,7 +1020,7 @@ def process_message(args, message: dict):
         return {"handled": False, "reason": "chat_not_allowed"}
 
     if message_text(message):
-        return process_text_message(args, message)
+        return process_text_message(args, state, message)
     if message_audio_descriptor(message):
         return process_audio_message(args, message)
     if args.telegram_token and not args.dry_run:
@@ -627,6 +1042,7 @@ def iter_updates(args, state):
 
 
 def run_once(args, state):
+    prune_pending_actions(state, args.pending_action_ttl_seconds)
     handled = 0
     skipped = 0
     for update in iter_updates(args, state):
@@ -634,14 +1050,18 @@ def run_once(args, state):
             continue
         update_id = update.get("update_id")
         message = update.get("message")
-        if not isinstance(message, dict):
+        callback_query = update.get("callback_query")
+
+        if isinstance(message, dict):
+            message["_ob1_update_id"] = update_id
+            result = process_message(args, state, message)
+        elif isinstance(callback_query, dict):
+            result = process_callback_query(args, state, callback_query)
+        else:
             skipped += 1
             if update_id is not None:
                 state["offset"] = max(int(state.get("offset", 0)), int(update_id) + 1)
             continue
-
-        message["_ob1_update_id"] = update_id
-        result = process_message(args, message)
         if result.get("handled"):
             handled += 1
         else:

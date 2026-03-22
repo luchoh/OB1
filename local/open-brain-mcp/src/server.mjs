@@ -65,6 +65,14 @@ const updateThoughtMetadataSchema = {
 };
 const updateThoughtMetadataInput = z.object(updateThoughtMetadataSchema);
 
+const similarThoughtLookupSchema = {
+  queries: z.array(z.string().min(1)).min(1).max(10).describe("Candidate strings to compare against the existing brain."),
+  match_threshold: z.number().min(0).max(1).optional().describe("Minimum similarity threshold."),
+  match_count: z.number().int().min(1).max(10).optional().describe("Maximum number of similar matches per query."),
+  filter: z.record(z.any()).optional().describe("Optional JSONB containment filter."),
+};
+const similarThoughtLookupInput = z.object(similarThoughtLookupSchema);
+
 const graphNeighborsSchema = {
   thought_id: z.string().uuid().optional().describe("Canonical OB1 thought UUID."),
   canonical_id: z.string().optional().describe("Optional graph canonical_id such as thought:<uuid>."),
@@ -620,6 +628,36 @@ async function updateThoughtMetadata({ thoughtId, metadataPatch }) {
   };
 }
 
+async function handleSimilarThoughtLookup(args) {
+  const matchThreshold = args.match_threshold ?? 0.78;
+  const matchCount = args.match_count ?? 3;
+  const filter = args.filter ?? {};
+  const queries = [...new Set(args.queries.map((value) => value.trim()).filter(Boolean))];
+
+  const results = [];
+  for (const queryText of queries) {
+    const retrieval = await retrieveThoughts({
+      queryText,
+      threshold: matchThreshold,
+      count: matchCount,
+      filter,
+    });
+
+    results.push({
+      query: queryText,
+      retrieval_strategy: retrieval.retrieval_strategy,
+      fallback_used: retrieval.fallback_used,
+      matches: retrieval.results.map((row) => evidenceCitation(row)),
+    });
+  }
+
+  return {
+    success: true,
+    count: results.length,
+    results,
+  };
+}
+
 async function handleListThoughts(args) {
   const result = await query(
     "select * from list_recent_thoughts($1, $2::jsonb)",
@@ -979,6 +1017,23 @@ app.post("/admin/thought/metadata", async (c) => {
       thoughtId: payload.thought_id,
       metadataPatch: payload.metadata_patch,
     });
+    return c.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const status = error instanceof z.ZodError ? 400 : 500;
+    return c.json({ success: false, error: message }, status);
+  }
+});
+
+app.post("/admin/thought/similar", async (c) => {
+  const key = authKey(c);
+  if (!key || key !== config.accessKey) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  try {
+    const payload = similarThoughtLookupInput.parse(await c.req.json());
+    const result = await handleSimilarThoughtLookup(payload);
     return c.json(result);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);

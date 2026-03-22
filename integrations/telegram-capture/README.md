@@ -8,6 +8,8 @@ Adds a dedicated Telegram bot inbox to OB1.
 
 - typed messages are ingested directly into OB1 as `telegram_message` source rows plus `telegram_thought` distilled rows
 - voice notes and audio clips are uploaded to MinIO and handed off to the separate dictation service for transcription
+- trivial text like `Hi` is not auto-recorded
+- text that looks duplicate or ambiguous is held for `Record / Ignore` review in Telegram before OB1 ingest
 
 This integration is bot-based and direct-chat-only in v1.
 
@@ -68,8 +70,16 @@ python telegram_bridge.py --verbose
 
 Typed message:
 
-- one `telegram_message` source row
-- up to 3 `telegram_thought` rows
+- if meaningful and novel:
+  - one `telegram_message` source row
+  - up to 3 `telegram_thought` rows
+- if trivial:
+  - nothing is stored automatically
+  - Telegram explains why it was not auto-recorded
+  - Telegram offers `Record / Ignore` so the user can override without resending
+- if duplicate or uncertain:
+  - nothing is stored yet
+  - Telegram sends a `Record / Ignore` review prompt
 
 Voice or audio message:
 
