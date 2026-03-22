@@ -33,6 +33,12 @@ from recipes.shared_docling import (
     sha256_text,
     truncate_text,
 )
+from recipes.shared_telegram_review_state import (
+    default_review_state_path,
+    locked_review_state,
+    pending_action_token,
+    prune_pending_actions,
+)
 
 
 RECIPE_DIR = Path(__file__).resolve().parent
@@ -59,6 +65,11 @@ DEFAULT_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").str
     "yes",
     "on",
 )
+DEFAULT_TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
+DEFAULT_TELEGRAM_REVIEW_MATCH_THRESHOLD = float(os.environ.get("TELEGRAM_REVIEW_MATCH_THRESHOLD", "0.78"))
+DEFAULT_TELEGRAM_REVIEW_MATCH_COUNT = int(os.environ.get("TELEGRAM_REVIEW_MATCH_COUNT", "3"))
+DEFAULT_TELEGRAM_PENDING_ACTION_TTL_SECONDS = int(os.environ.get("TELEGRAM_PENDING_ACTION_TTL_SECONDS", "86400"))
+DEFAULT_TELEGRAM_REVIEW_STATE_PATH = default_review_state_path(RECIPE_DIR / "telegram-review-state.json")
 
 THOUGHTS_TOOL = {
     "type": "function",
@@ -74,6 +85,41 @@ THOUGHTS_TOOL = {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Up to 3 standalone dictation thoughts.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Short explanation when nothing should be stored automatically.",
+                },
+            },
+        },
+    },
+}
+
+NOVELTY_REVIEW_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "submit_review",
+        "description": "Review whether candidate thoughts are novel enough to store automatically.",
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["reviews"],
+            "properties": {
+                "reviews": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["thought", "decision", "reason"],
+                        "properties": {
+                            "thought": {"type": "string"},
+                            "decision": {
+                                "type": "string",
+                                "enum": ["record", "duplicate", "uncertain"],
+                            },
+                            "reason": {"type": "string"},
+                        },
+                    },
                 }
             },
         },
@@ -100,8 +146,27 @@ Each thought must:
 - be 1-3 sentences
 
 Return a JSON object with exactly one key: "thoughts".
+You may also include an optional "reason" string.
 The value must be an array of 0-3 real thought strings.
-If the note has no durable value, return {"thoughts": []}.
+If the note has no durable value, return {"thoughts": [], "reason": "<short explanation>"}.
+"""
+
+DICTATION_NOVELTY_PROMPT = """\
+You are reviewing candidate memory thoughts from a Telegram-origin dictation transcript before they are stored automatically.
+
+Decide whether each candidate thought should be recorded automatically.
+
+Use these decisions:
+- "record": materially new or meaningfully sharper than the existing nearby memories
+- "duplicate": already represented closely enough by existing memories
+- "uncertain": too ambiguous to auto-record safely
+
+Important:
+- Paraphrases can still be duplicates.
+- A thought is still "record" if it adds new scope, new constraint, new decision, or new factual detail.
+- Be conservative. If unsure, choose "uncertain".
+
+Return one review object per candidate thought.
 """
 
 
@@ -122,10 +187,16 @@ def parse_args():
     parser.add_argument("--poll", action="store_true", help="Continuously poll MinIO for new artifacts.")
     parser.add_argument("--poll-interval", type=int, default=30, help="Polling interval in seconds.")
     parser.add_argument("--sync-log-file", default=str(DEFAULT_SYNC_LOG_PATH), help="Path to importer sync state JSON.")
+    parser.add_argument("--telegram-bot-token", default=DEFAULT_TELEGRAM_BOT_TOKEN, help="Telegram bot token for review prompts on Telegram-origin transcripts.")
+    parser.add_argument("--telegram-review-match-threshold", type=float, default=DEFAULT_TELEGRAM_REVIEW_MATCH_THRESHOLD, help="Similarity threshold for Telegram transcript novelty review.")
+    parser.add_argument("--telegram-review-match-count", type=int, default=DEFAULT_TELEGRAM_REVIEW_MATCH_COUNT, help="Max similar rows per candidate for Telegram transcript novelty review.")
+    parser.add_argument("--telegram-pending-action-ttl-seconds", type=int, default=DEFAULT_TELEGRAM_PENDING_ACTION_TTL_SECONDS, help="How long Telegram review prompts remain actionable.")
+    parser.add_argument("--telegram-review-state-file", default=str(DEFAULT_TELEGRAM_REVIEW_STATE_PATH), help="Path to shared Telegram review-state JSON.")
     parser.add_argument("--dry-run", action="store_true", help="Parse and report without ingesting.")
     parser.add_argument("--verbose", action="store_true", help="Print per-artifact progress.")
     args = parser.parse_args()
     args.sync_log_file = Path(args.sync_log_file)
+    args.telegram_review_state_file = Path(args.telegram_review_state_file)
 
     if not args.dry_run and not args.access_key:
         parser.error("Missing access key. Set MCP_ACCESS_KEY or pass --access-key.")
@@ -282,8 +353,9 @@ def summarize_dictation(body_text: str, metadata: dict, llm_model: str):
     body = response.json()
     parsed = extract_tool_arguments(body, "submit_thoughts")
     thoughts = parsed.get("thoughts", [])
+    reason = normalize_optional_string(parsed.get("reason")) if isinstance(parsed, dict) else None
     if not isinstance(thoughts, list):
-        return []
+        return {"thoughts": [], "reason": reason or "The model did not return usable thought candidates."}
 
     normalized = []
     seen = set()
@@ -300,7 +372,152 @@ def summarize_dictation(body_text: str, metadata: dict, llm_model: str):
         normalized.append(cleaned)
         if len(normalized) >= 3:
             break
-    return normalized
+    return {"thoughts": normalized, "reason": reason}
+
+
+def telegram_api_call(token: str, method: str, payload: dict | None = None, timeout: int = 60):
+    response = requests.post(
+        f"https://api.telegram.org/bot{token}/{method}",
+        json=payload or {},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    body = response.json()
+    if not body.get("ok"):
+        raise RuntimeError(f"Telegram {method} failed: {body}")
+    return body["result"]
+
+
+def send_reply(token: str, chat_id: str, reply_to_message_id: int, text: str):
+    telegram_api_call(
+        token,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "reply_to_message_id": reply_to_message_id,
+            "text": text,
+            "allow_sending_without_reply": True,
+        },
+    )
+
+
+def send_action_prompt(token: str, chat_id: str, reply_to_message_id: int, text: str, action_token: str):
+    return telegram_api_call(
+        token,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "reply_to_message_id": reply_to_message_id,
+            "text": text,
+            "allow_sending_without_reply": True,
+            "reply_markup": {
+                "inline_keyboard": [[
+                    {"text": "Record", "callback_data": f"ob1:record:{action_token}"},
+                    {"text": "Ignore", "callback_data": f"ob1:ignore:{action_token}"},
+                ]]
+            },
+        },
+    )
+
+
+def normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def lookup_similar_thoughts(base_url: str, access_key: str, queries: list[str], *, match_threshold: float, match_count: int):
+    response = requests.post(
+        f"{base_url.rstrip('/')}/admin/thought/similar",
+        headers={
+            "Content-Type": "application/json",
+            "x-access-key": access_key,
+            "x-ingest-key": access_key,
+        },
+        json={
+            "queries": queries,
+            "match_threshold": match_threshold,
+            "match_count": match_count,
+        },
+        timeout=300,
+    )
+    body_text = response.text
+    if response.status_code not in (200, 201):
+        raise RuntimeError(f"{response.status_code} {response.reason}: {body_text}")
+    payload = response.json()
+    results = payload.get("results", [])
+    return {item.get("query"): item.get("matches", []) for item in results if isinstance(item, dict)}
+
+
+def review_thought_novelty(candidate_thoughts: list[str], similar_matches: dict[str, list[dict]], llm_model: str):
+    if not candidate_thoughts:
+        return []
+
+    lines = []
+    for index, thought in enumerate(candidate_thoughts, start=1):
+        lines.append(f"Candidate {index}: {thought}")
+        matches = similar_matches.get(thought, [])[:3]
+        if not matches:
+            lines.append("Nearby existing memories: (none)")
+        else:
+            lines.append("Nearby existing memories:")
+            for match_index, match in enumerate(matches, start=1):
+                lines.append(
+                    f"- {match_index}. similarity={match.get('similarity')} type={match.get('type')} "
+                    f"source={match.get('source')} summary={match.get('summary')}"
+                )
+        lines.append("")
+
+    response = http_post_with_retry(
+        f"{local_llm_base_url()}/chat/completions",
+        headers={"Content-Type": "application/json"},
+        json_body={
+            "model": llm_model,
+            "temperature": 0.1,
+            "max_tokens": 1200,
+            "chat_template_kwargs": {"enable_thinking": DEFAULT_LLM_ENABLE_THINKING},
+            "messages": [
+                {"role": "system", "content": DICTATION_NOVELTY_PROMPT},
+                {"role": "user", "content": "\n".join(lines).strip()},
+            ],
+            "tools": [NOVELTY_REVIEW_TOOL],
+            "tool_choice": {"type": "function", "function": {"name": "submit_review"}},
+        },
+        timeout=300,
+    )
+
+    if response is None:
+        raise RuntimeError("LLM novelty review returned no response")
+
+    payload = response.json()
+    parsed = extract_tool_arguments(payload, "submit_review")
+    reviews = parsed.get("reviews", [])
+    if not isinstance(reviews, list):
+        return []
+
+    by_thought = {}
+    for item in reviews:
+        if not isinstance(item, dict):
+            continue
+        thought = normalize_text(item.get("thought", ""))
+        decision = normalize_text(item.get("decision", "")).lower()
+        reason = normalize_text(item.get("reason", ""))
+        if thought not in candidate_thoughts:
+            continue
+        if decision not in {"record", "duplicate", "uncertain"}:
+            continue
+        by_thought[thought] = {
+            "thought": thought,
+            "decision": decision,
+            "reason": reason,
+        }
+
+    ordered = []
+    for thought in candidate_thoughts:
+        ordered.append(by_thought.get(thought, {
+            "thought": thought,
+            "decision": "uncertain",
+            "reason": "Novelty review did not return a usable decision.",
+        }))
+    return ordered
 
 
 def object_descriptor(source_name: str, identifier: str):
@@ -378,10 +595,76 @@ def mark_processed(log: dict, dedupe_key: str, ref_key: str, metadata: dict, tho
         "audio_sha256": normalize_optional_string(metadata.get("audio_sha256")),
         "title": normalize_optional_string(metadata.get("title")),
         "thought_count": thought_count,
+        "status": "ingested",
     }
     processed = log.setdefault("processed", {})
     processed[dedupe_key] = entry
     processed[ref_key] = entry
+
+
+def mark_review_pending(log: dict, dedupe_key: str, ref_key: str, metadata: dict, thought_count: int, *, review_kind: str, action_token: str):
+    entry = {
+        "schema_version": SYNC_SCHEMA_VERSION,
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "artifact_id": normalize_optional_string(metadata.get("artifact_id")),
+        "audio_sha256": normalize_optional_string(metadata.get("audio_sha256")),
+        "title": normalize_optional_string(metadata.get("title")),
+        "thought_count": thought_count,
+        "status": "review_pending",
+        "review_kind": review_kind,
+        "action_token": action_token,
+    }
+    processed = log.setdefault("processed", {})
+    processed[dedupe_key] = entry
+    processed[ref_key] = entry
+
+
+def is_telegram_capture(metadata: dict) -> bool:
+    capture_channel = normalize_optional_string(metadata.get("capture_channel"))
+    source = normalize_optional_string(metadata.get("source"))
+    return capture_channel == "telegram" or source == "telegram"
+
+
+def build_review_prompt(reason: str, *, review_kind: str):
+    if review_kind == "no_durable_thought":
+        return (
+            "I did not auto-record this voice transcript.\n\n"
+            f"Reason: {reason}\n\n"
+            "Record the transcript anyway, or ignore it?"
+        )
+    if review_kind == "duplicate":
+        return "This voice transcript looks like it may already be recorded. Record it anyway or ignore it?"
+    return "I am not confident this voice transcript should be recorded automatically. Record it anyway or ignore it?"
+
+
+def register_telegram_review(args, metadata: dict, *, review_kind: str, prompt_text: str, source_payload: dict, thought_payloads: list[dict]):
+    if not args.telegram_bot_token:
+        raise RuntimeError("Telegram bot token is required to review Telegram-origin dictation artifacts.")
+
+    chat_id = normalize_optional_string(metadata.get("telegram_chat_id"))
+    message_id_raw = metadata.get("telegram_message_id")
+    if not chat_id or message_id_raw is None:
+        raise RuntimeError("Telegram-origin dictation artifact is missing chat_id/message_id metadata.")
+
+    message_id = int(message_id_raw)
+    action_token = pending_action_token()
+    prompt_result = send_action_prompt(args.telegram_bot_token, chat_id, message_id, prompt_text, action_token)
+
+    pending_entry = {
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "kind": review_kind,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "review_message_id": prompt_result.get("message_id") if isinstance(prompt_result, dict) else None,
+        "source_payload": source_payload,
+        "thought_payloads": thought_payloads,
+    }
+
+    with locked_review_state(args.telegram_review_state_file) as review_state:
+        prune_pending_actions(review_state, args.telegram_pending_action_ttl_seconds)
+        review_state.setdefault("pending_actions", {})[action_token] = pending_entry
+
+    return action_token
 
 
 def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict):
@@ -402,7 +685,9 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
         dedupe_key=source_dedupe_key,
         artifact_ref=artifact_ref,
     )
-    thoughts = summarize_dictation(body_text, metadata, args.llm_model)
+    summary = summarize_dictation(body_text, metadata, args.llm_model)
+    thoughts = summary.get("thoughts", [])
+    ignored_reason = summary.get("reason") or "It does not look like a durable memory worth storing automatically."
     thought_payloads = [
         build_thought_payload(
             thought,
@@ -414,6 +699,105 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
         )
         for index, thought in enumerate(thoughts)
     ]
+
+    duplicate_count = 0
+    uncertain_count = 0
+
+    if is_telegram_capture(metadata):
+        if not thoughts:
+            prompt_text = build_review_prompt(ignored_reason, review_kind="no_durable_thought")
+            if args.dry_run:
+                action_token = "dry-run"
+            else:
+                action_token = register_telegram_review(
+                    args,
+                    metadata,
+                    review_kind="no_durable_thought",
+                    prompt_text=prompt_text,
+                    source_payload=source_payload,
+                    thought_payloads=[],
+                )
+            mark_review_pending(
+                log,
+                source_dedupe_key,
+                ref_key,
+                metadata,
+                0,
+                review_kind="no_durable_thought",
+                action_token=action_token,
+            )
+            return {
+                "skipped": False,
+                "dry_run": args.dry_run,
+                "source_dedupe_key": source_dedupe_key,
+                "title": normalize_optional_string(metadata.get("title")),
+                "thoughts": [],
+                "review_required": True,
+                "review_kind": "no_durable_thought",
+                "reason": ignored_reason,
+            }
+
+        similar_matches = {}
+        novelty_reviews = []
+        if not args.dry_run:
+            similar_matches = lookup_similar_thoughts(
+                args.base_url,
+                args.access_key,
+                thoughts,
+                match_threshold=args.telegram_review_match_threshold,
+                match_count=args.telegram_review_match_count,
+            )
+            novelty_reviews = review_thought_novelty(thoughts, similar_matches, args.llm_model)
+        else:
+            novelty_reviews = [{"thought": thought, "decision": "record", "reason": "dry-run"} for thought in thoughts]
+
+        review_by_thought = {item["thought"]: item for item in novelty_reviews}
+        approved_payloads = []
+        for payload in thought_payloads:
+            decision = review_by_thought.get(payload["content"], {}).get("decision", "uncertain")
+            if decision == "record":
+                approved_payloads.append(payload)
+            elif decision == "duplicate":
+                duplicate_count += 1
+            else:
+                uncertain_count += 1
+
+        if not approved_payloads:
+            review_kind = "duplicate" if duplicate_count else "uncertain"
+            prompt_text = build_review_prompt("", review_kind=review_kind)
+            if args.dry_run:
+                action_token = "dry-run"
+            else:
+                action_token = register_telegram_review(
+                    args,
+                    metadata,
+                    review_kind=review_kind,
+                    prompt_text=prompt_text,
+                    source_payload=source_payload,
+                    thought_payloads=thought_payloads,
+                )
+            mark_review_pending(
+                log,
+                source_dedupe_key,
+                ref_key,
+                metadata,
+                len(thought_payloads),
+                review_kind=review_kind,
+                action_token=action_token,
+            )
+            return {
+                "skipped": False,
+                "dry_run": args.dry_run,
+                "source_dedupe_key": source_dedupe_key,
+                "title": normalize_optional_string(metadata.get("title")),
+                "thoughts": thoughts,
+                "review_required": True,
+                "review_kind": review_kind,
+                "duplicate_count": duplicate_count,
+                "uncertain_count": uncertain_count,
+            }
+
+        thought_payloads = approved_payloads
 
     if args.dry_run:
         mark_processed(log, source_dedupe_key, ref_key, metadata, len(thought_payloads))
@@ -428,6 +812,20 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
     ingest_row(args.base_url, args.access_key, source_payload)
     for payload in thought_payloads:
         ingest_row(args.base_url, args.access_key, payload)
+
+    if is_telegram_capture(metadata) and args.telegram_bot_token:
+        chat_id = normalize_optional_string(metadata.get("telegram_chat_id"))
+        message_id_raw = metadata.get("telegram_message_id")
+        if chat_id and message_id_raw is not None:
+            status = f"Thought recorded. Stored 1 source row and {len(thought_payloads)} thought rows."
+            skipped = []
+            if duplicate_count:
+                skipped.append(f"{duplicate_count} duplicate")
+            if uncertain_count:
+                skipped.append(f"{uncertain_count} uncertain")
+            if skipped:
+                status += f" Skipped {', '.join(skipped)}."
+            send_reply(args.telegram_bot_token, chat_id, int(message_id_raw), status)
 
     mark_processed(log, source_dedupe_key, ref_key, metadata, len(thought_payloads))
     return {
@@ -481,7 +879,13 @@ def run_once(args, log: dict):
             continue
         processed += 1
         if args.verbose:
-            print(f"Imported {result['title'] or '(untitled)'} -> {len(result.get('thoughts', []))} thoughts")
+            if result.get("review_required"):
+                print(
+                    f"Review required for {result['title'] or '(untitled)'} "
+                    f"({result.get('review_kind')})"
+                )
+            else:
+                print(f"Imported {result['title'] or '(untitled)'} -> {len(result.get('thoughts', []))} thoughts")
     return {"processed": processed, "skipped": skipped}
 
 

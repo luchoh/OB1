@@ -15,7 +15,6 @@ import json
 import mimetypes
 import os
 import re
-import secrets
 import sys
 import time
 from datetime import datetime, timezone
@@ -34,10 +33,17 @@ from recipes.shared_docling import (
     local_llm_base_url,
     truncate_text,
 )
+from recipes.shared_telegram_review_state import (
+    default_review_state_path,
+    locked_review_state,
+    pending_action_token,
+    prune_pending_actions,
+)
 
 
 INTEGRATION_DIR = Path(__file__).resolve().parent
 DEFAULT_STATE_PATH = Path(os.environ.get("TELEGRAM_BRIDGE_STATE_FILE") or (INTEGRATION_DIR / "telegram-bridge-state.json"))
+DEFAULT_REVIEW_STATE_PATH = default_review_state_path(INTEGRATION_DIR / "telegram-review-state.json")
 
 DEFAULT_OPEN_BRAIN_BASE = (os.environ.get("OPEN_BRAIN_BASE_URL") or f"http://127.0.0.1:{os.environ.get('OPEN_BRAIN_PORT', '8787')}").rstrip("/")
 DEFAULT_OPEN_BRAIN_ACCESS_KEY = os.environ.get("MCP_ACCESS_KEY") or os.environ.get("OPEN_BRAIN_ACCESS_KEY") or ""
@@ -202,6 +208,7 @@ def parse_args():
     parser.add_argument("--review-match-count", type=int, default=DEFAULT_REVIEW_MATCH_COUNT, help="Max similar rows per candidate for Telegram novelty review.")
     parser.add_argument("--pending-action-ttl-seconds", type=int, default=DEFAULT_PENDING_ACTION_TTL_SECONDS, help="How long review prompts remain actionable.")
     parser.add_argument("--state-file", default=str(DEFAULT_STATE_PATH), help="Path to persistent bridge state JSON.")
+    parser.add_argument("--review-state-file", default=str(DEFAULT_REVIEW_STATE_PATH), help="Path to shared Telegram review-state JSON.")
     parser.add_argument(
         "--ensure-bucket",
         action=argparse.BooleanOptionalAction,
@@ -229,6 +236,7 @@ def parse_args():
         parser.error("Missing dictation access key. Set DICTATION_ACCESS_KEY or pass --dictation-access-key.")
 
     args.state_file = Path(args.state_file)
+    args.review_state_file = Path(args.review_state_file)
     return args
 
 
@@ -251,28 +259,6 @@ def save_state(path: Path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
-
-
-def prune_pending_actions(state: dict, ttl_seconds: int):
-    pending = state.setdefault("pending_actions", {})
-    if ttl_seconds <= 0:
-        return
-    now = datetime.now(timezone.utc).timestamp()
-    expired_tokens = []
-    for token, entry in pending.items():
-        created_at = entry.get("created_at")
-        try:
-            created_ts = datetime.fromisoformat(created_at).timestamp() if created_at else 0
-        except ValueError:
-            created_ts = 0
-        if not created_ts or (now - created_ts) > ttl_seconds:
-            expired_tokens.append(token)
-    for token in expired_tokens:
-        pending.pop(token, None)
-
-
-def pending_action_token():
-    return secrets.token_hex(8)
 
 
 def minio_client(args):
@@ -662,8 +648,8 @@ def register_pending_action(state: dict, args, message: dict, *, kind: str, prom
         "source_payload": source_payload,
         "thought_payloads": thought_payloads,
     }
-    state.setdefault("pending_actions", {})[token] = pending_entry
-    save_state(args.state_file, state)
+    with locked_review_state(args.review_state_file) as review_state:
+        review_state.setdefault("pending_actions", {})[token] = pending_entry
     return token
 
 
@@ -963,42 +949,43 @@ def process_callback_query(args, state: dict, callback_query: dict):
         return {"handled": False, "reason": "unknown_callback"}
 
     action, token = match.groups()
-    pending = state.setdefault("pending_actions", {}).get(token)
-    if not pending:
+    with locked_review_state(args.review_state_file) as review_state:
+        prune_pending_actions(review_state, args.pending_action_ttl_seconds)
+        pending = review_state.setdefault("pending_actions", {}).get(token)
+        if not pending:
+            if args.telegram_token and callback_id:
+                answer_callback_query(args.telegram_token, callback_id, "This review prompt expired.")
+            return {"handled": False, "reason": "missing_pending_action"}
+
+        if str(pending.get("chat_id")) != chat_id:
+            if args.telegram_token and callback_id:
+                answer_callback_query(args.telegram_token, callback_id, "This review prompt belongs to a different chat.")
+            return {"handled": False, "reason": "chat_mismatch"}
+
+        source_payload = pending.get("source_payload") or {}
+        thought_payloads = pending.get("thought_payloads") or []
+        review_message_id = pending.get("review_message_id")
+        kind = pending.get("kind") or "review"
+
+        if action == "record" and not args.dry_run:
+            ingest_text_capture(args, source_payload, thought_payloads)
+
         if args.telegram_token and callback_id:
-            answer_callback_query(args.telegram_token, callback_id, "This review prompt expired.")
-        return {"handled": False, "reason": "missing_pending_action"}
+            answer_callback_query(
+                args.telegram_token,
+                callback_id,
+                "Recorded." if action == "record" else "Ignored.",
+            )
 
-    if str(pending.get("chat_id")) != chat_id:
-        if args.telegram_token and callback_id:
-            answer_callback_query(args.telegram_token, callback_id, "This review prompt belongs to a different chat.")
-        return {"handled": False, "reason": "chat_mismatch"}
+        if args.telegram_token and review_message_id and not args.dry_run:
+            final_text = (
+                f"Recorded by request. Stored 1 source row and {len(thought_payloads)} thought rows."
+                if action == "record"
+                else f"Ignored. Nothing was stored from this {kind.replace('_', ' ')} capture."
+            )
+            edit_message(args.telegram_token, chat_id, int(review_message_id), final_text)
 
-    source_payload = pending.get("source_payload") or {}
-    thought_payloads = pending.get("thought_payloads") or []
-    review_message_id = pending.get("review_message_id")
-    kind = pending.get("kind") or "review"
-
-    if action == "record" and not args.dry_run:
-        ingest_text_capture(args, source_payload, thought_payloads)
-
-    if args.telegram_token and callback_id:
-        answer_callback_query(
-            args.telegram_token,
-            callback_id,
-            "Recorded." if action == "record" else "Ignored.",
-        )
-
-    if args.telegram_token and review_message_id and not args.dry_run:
-        final_text = (
-            f"Recorded by request. Stored 1 source row and {len(thought_payloads)} thought rows."
-            if action == "record"
-            else f"Ignored. Nothing was stored from this {kind.replace('_', ' ')} capture."
-        )
-        edit_message(args.telegram_token, chat_id, int(review_message_id), final_text)
-
-    state.setdefault("pending_actions", {}).pop(token, None)
-    save_state(args.state_file, state)
+        review_state.setdefault("pending_actions", {}).pop(token, None)
 
     return {
         "handled": True,
@@ -1042,7 +1029,8 @@ def iter_updates(args, state):
 
 
 def run_once(args, state):
-    prune_pending_actions(state, args.pending_action_ttl_seconds)
+    with locked_review_state(args.review_state_file) as review_state:
+        prune_pending_actions(review_state, args.pending_action_ttl_seconds)
     handled = 0
     skipped = 0
     for update in iter_updates(args, state):

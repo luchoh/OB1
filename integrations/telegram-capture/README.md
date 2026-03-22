@@ -86,6 +86,7 @@ Voice or audio message:
 - raw file stored in the configured MinIO bucket
 - object reference submitted to dictation
 - short Telegram acknowledgment confirming it was queued for transcription
+- after transcription, Telegram-origin transcripts follow the same meaningfulness/novelty gate before any OB1 ingest
 
 ## Notes
 

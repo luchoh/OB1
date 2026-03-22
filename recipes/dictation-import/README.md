@@ -11,6 +11,8 @@ Consumes canonical markdown artifacts produced by the separate `dictation` servi
 
 The preferred source is the MinIO artifact bucket described in [docs/11-local-dictation-ingest-prd.md](/Users/luchoh/Dev/OB1/docs/11-local-dictation-ingest-prd.md#L1).
 
+For `capture_channel=telegram` artifacts, the importer now applies the same meaningfulness/novelty gate as Telegram text capture before anything is stored in OB1.
+
 ## Prerequisites
 
 - Working Open Brain local runtime
@@ -43,6 +45,15 @@ Optional:
 export OPEN_BRAIN_BASE_URL=http://localhost:8787
 export DICTATION_MINIO_PREFIX=canonical/
 export MINIO_SECURE=true
+```
+
+Recommended for Telegram-origin dictation review:
+
+```bash
+export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_REVIEW_MATCH_THRESHOLD=0.78
+export TELEGRAM_REVIEW_MATCH_COUNT=3
+export TELEGRAM_REVIEW_STATE_FILE=/usr/local/var/ob1-telegram-bridge/telegram-review-state.json
 ```
 
 ## One-Shot Import
@@ -82,6 +93,12 @@ For each imported artifact:
 - up to 3 `dictation_thought` rows are stored
 - artifact provenance is preserved in `metadata.user_metadata`
 - `dictation-sync-log.json` records the processed artifact identity
+
+For Telegram-origin artifacts:
+
+- low-signal transcripts are not auto-ingested
+- duplicate or uncertain transcripts are not auto-ingested
+- the bot sends a `Record / Ignore` review prompt instead
 
 ## Notes
 
