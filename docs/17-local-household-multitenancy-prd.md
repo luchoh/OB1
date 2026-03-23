@@ -20,14 +20,14 @@ without mixing memories, retrieval results, graph context, or capture imports ac
 
 ## Problem
 
-The current local runtime is single-brain in three hard ways:
+The current development/local runtime is single-brain in three hard ways:
 
 - authentication is one global access key
 - `thoughts` is globally deduped by `dedupe_key`
 - retrieval and graph expansion operate on the whole corpus unless explicitly filtered by metadata
 
-That is fine for a single owner.
-It is wrong for a household.
+That is fine for a single owner and local development.
+It is wrong for a household-facing stable service.
 
 If multiple family members use the same OB1 deployment today:
 
@@ -479,7 +479,7 @@ Resolution should support two trusted auth sources.
 2. OB1 reads a forwarded Keycloak access token from:
    - `X-Auth-Request-Access-Token`
    - or `Authorization: Bearer ...` if explicitly enabled later
-3. OB1 validates that token against the configured Keycloak issuer and extracts:
+3. OB1 validates that token as a JWT against the configured Keycloak issuer and JWKS set, and extracts:
    - `sub`
    - `preferred_username`
    - `email`
@@ -539,6 +539,12 @@ Expected forwarded identity inputs from the trusted proxy path:
 
 The runtime should primarily bind humans by the validated Keycloak token `sub`, not by mutable forwarded username/email values and not by client-held static secrets.
 
+Validation mode in v1:
+
+- prefer standard JWT verification against Keycloak issuer metadata and JWKS
+- do not require per-request token introspection for the first slice
+- only accept tokens whose issuer, audience/client expectations, signature, and expiry checks pass
+
 ### Brain Selection
 
 Brain selection should be explicit at the connector or route level, not hidden in arbitrary per-tool headers.
@@ -557,6 +563,12 @@ The concrete v1 MCP route shape should be:
 - `/mcp/brains/:brain_slug` -> explicit requested brain for that connector
 
 The server must resolve `:brain_slug` inside the authenticated principal's household and reject unauthorized access.
+Do not silently fall back to the default brain when a requested slug is unknown or no longer authorized.
+
+Expected failure behavior:
+
+- `404` if the slug does not exist in the household
+- `403` if the slug exists but the principal is not allowed to use it
 
 ### MCP Connection Model
 
