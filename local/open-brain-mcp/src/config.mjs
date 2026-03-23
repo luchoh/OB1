@@ -303,6 +303,17 @@ async function loadConfig() {
     };
   }
 
+  const humanTokenAuthEnabled = envBoolean("OB1_ENABLE_HUMAN_TOKEN_AUTH", false);
+  const oidcIssuer = humanTokenAuthEnabled
+    ? envString("OB1_OIDC_ISSUER_URL", undefined).replace(/\/$/, "")
+    : envOptionalString("OB1_OIDC_ISSUER_URL")?.replace(/\/$/, "");
+  const oidcAudience = humanTokenAuthEnabled
+    ? envString("OB1_OIDC_AUDIENCE", undefined)
+    : envOptionalString("OB1_OIDC_AUDIENCE");
+  const oidcJwksUrl = humanTokenAuthEnabled
+    ? envOptionalString("OB1_OIDC_JWKS_URL") ?? `${oidcIssuer}/protocol/openid-connect/certs`
+    : envOptionalString("OB1_OIDC_JWKS_URL");
+
   return {
     serviceName: process.env.OPEN_BRAIN_SERVICE_NAME ?? "open-brain-local",
     runtimeRole,
@@ -320,6 +331,14 @@ async function loadConfig() {
     expectedEmbeddingDimension: envOptionalNumber("EMBEDDING_STORE_DIMENSION", 1536) ?? 1536,
     metadataMaxTokens: envOptionalNumber("OPEN_BRAIN_METADATA_MAX_TOKENS", 400) ?? 400,
     answerMaxTokens: envOptionalNumber("OPEN_BRAIN_ANSWER_MAX_TOKENS", 600) ?? 600,
+    auth: {
+      humanTokenAuth: {
+        enabled: humanTokenAuthEnabled,
+        issuer: oidcIssuer,
+        audience: oidcAudience,
+        jwksUrl: oidcJwksUrl,
+      },
+    },
     graph,
     postgres: await pgConfig(consul),
   };

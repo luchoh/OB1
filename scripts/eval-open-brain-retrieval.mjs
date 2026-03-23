@@ -16,6 +16,7 @@ Options:
   --cases PATH        JSON case file (default: local/open-brain-mcp/evals/graph-retrieval-eval-cases.json)
   --database NAME     Graph database to evaluate against (default: OPEN_BRAIN_GRAPH_DATABASE or ob1-graph-stage)
   --schema-variant N  Projection schema variant (default: OPEN_BRAIN_GRAPH_SCHEMA_VARIANT or provenance-v1)
+  --brain-slug SLUG   Brain slug to evaluate against (default: principal default brain)
   --output PATH       Optional JSON report path
   --no-project        Skip projection of case-specific thought ids before evaluation
   --include-chat-sources  Also project raw/source chat export rows linked to the case thought ids
@@ -29,6 +30,7 @@ function parseArgs(argv) {
     casesPath: path.join(repoRoot, "local/open-brain-mcp/evals/graph-retrieval-eval-cases.json"),
     database: process.env.OPEN_BRAIN_GRAPH_DATABASE ?? "ob1-graph-stage",
     schemaVariant: process.env.OPEN_BRAIN_GRAPH_SCHEMA_VARIANT ?? "provenance-v1",
+    brainSlug: process.env.OPEN_BRAIN_DEFAULT_BRAIN_SLUG ?? null,
     outputPath: null,
     ensureProjection: true,
     includeChatSources: false,
@@ -43,6 +45,8 @@ function parseArgs(argv) {
       args.database = argv[++index];
     } else if (arg === "--schema-variant") {
       args.schemaVariant = argv[++index];
+    } else if (arg === "--brain-slug") {
+      args.brainSlug = argv[++index];
     } else if (arg === "--output") {
       args.outputPath = path.resolve(argv[++index]);
     } else if (arg === "--no-project") {
@@ -60,6 +64,62 @@ function parseArgs(argv) {
   }
 
   return args;
+}
+
+async function resolveEvaluationBrain(args) {
+  if (args.brainSlug) {
+    const result = await query(
+      `
+        select id, slug
+        from brains
+        where slug = $1
+        order by created_at asc
+        limit 2
+      `,
+      [args.brainSlug],
+    );
+
+    if (result.rowCount === 0) {
+      throw new Error(`Brain not found: ${args.brainSlug}`);
+    }
+    if (result.rowCount > 1) {
+      throw new Error(`Brain slug is ambiguous: ${args.brainSlug}`);
+    }
+
+    return result.rows[0];
+  }
+
+  const defaultResult = await query(
+    `
+      select b.id, b.slug
+      from brain_principals p
+      join brains b
+        on b.id = p.default_brain_id
+      where p.principal_type = 'person'
+        and p.default_brain_id is not null
+      order by p.created_at asc
+      limit 1
+    `,
+  );
+
+  if (defaultResult.rowCount === 1) {
+    return defaultResult.rows[0];
+  }
+
+  const fallback = await query(
+    `
+      select id, slug
+      from brains
+      order by created_at asc
+      limit 1
+    `,
+  );
+
+  if (fallback.rowCount !== 1) {
+    throw new Error("No evaluation brain could be resolved");
+  }
+
+  return fallback.rows[0];
 }
 
 function unique(values) {
@@ -182,6 +242,8 @@ async function main() {
     throw new Error(`No cases found in ${args.casesPath}`);
   }
 
+  const evaluationBrain = await resolveEvaluationBrain(args);
+
   if (args.ensureProjection) {
     const projectionIds = unique(cases.flatMap((testCase) => testCase.projection_ids ?? []));
     const explicitDedupeKeys = unique(cases.flatMap((testCase) => testCase.projection_dedupe_keys ?? []));
@@ -204,6 +266,7 @@ async function main() {
   const results = [];
   for (const testCase of cases) {
     const vector = await retrieveEvidenceRows({
+      brainId: evaluationBrain.id,
       queryText: testCase.question,
       threshold: testCase.match_threshold ?? 0.4,
       count: testCase.match_count ?? 6,
@@ -213,6 +276,7 @@ async function main() {
     });
 
     const graph = await retrieveEvidenceRows({
+      brainId: evaluationBrain.id,
       queryText: testCase.question,
       threshold: testCase.match_threshold ?? 0.4,
       count: testCase.match_count ?? 6,
@@ -251,6 +315,8 @@ async function main() {
     generated_at: new Date().toISOString(),
     database: args.database,
     schema_variant: args.schemaVariant,
+    brain_id: evaluationBrain.id,
+    brain_slug: evaluationBrain.slug,
     policy_path: graphRetrievalPolicyPath(),
     policy: loadGraphRetrievalPolicy(),
     case_count: results.length,

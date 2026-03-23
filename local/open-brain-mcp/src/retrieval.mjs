@@ -140,10 +140,11 @@ function queryEmbeddingVector(queryText) {
   return createEmbedding(normalized);
 }
 
-async function matchThoughtRows({ embedding, threshold, count, filter }) {
+async function matchThoughtRows({ brainId, embedding, threshold, count, filter }) {
   return query(
-    "select * from match_thoughts($1::vector, $2, $3, $4::jsonb)",
+    "select * from match_thoughts($1::uuid, $2::vector, $3, $4, $5::jsonb)",
     [
+      brainId,
       formatVector(embedding),
       threshold,
       count,
@@ -170,12 +171,16 @@ export function mergeUniqueThoughtRows(...groups) {
 }
 
 export async function retrieveThoughts({
+  brainId,
   queryText,
   threshold,
   count,
   filter,
   embedding = null,
 }) {
+  if (!brainId) {
+    throw new Error("brainId is required for retrieval");
+  }
   const queryVector = embedding ?? await queryEmbeddingVector(queryText);
 
   let results;
@@ -184,6 +189,7 @@ export async function retrieveThoughts({
 
   if (hasExplicitSearchRole(filter)) {
     const direct = await matchThoughtRows({
+      brainId,
       embedding: queryVector,
       threshold,
       count,
@@ -194,6 +200,7 @@ export async function retrieveThoughts({
     retrievalStrategy = "distilled-first";
 
     const preferred = await matchThoughtRows({
+      brainId,
       embedding: queryVector,
       threshold,
       count,
@@ -204,6 +211,7 @@ export async function retrieveThoughts({
 
     if (results.length < count) {
       const fallback = await matchThoughtRows({
+        brainId,
         embedding: queryVector,
         threshold,
         count: Math.min(count * 3, 50),
@@ -270,7 +278,10 @@ function canonicalKind(canonicalId) {
   return "unknown";
 }
 
-export async function fetchThoughtRowsByIds({ ids, filter, embedding }) {
+export async function fetchThoughtRowsByIds({ brainId, ids, filter, embedding }) {
+  if (!brainId) {
+    throw new Error("brainId is required for fetchThoughtRowsByIds");
+  }
   if (!Array.isArray(ids) || ids.length === 0) {
     return [];
   }
@@ -291,9 +302,10 @@ export async function fetchThoughtRowsByIds({ ids, filter, embedding }) {
           t.updated_at
         from thoughts t
         where t.id = any($1::uuid[])
-          and ($3::jsonb = '{}'::jsonb or t.metadata @> $3::jsonb)
+          and t.brain_id = $2::uuid
+          and ($4::jsonb = '{}'::jsonb or t.metadata @> $4::jsonb)
       `,
-      [ids, formatVector(embedding), filterJson],
+      [ids, brainId, formatVector(embedding), filterJson],
     );
   } else {
     result = await query(
@@ -309,9 +321,10 @@ export async function fetchThoughtRowsByIds({ ids, filter, embedding }) {
           t.updated_at
         from thoughts t
         where t.id = any($1::uuid[])
-          and ($2::jsonb = '{}'::jsonb or t.metadata @> $2::jsonb)
+          and t.brain_id = $2::uuid
+          and ($3::jsonb = '{}'::jsonb or t.metadata @> $3::jsonb)
       `,
-      [ids, filterJson],
+      [ids, brainId, filterJson],
     );
   }
 
@@ -794,6 +807,7 @@ function selectEvidenceRows({
 }
 
 export async function expandThoughtsWithGraph({
+  brainId,
   seedRows,
   filter,
   embedding,
@@ -855,6 +869,7 @@ export async function expandThoughtsWithGraph({
   }
 
   const fetchedRows = await fetchThoughtRowsByIds({
+    brainId,
     ids: candidateIds,
     filter,
     embedding,
@@ -878,6 +893,7 @@ export async function expandThoughtsWithGraph({
 }
 
 export async function retrieveEvidenceRows({
+  brainId,
   queryText,
   threshold,
   count,
@@ -887,9 +903,13 @@ export async function retrieveEvidenceRows({
   graphNeighborLimit,
   graphDatabase = config.graph.database,
 } = {}) {
+  if (!brainId) {
+    throw new Error("brainId is required for retrieveEvidenceRows");
+  }
   const questionIntent = detectQuestionIntent(queryText);
   const signal = questionSignal(queryText);
   const retrieval = await retrieveThoughts({
+    brainId,
     queryText,
     threshold,
     count,
@@ -898,6 +918,7 @@ export async function retrieveEvidenceRows({
 
   const graphExpansion = graphAssisted
     ? await expandThoughtsWithGraph({
+      brainId,
       seedRows: retrieval.results,
       filter,
       embedding: retrieval.embedding,
@@ -949,6 +970,7 @@ export async function retrieveEvidenceRows({
 }
 
 export async function expandContextRows({
+  brainId,
   thoughtId,
   canonicalId,
   questionText = "",
@@ -957,10 +979,14 @@ export async function expandContextRows({
   limit,
   graphDatabase = config.graph.database,
 } = {}) {
+  if (!brainId) {
+    throw new Error("brainId is required for expandContextRows");
+  }
   const policy = loadGraphRetrievalPolicy();
   const resolvedLimit = Math.max(1, Math.min(24, Number(limit) || policy.defaultAddedRows));
   const resolvedThoughtId = resolveThoughtIdInput({ thoughtId, canonicalId });
   const seedRows = await fetchThoughtRowsByIds({
+    brainId,
     ids: [resolvedThoughtId],
     filter: {},
   });
@@ -972,6 +998,7 @@ export async function expandContextRows({
   const questionIntent = detectQuestionIntent(questionText);
   const signal = questionSignal(questionText);
   const graphExpansion = await expandThoughtsWithGraph({
+    brainId,
     seedRows,
     filter,
     embedding: null,
