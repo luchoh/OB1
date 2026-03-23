@@ -334,6 +334,7 @@ async function fetchProjectionCandidates({
       with projected as (
         select
           t.id,
+          t.brain_id,
           t.dedupe_key,
           t.content,
           t.content_hash,
@@ -346,6 +347,7 @@ async function fetchProjectionCandidates({
         from thoughts t
         left join thought_graph_projection_state gps
           on gps.thought_id = t.id
+         and gps.brain_id = t.brain_id
          and gps.graph_database = $1
         where ($2::boolean
           or gps.thought_id is null
@@ -378,6 +380,7 @@ async function fetchProjectionCandidates({
 
 async function recordProjectionState({
   thoughtId,
+  brainId,
   database,
   revisionHash,
   status,
@@ -387,22 +390,24 @@ async function recordProjectionState({
     `
       insert into thought_graph_projection_state (
         thought_id,
+        brain_id,
         graph_database,
         projection_revision_hash,
         last_projected_at,
         last_projection_status,
         last_projection_error
       )
-      values ($1, $2, $3, now(), $4, $5)
+      values ($1, $2, $3, $4, now(), $5, $6)
       on conflict (thought_id, graph_database)
       do update set
+        brain_id = excluded.brain_id,
         projection_revision_hash = excluded.projection_revision_hash,
         last_projected_at = excluded.last_projected_at,
         last_projection_status = excluded.last_projection_status,
         last_projection_error = excluded.last_projection_error,
         updated_at = now()
     `,
-    [thoughtId, database, revisionHash, status, error],
+    [thoughtId, brainId, database, revisionHash, status, error],
   );
 }
 
@@ -1571,6 +1576,7 @@ export async function projectThoughts({
       await projectThoughtRow(row, database, schemaVariant);
       await recordProjectionState({
         thoughtId: row.id,
+        brainId: row.brain_id,
         database,
         revisionHash: row.projection_revision_hash,
         status: "projected",
@@ -1583,6 +1589,7 @@ export async function projectThoughts({
       const message = error instanceof Error ? error.message : String(error);
       await recordProjectionState({
         thoughtId: row.id,
+        brainId: row.brain_id,
         database,
         revisionHash: row.projection_revision_hash,
         status: "failed",
@@ -1610,6 +1617,7 @@ export async function graphProjectionStats(database = config.graph.database) {
       with candidate as (
         select
           t.id,
+          t.brain_id,
           gps.last_projection_status,
           gps.last_projected_at,
           gps.last_projection_error,
@@ -1618,6 +1626,7 @@ export async function graphProjectionStats(database = config.graph.database) {
         from thoughts t
         left join thought_graph_projection_state gps
           on gps.thought_id = t.id
+         and gps.brain_id = t.brain_id
          and gps.graph_database = $1
       )
       select

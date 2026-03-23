@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
+import { HttpError, resolveAccessContext } from "./auth.mjs";
 import { config } from "./config.mjs";
 import { closePool, formatVector, healthcheckDatabase, query } from "./db.mjs";
 import {
@@ -105,12 +106,6 @@ const expandContextSchema = {
   limit: z.number().int().min(1).max(24).optional().describe("Maximum number of expanded thought rows to return."),
 };
 
-function authKey(c) {
-  return c.req.query("key")
-    || c.req.header("x-access-key")
-    || c.req.header("x-brain-key");
-}
-
 function jsonToolResult(value) {
   return {
     content: [
@@ -139,6 +134,29 @@ function errorToolResult(error) {
     ],
     isError: true,
   };
+}
+
+function routeBrainSlug(c) {
+  try {
+    const value = c.req.param("brainSlug");
+    return typeof value === "string" && value.trim() ? value.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
+function errorStatus(error) {
+  if (error instanceof HttpError) {
+    return error.status;
+  }
+  if (error instanceof z.ZodError) {
+    return 400;
+  }
+  return 500;
+}
+
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function truncateText(text, limit = 280) {
@@ -205,222 +223,11 @@ function hasExplicitSearchRole(filter) {
       || Object.prototype.hasOwnProperty.call(filter, "retrieval_role"));
 }
 
-async function matchThoughtRows({ embedding, threshold, count, filter }) {
-  return query(
-    "select * from match_thoughts($1::vector, $2, $3, $4::jsonb)",
-    [
-      formatVector(embedding),
-      threshold,
-      count,
-      JSON.stringify(filter),
-    ],
-  );
-}
-
-async function retrieveThoughts({ queryText, threshold, count, filter }) {
-  const embedding = await createEmbedding(queryText.trim());
-
-  let results;
-  let retrievalStrategy = "direct";
-  let fallbackUsed = false;
-
-  if (hasExplicitSearchRole(filter)) {
-    const direct = await matchThoughtRows({
-      embedding,
-      threshold,
-      count,
-      filter,
-    });
-    results = direct.rows;
-  } else {
-    retrievalStrategy = "distilled-first";
-
-    const preferred = await matchThoughtRows({
-      embedding,
-      threshold,
-      count,
-      filter: { ...filter, retrieval_role: "distilled" },
-    });
-
-    results = preferred.rows;
-
-    if (results.length < count) {
-      const fallback = await matchThoughtRows({
-        embedding,
-        threshold,
-        count: Math.min(count * 3, 50),
-        filter,
-      });
-
-      results = mergeUniqueThoughtRows(preferred.rows, fallback.rows).slice(0, count);
-      fallbackUsed = true;
-    }
-  }
-
-  return {
-    query: queryText,
-    retrieval_strategy: retrievalStrategy,
-    fallback_used: fallbackUsed,
-    results,
-  };
-}
-
-function thoughtIdFromCanonicalId(canonicalId) {
-  if (typeof canonicalId !== "string" || !canonicalId.startsWith("thought:")) {
-    return null;
-  }
-
-  const thoughtId = canonicalId.slice("thought:".length).trim();
-  return thoughtId || null;
-}
-
-function graphThoughtSortValue(row, metadata) {
-  const retrievalRole = row?.metadata?.retrieval_role ?? null;
-  return [
-    metadata?.hopCount ?? 99,
-    retrievalRole === "distilled" ? 0 : 1,
-    row?.created_at ? -Date.parse(row.created_at) : 0,
-  ];
-}
-
-function compareGraphThoughtRows(a, b, metadataById) {
-  const aSort = graphThoughtSortValue(a, metadataById.get(a.id));
-  const bSort = graphThoughtSortValue(b, metadataById.get(b.id));
-
-  for (let index = 0; index < aSort.length; index += 1) {
-    if (aSort[index] < bSort[index]) {
-      return -1;
-    }
-    if (aSort[index] > bSort[index]) {
-      return 1;
-    }
-  }
-
-  return a.id.localeCompare(b.id);
-}
-
-async function fetchThoughtRowsByIds({ ids, filter }) {
-  if (!Array.isArray(ids) || ids.length === 0) {
-    return [];
-  }
-
-  const result = await query(
-    `
-      select
-        t.id,
-        t.content,
-        t.embedding_model,
-        t.embedding_dimension,
-        t.metadata,
-        null::float as similarity,
-        t.created_at,
-        t.updated_at
-      from thoughts t
-      where t.id = any($1::uuid[])
-        and ($2::jsonb = '{}'::jsonb or t.metadata @> $2::jsonb)
-    `,
-    [ids, JSON.stringify(filter ?? {})],
-  );
-
-  const byId = new Map(result.rows.map((row) => [row.id, row]));
-  return ids.map((id) => byId.get(id)).filter(Boolean);
-}
-
-async function expandThoughtsWithGraph({
-  seedRows,
-  filter,
-  maxHops = 2,
-  limit = 6,
-}) {
-  if (!config.graph.enabled) {
-    throw new Error("Graph-assisted retrieval requested but graph integration is disabled");
-  }
-
-  if (!Array.isArray(seedRows) || seedRows.length === 0 || limit <= 0) {
-    return {
-      rows: [],
-      expansion: {
-        enabled: true,
-        seed_count: Array.isArray(seedRows) ? seedRows.length : 0,
-        candidate_count: 0,
-        added_count: 0,
-        max_hops: maxHops,
-        limit,
-      },
-    };
-  }
-
-  const seedIds = new Set(seedRows.map((row) => row.id));
-  const candidateIds = [];
-  const metadataById = new Map();
-  const perSeedTraversalLimit = Math.min(Math.max(limit, 6), 24);
-
-  for (const row of seedRows) {
-    const neighborResult = await graphNeighbors({
-      thoughtId: row.id,
-      maxHops,
-      limit: perSeedTraversalLimit,
-    });
-
-    for (const neighbor of neighborResult.neighbors ?? []) {
-      if (!Array.isArray(neighbor.labels) || !neighbor.labels.includes("Thought")) {
-        continue;
-      }
-
-      const graphThoughtId = thoughtIdFromCanonicalId(neighbor.node?.canonical_id);
-      if (!graphThoughtId || seedIds.has(graphThoughtId) || metadataById.has(graphThoughtId)) {
-        continue;
-      }
-
-      metadataById.set(graphThoughtId, {
-        hopCount: neighbor.hop_count ?? 99,
-      });
-      candidateIds.push(graphThoughtId);
-    }
-  }
-
-  const fetchedRows = await fetchThoughtRowsByIds({
-    ids: candidateIds,
-    filter,
-  });
-
-  const sortedRows = [...fetchedRows].sort((a, b) => compareGraphThoughtRows(a, b, metadataById));
-  const limitedRows = sortedRows.slice(0, limit);
-
-  return {
-    rows: limitedRows,
-    expansion: {
-      enabled: true,
-      seed_count: seedRows.length,
-      candidate_count: candidateIds.length,
-      added_count: limitedRows.length,
-      max_hops: maxHops,
-      limit,
-    },
-  };
-}
-
-function mergeUniqueThoughtRows(...groups) {
-  const seen = new Set();
-  const merged = [];
-
-  for (const group of groups) {
-    for (const row of group) {
-      if (!row?.id || seen.has(row.id)) {
-        continue;
-      }
-      seen.add(row.id);
-      merged.push(row);
-    }
-  }
-
-  return merged;
-}
-
-async function upsertThought({ content, embedding, metadata, dedupeKey }) {
+async function upsertThought({ brainId, content, embedding, metadata, dedupeKey }) {
   const result = await query(
     `
       insert into thoughts (
+        brain_id,
         content,
         embedding,
         embedding_model,
@@ -429,14 +236,15 @@ async function upsertThought({ content, embedding, metadata, dedupeKey }) {
         metadata
       )
       values (
-        $1,
-        $2::vector,
-        $3,
+        $1::uuid,
+        $2,
+        $3::vector,
         $4,
-        coalesce($5, encode(digest($1, 'sha256'), 'hex')),
-        $6::jsonb
+        $5,
+        coalesce($6, encode(digest($2, 'sha256'), 'hex')),
+        $7::jsonb
       )
-      on conflict (dedupe_key)
+      on conflict (brain_id, dedupe_key)
       do update set
         content = excluded.content,
         embedding = excluded.embedding,
@@ -446,6 +254,7 @@ async function upsertThought({ content, embedding, metadata, dedupeKey }) {
         updated_at = now()
       returning
         id,
+        brain_id,
         content,
         dedupe_key,
         content_hash,
@@ -456,6 +265,7 @@ async function upsertThought({ content, embedding, metadata, dedupeKey }) {
         updated_at
     `,
     [
+      brainId,
       content,
       formatVector(embedding),
       config.embeddingModel,
@@ -468,7 +278,7 @@ async function upsertThought({ content, embedding, metadata, dedupeKey }) {
   return result.rows[0];
 }
 
-async function handleCaptureThought(args) {
+async function handleCaptureThought(args, accessContext) {
   const content = args.content.trim();
   const metadata = args.metadata ?? {};
   const shouldExtractMetadata = args.extract_metadata ?? true;
@@ -501,6 +311,7 @@ async function handleCaptureThought(args) {
   });
 
   const thought = await upsertThought({
+    brainId: accessContext.effectiveBrainId,
     content,
     embedding: embeddingResult.value,
     metadata: normalizedMetadata,
@@ -515,11 +326,12 @@ async function handleCaptureThought(args) {
   };
 }
 
-async function handleSearchThoughts(args) {
+async function handleSearchThoughts(args, accessContext) {
   const threshold = args.match_threshold ?? 0.4;
   const matchCount = args.match_count ?? 10;
   const filter = args.filter ?? {};
   const retrieval = await retrieveThoughtRows({
+    brainId: accessContext.effectiveBrainId,
     queryText: args.query,
     threshold,
     count: matchCount,
@@ -536,11 +348,16 @@ async function handleSearchThoughts(args) {
   };
 }
 
-async function handleAskBrain(args) {
+async function handleAskBrain(args, accessContext) {
+  if ((args.graph_assisted ?? false) && !accessContext.isAdmin) {
+    throw new HttpError(400, "graph_assisted is disabled for non-admin multitenant requests");
+  }
+
   const threshold = args.match_threshold ?? 0.4;
   const matchCount = args.match_count ?? 6;
   const filter = args.filter ?? {};
   const { retrieval, graphExpansion, evidenceRows, questionIntent } = await retrieveEvidenceRows({
+    brainId: accessContext.effectiveBrainId,
     queryText: args.question,
     threshold,
     count: matchCount,
@@ -589,31 +406,32 @@ async function handleAskBrain(args) {
   };
 }
 
-async function updateThoughtMetadata({ thoughtId, metadataPatch }) {
+async function updateThoughtMetadata({ brainId, thoughtId, metadataPatch }) {
   const result = await query(
     `
       update thoughts
       set
         metadata = (
           thoughts.metadata
-          || ($2::jsonb - 'user_metadata')
+          || ($3::jsonb - 'user_metadata')
           || case
-            when $2::jsonb ? 'user_metadata' then jsonb_build_object(
+            when $3::jsonb ? 'user_metadata' then jsonb_build_object(
               'user_metadata',
               coalesce(thoughts.metadata->'user_metadata', '{}'::jsonb)
-              || coalesce($2::jsonb->'user_metadata', '{}'::jsonb)
+              || coalesce($3::jsonb->'user_metadata', '{}'::jsonb)
             )
             else '{}'::jsonb
           end
         ),
         updated_at = now()
       where id = $1::uuid
+        and brain_id = $2::uuid
       returning
         id,
         metadata,
         updated_at
     `,
-    [thoughtId, JSON.stringify(metadataPatch)],
+    [thoughtId, brainId, JSON.stringify(metadataPatch)],
   );
 
   if (result.rowCount !== 1) {
@@ -628,7 +446,7 @@ async function updateThoughtMetadata({ thoughtId, metadataPatch }) {
   };
 }
 
-async function handleSimilarThoughtLookup(args) {
+async function handleSimilarThoughtLookup(args, accessContext) {
   const matchThreshold = args.match_threshold ?? 0.78;
   const matchCount = args.match_count ?? 3;
   const filter = args.filter ?? {};
@@ -636,7 +454,8 @@ async function handleSimilarThoughtLookup(args) {
 
   const results = [];
   for (const queryText of queries) {
-    const retrieval = await retrieveThoughts({
+    const retrieval = await retrieveThoughtRows({
+      brainId: accessContext.effectiveBrainId,
       queryText,
       threshold: matchThreshold,
       count: matchCount,
@@ -658,10 +477,10 @@ async function handleSimilarThoughtLookup(args) {
   };
 }
 
-async function handleListThoughts(args) {
+async function handleListThoughts(args, accessContext) {
   const result = await query(
-    "select * from list_recent_thoughts($1, $2::jsonb)",
-    [args.limit ?? 20, JSON.stringify(args.filter ?? {})],
+    "select * from list_recent_thoughts($1::uuid, $2, $3::jsonb)",
+    [accessContext.effectiveBrainId, args.limit ?? 20, JSON.stringify(args.filter ?? {})],
   );
 
   return {
@@ -671,27 +490,29 @@ async function handleListThoughts(args) {
   };
 }
 
-async function handleStats() {
+async function handleStats(accessContext) {
   const [overviewResult, sourceCounts, typeCounts, peopleCounts] = await Promise.all([
-    query("select * from thoughts_stats()"),
+    query("select * from thoughts_stats($1::uuid)", [accessContext.effectiveBrainId]),
     query(`
       select
         coalesce(metadata->>'source', 'unknown') as source,
         count(*)::bigint as count
       from thoughts
+      where brain_id = $1::uuid
       group by 1
       order by count desc, source asc
       limit 10
-    `),
+    `, [accessContext.effectiveBrainId]),
     query(`
       select
         coalesce(metadata->>'type', 'unknown') as type,
         count(*)::bigint as count
       from thoughts
+      where brain_id = $1::uuid
       group by 1
       order by count desc, type asc
       limit 10
-    `),
+    `, [accessContext.effectiveBrainId]),
     query(`
       select
         person,
@@ -699,11 +520,12 @@ async function handleStats() {
       from (
         select jsonb_array_elements_text(coalesce(metadata->'people', '[]'::jsonb)) as person
         from thoughts
+        where brain_id = $1::uuid
       ) people
       group by person
       order by count desc, person asc
       limit 10
-    `),
+    `, [accessContext.effectiveBrainId]),
   ]);
 
   const stats = {
@@ -714,14 +536,16 @@ async function handleStats() {
     top_people: peopleCounts.rows,
   };
 
-  const graphStats = await graphProjectionStats(config.graph.database).catch(() => null);
+  const graphStats = accessContext.isAdmin
+    ? await graphProjectionStats(config.graph.database).catch(() => null)
+    : null;
   if (graphStats) {
     stats.graph = {
       enabled: config.graph.enabled,
       database: config.graph.database,
       projection: graphStats,
     };
-  } else if (config.graph.enabled) {
+  } else if (config.graph.enabled && accessContext.isAdmin) {
     stats.graph = {
       enabled: true,
       database: config.graph.database,
@@ -732,7 +556,14 @@ async function handleStats() {
   return stats;
 }
 
-async function handleGraphNeighbors(args) {
+function ensureGraphAdmin(accessContext) {
+  if (!accessContext.isAdmin) {
+    throw new HttpError(403, "Graph endpoints are disabled for non-admin multitenant requests");
+  }
+}
+
+async function handleGraphNeighbors(args, accessContext) {
+  ensureGraphAdmin(accessContext);
   if (!args.thought_id && !args.canonical_id) {
     throw new Error("Either thought_id or canonical_id is required");
   }
@@ -744,7 +575,8 @@ async function handleGraphNeighbors(args) {
   });
 }
 
-async function handleSourceLineage(args) {
+async function handleSourceLineage(args, accessContext) {
+  ensureGraphAdmin(accessContext);
   if (!args.thought_id && !args.canonical_id) {
     throw new Error("Either thought_id or canonical_id is required");
   }
@@ -756,7 +588,8 @@ async function handleSourceLineage(args) {
   });
 }
 
-async function handleWhyConnected(args) {
+async function handleWhyConnected(args, accessContext) {
+  ensureGraphAdmin(accessContext);
   const hasFrom = Boolean(args.from_thought_id || args.from_canonical_id);
   const hasTo = Boolean(args.to_thought_id || args.to_canonical_id);
   if (!hasFrom || !hasTo) {
@@ -773,12 +606,14 @@ async function handleWhyConnected(args) {
   });
 }
 
-async function handleExpandContext(args) {
+async function handleExpandContext(args, accessContext) {
+  ensureGraphAdmin(accessContext);
   if (!args.thought_id && !args.canonical_id) {
     throw new Error("Either thought_id or canonical_id is required");
   }
 
   const result = await expandContextRows({
+    brainId: accessContext.effectiveBrainId,
     thoughtId: args.thought_id,
     canonicalId: args.canonical_id,
     questionText: args.question ?? "",
@@ -798,7 +633,7 @@ async function handleExpandContext(args) {
   };
 }
 
-function buildMcpServer() {
+function buildMcpServer(accessContext) {
   const server = new McpServer({
     name: config.serviceName,
     version: "0.1.0",
@@ -810,7 +645,7 @@ function buildMcpServer() {
     captureThoughtSchema,
     async (args) => {
       try {
-        return jsonToolResult(await handleCaptureThought(args));
+        return jsonToolResult(await handleCaptureThought(args, accessContext));
       } catch (error) {
         return errorToolResult(error);
       }
@@ -823,7 +658,7 @@ function buildMcpServer() {
     searchThoughtsSchema,
     async (args) => {
       try {
-        return jsonToolResult(await handleSearchThoughts(args));
+        return jsonToolResult(await handleSearchThoughts(args, accessContext));
       } catch (error) {
         return errorToolResult(error);
       }
@@ -836,7 +671,7 @@ function buildMcpServer() {
     listThoughtsSchema,
     async (args) => {
       try {
-        return jsonToolResult(await handleListThoughts(args));
+        return jsonToolResult(await handleListThoughts(args, accessContext));
       } catch (error) {
         return errorToolResult(error);
       }
@@ -849,7 +684,7 @@ function buildMcpServer() {
     {},
     async () => {
       try {
-        return jsonToolResult(await handleStats());
+        return jsonToolResult(await handleStats(accessContext));
       } catch (error) {
         return errorToolResult(error);
       }
@@ -862,7 +697,7 @@ function buildMcpServer() {
     askBrainSchema,
     async (args) => {
       try {
-        return jsonToolResult(await handleAskBrain(args));
+        return jsonToolResult(await handleAskBrain(args, accessContext));
       } catch (error) {
         return errorToolResult(error);
       }
@@ -875,7 +710,7 @@ function buildMcpServer() {
     graphNeighborsSchema,
     async (args) => {
       try {
-        return jsonToolResult(await handleGraphNeighbors(args));
+        return jsonToolResult(await handleGraphNeighbors(args, accessContext));
       } catch (error) {
         return errorToolResult(error);
       }
@@ -888,7 +723,7 @@ function buildMcpServer() {
     sourceLineageSchema,
     async (args) => {
       try {
-        return jsonToolResult(await handleSourceLineage(args));
+        return jsonToolResult(await handleSourceLineage(args, accessContext));
       } catch (error) {
         return errorToolResult(error);
       }
@@ -901,7 +736,7 @@ function buildMcpServer() {
     whyConnectedSchema,
     async (args) => {
       try {
-        return jsonToolResult(await handleWhyConnected(args));
+        return jsonToolResult(await handleWhyConnected(args, accessContext));
       } catch (error) {
         return errorToolResult(error);
       }
@@ -914,7 +749,7 @@ function buildMcpServer() {
     expandContextSchema,
     async (args) => {
       try {
-        return jsonToolResult(await handleExpandContext(args));
+        return jsonToolResult(await handleExpandContext(args, accessContext));
       } catch (error) {
         return errorToolResult(error);
       }
@@ -933,6 +768,7 @@ app.get("/", (c) => {
     version: "0.1.0",
     transport: "streamable-http",
     endpoint: "/mcp",
+    brain_endpoint: "/mcp/brains/:brainSlug",
   });
 });
 
@@ -972,150 +808,119 @@ app.get("/health", async (c) => {
 });
 
 app.post("/ingest/thought", async (c) => {
-  const key = authKey(c);
-  if (!key || key !== config.accessKey) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
   try {
+    const accessContext = await resolveAccessContext(c);
     const payload = captureThoughtInput.parse(await c.req.json());
-    const result = await handleCaptureThought(payload);
+    const result = await handleCaptureThought(payload, accessContext);
     return c.json(result, 201);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const status = error instanceof z.ZodError ? 400 : 500;
-    return c.json({ success: false, error: message }, status);
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
 });
 
 app.post("/ask", async (c) => {
-  const key = authKey(c);
-  if (!key || key !== config.accessKey) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
   try {
+    const accessContext = await resolveAccessContext(c);
     const payload = askBrainInput.parse(await c.req.json());
-    const result = await handleAskBrain(payload);
+    const result = await handleAskBrain(payload, accessContext);
     return c.json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const status = error instanceof z.ZodError ? 400 : 500;
-    return c.json({ success: false, error: message }, status);
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
 });
 
 app.post("/admin/thought/metadata", async (c) => {
-  const key = authKey(c);
-  if (!key || key !== config.accessKey) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
   try {
+    const accessContext = await resolveAccessContext(c);
     const payload = updateThoughtMetadataInput.parse(await c.req.json());
     const result = await updateThoughtMetadata({
+      brainId: accessContext.effectiveBrainId,
       thoughtId: payload.thought_id,
       metadataPatch: payload.metadata_patch,
     });
     return c.json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const status = error instanceof z.ZodError ? 400 : 500;
-    return c.json({ success: false, error: message }, status);
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
 });
 
 app.post("/admin/thought/similar", async (c) => {
-  const key = authKey(c);
-  if (!key || key !== config.accessKey) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
   try {
+    const accessContext = await resolveAccessContext(c);
     const payload = similarThoughtLookupInput.parse(await c.req.json());
-    const result = await handleSimilarThoughtLookup(payload);
+    const result = await handleSimilarThoughtLookup(payload, accessContext);
     return c.json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    const status = error instanceof z.ZodError ? 400 : 500;
-    return c.json({ success: false, error: message }, status);
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
 });
 
 app.post("/graph/neighbors", async (c) => {
-  const key = authKey(c);
-  if (!key || key !== config.accessKey) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
   try {
+    const accessContext = await resolveAccessContext(c);
     const payload = await c.req.json();
-    const result = await handleGraphNeighbors(payload);
+    const result = await handleGraphNeighbors(payload, accessContext);
     return c.json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return c.json({ success: false, error: message }, 500);
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
 });
 
 app.post("/graph/source-lineage", async (c) => {
-  const key = authKey(c);
-  if (!key || key !== config.accessKey) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
   try {
+    const accessContext = await resolveAccessContext(c);
     const payload = await c.req.json();
-    const result = await handleSourceLineage(payload);
+    const result = await handleSourceLineage(payload, accessContext);
     return c.json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return c.json({ success: false, error: message }, 500);
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
 });
 
 app.post("/graph/why-connected", async (c) => {
-  const key = authKey(c);
-  if (!key || key !== config.accessKey) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
   try {
+    const accessContext = await resolveAccessContext(c);
     const payload = await c.req.json();
-    const result = await handleWhyConnected(payload);
+    const result = await handleWhyConnected(payload, accessContext);
     return c.json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return c.json({ success: false, error: message }, 500);
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
 });
 
 app.post("/graph/expand-context", async (c) => {
-  const key = authKey(c);
-  if (!key || key !== config.accessKey) {
-    return c.json({ error: "Unauthorized" }, 401);
-  }
-
   try {
+    const accessContext = await resolveAccessContext(c);
     const payload = await c.req.json();
-    const result = await handleExpandContext(payload);
+    const result = await handleExpandContext(payload, accessContext);
     return c.json(result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return c.json({ success: false, error: message }, 500);
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
 });
 
 app.post("/mcp", async (c) => {
-  const key = authKey(c);
-  if (!key || key !== config.accessKey) {
-    return c.json({ error: "Unauthorized" }, 401);
+  try {
+    const accessContext = await resolveAccessContext(c);
+    const server = buildMcpServer(accessContext);
+    const transport = new StreamableHTTPTransport();
+    await server.connect(transport);
+    return transport.handleRequest(c);
+  } catch (error) {
+    return c.json({ error: errorMessage(error) }, errorStatus(error));
   }
+});
 
-  const server = buildMcpServer();
-  const transport = new StreamableHTTPTransport();
-  await server.connect(transport);
-  return transport.handleRequest(c);
+app.post("/mcp/brains/:brainSlug", async (c) => {
+  try {
+    const accessContext = await resolveAccessContext(c, { routeBrainSlug: routeBrainSlug(c) });
+    const server = buildMcpServer(accessContext);
+    const transport = new StreamableHTTPTransport();
+    await server.connect(transport);
+    return transport.handleRequest(c);
+  } catch (error) {
+    return c.json({ error: errorMessage(error) }, errorStatus(error));
+  }
 });
 
 export async function shutdown() {
