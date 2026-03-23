@@ -57,6 +57,7 @@ It is a storage, retrieval, graph, and capture-isolation problem.
 - Multi-host distributed tenancy
 - Requiring a separate PostgreSQL database per household member
 - Requiring a separate Neo4j database per household member in v1
+- Directly changing Consul-managed infrastructure from this repo
 
 ## Product Position
 
@@ -68,6 +69,7 @@ The intended model is:
 - the family may also have a shared brain
 - human users authenticate through Keycloak
 - the public MCP/HTTP path is protected by Traefik forward-auth and oauth2-proxy
+- the public household path terminates at a sysadmin-managed stable OB1 service running from `main`
 - internal services and background jobs use OB1-managed service keys
 - the active brain is resolved server-side and enforced server-side
 
@@ -77,6 +79,50 @@ The system should feel like:
 - multiple private memory spaces
 - optional shared family memory
 - one family sign-in flow instead of many static user keys
+
+## Operational Boundary
+
+This repo owns:
+
+- OB1 schema changes
+- OB1 runtime changes
+- OB1 integrations and importers
+- OB1 documentation and handoff requirements
+
+This repo does not own live changes to Consul-managed platform services such as:
+
+- Traefik
+- oauth2-proxy
+- Keycloak
+- other shared services registered in Consul
+
+Any required changes to those services must be handed off to the sysadmin team.
+The PRD may specify those dependencies, but implementation in this repo must not assume those changes can be applied here directly.
+
+## Deployment Split
+
+Use two OB1 runtimes:
+
+- stable OB1 service
+  - sysadmin-managed
+  - runs from the `main` branch
+  - intended public/household target
+  - example fixed port: `8788`
+- development OB1 runtime
+  - user-managed
+  - runs from the working tree via `devenv up open_brain_local`
+  - intended for local development, testing, and verification only
+  - current local port: `8787`
+
+The public household-authenticated MCP route should target the stable service, not the development runtime.
+
+Example split:
+
+- stable/public:
+  - `https://ob1.lincoln.luchoh.net/mcp`
+  - `https://ob1.lincoln.luchoh.net/mcp/brains/:brain_slug`
+- local/dev:
+  - `http://localhost:8787`
 
 ## User Model
 
@@ -119,7 +165,7 @@ An `identity binding` maps an external authenticated identity onto a principal.
 
 The main v1 human identity source is:
 
-- Keycloak subject and preferred username forwarded by the trusted proxy path
+- Keycloak token claims validated by OB1, especially stable `sub`
 
 Service identities remain separate:
 
@@ -164,12 +210,12 @@ Reason:
 - easier reuse of current importer/runtime code
 - easier future shared-brain workflows
 
-### 3. Human users authenticate with Keycloak identity, not per-user static MCP keys
+### 3. Human users authenticate with validated Keycloak identity, not per-user static MCP keys
 
 The current single `MCP_ACCESS_KEY` model becomes a split model:
 
 - human users authenticate through the existing Keycloak -> oauth2-proxy -> Traefik path
-- OB1 resolves trusted forwarded identity headers into a principal
+- OB1 validates the forwarded Keycloak access token and resolves identity from token claims
 - internal services and background jobs continue to use OB1-managed service keys
 - one legacy bootstrap/admin key remains for local administration and migration
 
@@ -188,6 +234,8 @@ Reason:
 - matches the auth stack already present on this machine
 - keeps human auth in the identity provider, not in ad hoc shared secrets
 - still preserves an internal key path for non-human workers
+
+The authoritative human identity source is the validated token `sub`, not mutable username or email headers.
 
 ### 3a. MCP remains the protocol
 
@@ -428,11 +476,18 @@ Resolution should support two trusted auth sources.
 ### Human request path
 
 1. request arrives through the trusted proxy path
-2. OB1 reads forwarded identity headers supplied by Traefik/oauth2-proxy
-3. OB1 resolves the Keycloak identity binding into a principal
-4. OB1 loads memberships and default brain
-5. if the route/session requests a specific allowed brain, use it
-6. otherwise use the principal default brain
+2. OB1 reads a forwarded Keycloak access token from:
+   - `X-Auth-Request-Access-Token`
+   - or `Authorization: Bearer ...` if explicitly enabled later
+3. OB1 validates that token against the configured Keycloak issuer and extracts:
+   - `sub`
+   - `preferred_username`
+   - `email`
+   - role/group claims if needed
+4. OB1 resolves the Keycloak identity binding from `provider = keycloak` and `subject = sub`
+5. OB1 loads memberships and default brain
+6. if the route/session requests a specific allowed brain, use it
+7. otherwise use the principal default brain
 
 ### Service/admin request path
 
@@ -445,8 +500,19 @@ Resolution should support two trusted auth sources.
    - verify it is allowed
 6. apply `effective_brain_id` to all reads and writes
 
-The runtime must never trust forwarded identity headers from arbitrary callers.
-That trust is only valid on the local/internal path behind the configured reverse proxy.
+The runtime must never trust `X-Auth-Request-*` identity headers by themselves.
+Those headers are advisory only unless accompanied by a valid Keycloak token that OB1 has verified.
+
+The runtime must also remain on a non-public interface.
+The public human path is:
+
+- internet/client
+- Traefik
+- oauth2-proxy
+- stable OB1 upstream on loopback or private-only bind
+
+Do not expose the OB1 human-auth upstream directly on a public interface.
+Do not point the public household route at the development runtime.
 
 ## API Changes
 
@@ -460,15 +526,18 @@ Add a public OB1 route behind:
 
 Do not assume OB1 should reuse the existing dictation role policy.
 Provision a dedicated OB1 Keycloak client and household-access role/group policy for this route.
+This is a sysadmin-managed dependency, not a change this repo can apply by itself.
+That public route should target the stable service instance, not the developer `devenv` process.
 
 Expected forwarded identity inputs from the trusted proxy path:
 
+- `X-Auth-Request-Access-Token` as the primary token source
 - `X-Auth-Request-Preferred-Username`
 - `X-Auth-Request-Email`
 - `X-Auth-Request-User`
-- `Authorization` or forwarded access-token header if needed later
+- `Authorization` only if explicitly enabled for a future direct bearer-token client path
 
-The runtime should primarily bind humans by stable Keycloak subject/user identity, not by client-held static secrets.
+The runtime should primarily bind humans by the validated Keycloak token `sub`, not by mutable forwarded username/email values and not by client-held static secrets.
 
 ### Brain Selection
 
@@ -482,6 +551,13 @@ v1 acceptable shapes are:
 
 Do not assume per-tool header switching in v1.
 
+The concrete v1 MCP route shape should be:
+
+- `/mcp` -> principal default brain
+- `/mcp/brains/:brain_slug` -> explicit requested brain for that connector
+
+The server must resolve `:brain_slug` inside the authenticated principal's household and reject unauthorized access.
+
 ### MCP Connection Model
 
 For MCP specifically:
@@ -489,13 +565,20 @@ For MCP specifically:
 - OB1 still exposes MCP
 - the human-facing MCP route is protected by Keycloak-authenticated proxying
 - tool schemas do not gain `brain_id` or `brain_slug` parameters in the first slice
-- users may connect to different brains by using different MCP connectors or route targets
+- users may connect to different brains by using different MCP connectors pointed at different MCP URLs
 - those connectors should reuse the same human identity session rather than different static user keys
+
+Practical compatibility note:
+
+- not every MCP client will handle browser-style OAuth/proxy login equally well
+- v1 should target app/browser-capable MCP clients or a household app/gateway that can complete the sign-in flow reliably
+- direct raw-client OAuth support can be expanded later if needed
 
 Examples:
 
-- `OB1 Personal (Lucho)` -> Keycloak-authenticated MCP connector targeting Lucho personal brain
-- `OB1 Shared Household` -> Keycloak-authenticated MCP connector targeting shared household brain
+- `OB1 Personal (Lucho)` -> `.../mcp/brains/lucho`
+- `OB1 Shared Household` -> `.../mcp/brains/household`
+- `OB1 Default` -> `.../mcp`
 
 This keeps the MCP tool surface stable and avoids relying on client-specific per-call header tricks.
 It also keeps MCP usable for the household model.
@@ -638,7 +721,8 @@ That means:
 - identical content across brains must not collide
 - graph expansion must not leak another person's evidence
 - access keys must be hashed at rest
-- human identity headers must only be trusted from the configured reverse-proxy path
+- human identity must be derived from a validated Keycloak token, not bare forwarded headers
+- the human-auth upstream must remain loopback-only or otherwise non-public behind the reverse proxy
 - admin/bootstrap access should be limited and clearly documented
 
 ## Acceptance Criteria
@@ -661,8 +745,9 @@ The first implementation slice should be:
 3. scoped dedupe
 4. trusted human identity resolution from the existing Keycloak/oauth2-proxy/Traefik path
 5. service/admin key resolution for non-human callers
-6. brain-scoped capture, search, ask, list, and stats
-7. graph features disabled for non-admin multitenant requests until phase 3
+6. explicit MCP route-level brain selection via `/mcp` and `/mcp/brains/:brain_slug`
+7. brain-scoped capture, search, ask, list, and stats
+8. graph features disabled for non-admin multitenant requests until phase 3
 
 Do not start with:
 
@@ -671,3 +756,15 @@ Do not start with:
 - per-row sharing semantics
 
 The storage and auth boundary must be correct first.
+
+## External Service Dependencies
+
+The following non-OB1 changes are expected to be sysadmin-owned if and when this PRD is implemented:
+
+- a stable OB1 runtime running from `main`, separate from the developer runtime
+- Traefik public route for OB1 human-authenticated MCP access
+- oauth2-proxy policy for the OB1 route
+- dedicated Keycloak client, redirect configuration, and household access role/group policy
+- any Consul registration or routing changes needed for the public OB1 MCP route
+
+These should be handled through a separate sysadmin handoff document when implementation begins.
