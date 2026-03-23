@@ -52,7 +52,6 @@ It is a storage, retrieval, graph, and capture-isolation problem.
 ## Non-Goals
 
 - Full SaaS user management
-- OAuth or hosted identity providers
 - Fine-grained per-thought ACLs in v1
 - Arbitrary team/workspace permissions
 - Multi-host distributed tenancy
@@ -67,14 +66,17 @@ The intended model is:
 
 - each person has a personal brain
 - the family may also have a shared brain
-- clients authenticate with a local access key
-- the active brain is resolved locally and enforced server-side
+- human users authenticate through Keycloak
+- the public MCP/HTTP path is protected by Traefik forward-auth and oauth2-proxy
+- internal services and background jobs use OB1-managed service keys
+- the active brain is resolved server-side and enforced server-side
 
 The system should feel like:
 
 - one OB1 service
 - multiple private memory spaces
 - optional shared family memory
+- one family sign-in flow instead of many static user keys
 
 ## User Model
 
@@ -110,6 +112,20 @@ A principal may have:
 
 - one default personal brain
 - access to additional brains, such as the shared household brain
+
+### Identity Binding
+
+An `identity binding` maps an external authenticated identity onto a principal.
+
+The main v1 human identity source is:
+
+- Keycloak subject and preferred username forwarded by the trusted proxy path
+
+Service identities remain separate:
+
+- Telegram bridge
+- dictation importer
+- future internal workers
 
 ### Household
 
@@ -148,25 +164,54 @@ Reason:
 - easier reuse of current importer/runtime code
 - easier future shared-brain workflows
 
-### 3. Use server-side access-key resolution, not client-trusted brain ids
+### 3. Human users authenticate with Keycloak identity, not per-user static MCP keys
 
-The current single `MCP_ACCESS_KEY` model becomes:
+The current single `MCP_ACCESS_KEY` model becomes a split model:
 
-- one bootstrap/admin key for local administration and migration
-- one or more principal access keys stored in OB1 metadata tables
+- human users authenticate through the existing Keycloak -> oauth2-proxy -> Traefik path
+- OB1 resolves trusted forwarded identity headers into a principal
+- internal services and background jobs continue to use OB1-managed service keys
+- one legacy bootstrap/admin key remains for local administration and migration
 
-Requests must authenticate with an access key that resolves to:
+Human requests must resolve from trusted identity into:
 
 - principal id
+- household id
 - allowed brain ids
 - default brain id
 
-The client may request a specific target brain only if the principal is authorized for it.
+Service-key requests must resolve into the same access context, but from a stored OB1 credential instead of Keycloak identity.
 
 Reason:
 
-- prevents trivial cross-brain spoofing
-- allows shared-household access without full external auth
+- avoids one static MCP key per family member
+- matches the auth stack already present on this machine
+- keeps human auth in the identity provider, not in ad hoc shared secrets
+- still preserves an internal key path for non-human workers
+
+### 3a. MCP remains the protocol
+
+Multitenancy does not replace MCP.
+
+The design is:
+
+- OB1 remains an MCP server
+- human MCP access goes through an authenticated public MCP route
+- services and local automation may continue to call the internal OB1 runtime directly with service/admin keys
+
+In v1, human MCP sessions should still be effectively single-brain per connector/session.
+The difference is:
+
+- not one static key per brain
+- instead, one authenticated user session with a connector or route that chooses the target brain context
+
+Practical consequence:
+
+- a user may still keep separate MCP connectors for `personal` and `shared household`
+- but both connectors are authenticated by the same Keycloak user session, not two different long-lived secrets
+
+Do not depend on MCP clients varying custom headers per tool call in v1.
+If per-call brain switching is needed later, it should be implemented as an explicit OB1 feature, not assumed from client behavior.
 
 ### 4. Shared household memory is a separate brain, not a flag on personal rows
 
@@ -192,7 +237,7 @@ That means:
 
 - each projected node carries `brain_id`
 - graph queries constrain expansion to the active brain
-- canonical ids and projection state remain stable
+- canonical ids remain stable within a brain-qualified namespace
 
 Do not require per-brain Neo4j databases in v1.
 
@@ -201,6 +246,15 @@ Reason:
 - lower operational burden
 - easier migration of the current graph tooling
 - preserves one graph runtime while still enforcing isolation
+
+Concretely:
+
+- Neo4j `canonical_id` values must be brain-qualified
+- for example, a conversation node becomes conceptually:
+  - `brain:<brain_id>:conversation:chatgpt:<conversation_id>`
+- raw external identifiers such as chat conversation ids or document hashes remain separate node properties
+
+This avoids accidental cross-brain merges when two brains import the same external source artifact.
 
 ## Data Model
 
@@ -259,13 +313,39 @@ Initial roles:
 - `member`
 - `capture_agent`
 
+#### `principal_identity_bindings`
+
+- `id uuid primary key`
+- `principal_id uuid not null references brain_principals(id)`
+- `provider text not null`
+- `subject text not null`
+- `preferred_username text`
+- `email text`
+- `is_active boolean not null default true`
+- `last_seen_at timestamptz`
+- `created_at timestamptz`
+- `updated_at timestamptz`
+
+Uniqueness:
+
+- `(provider, subject)`
+
+Notes:
+
+- v1 human provider is `keycloak`
+- match should use stable subject first, with username/email as supporting attributes
+- this is the main human-auth resolution path
+
 #### `brain_access_keys`
 
 - `id uuid primary key`
 - `principal_id uuid not null references brain_principals(id)`
+- `brain_id uuid references brains(id)`
 - `key_hash text not null`
 - `label text not null`
+- `credential_type text not null`
 - `is_active boolean not null default true`
+- `is_admin boolean not null default false`
 - `last_used_at timestamptz`
 - `created_at timestamptz`
 - `updated_at timestamptz`
@@ -274,6 +354,31 @@ Notes:
 
 - store hashes, not plaintext keys
 - plaintext keys are only shown at creation time
+- human users should not normally use these keys directly
+- normal service keys should be bound to exactly one brain when possible
+- `credential_type` should distinguish:
+  - `service`
+  - `admin`
+  - future migration/compat paths if needed
+
+#### `principal_capture_routes`
+
+- `id uuid primary key`
+- `principal_id uuid not null references brain_principals(id)`
+- `brain_id uuid not null references brains(id)`
+- `channel text not null`
+- `external_subject text not null`
+- `created_at timestamptz`
+- `updated_at timestamptz`
+
+Uniqueness:
+
+- `(channel, external_subject)`
+
+Examples:
+
+- `channel = 'telegram'`, `external_subject = '<telegram_user_id>'`
+- future capture adapters can reuse the same pattern
 
 ### Changes To Existing Tables
 
@@ -318,33 +423,82 @@ Every authenticated request resolves to an `access context`:
 - `effective_brain_id`
 - `is_admin`
 
-Resolution order:
+Resolution should support two trusted auth sources.
 
-1. validate the access key
-2. load principal and memberships
-3. if request explicitly asks for a brain, verify membership
-4. otherwise use principal default brain
-5. apply `effective_brain_id` to all reads and writes
+### Human request path
+
+1. request arrives through the trusted proxy path
+2. OB1 reads forwarded identity headers supplied by Traefik/oauth2-proxy
+3. OB1 resolves the Keycloak identity binding into a principal
+4. OB1 loads memberships and default brain
+5. if the route/session requests a specific allowed brain, use it
+6. otherwise use the principal default brain
+
+### Service/admin request path
+
+1. validate the service or bootstrap/admin key
+2. if it is the legacy bootstrap/admin key, mark `is_admin = true`
+3. otherwise load the stored key, principal, and memberships
+4. if the key is brain-bound, use that brain as `effective_brain_id`
+5. only if the request is an admin/service path that supports explicit override:
+   - resolve requested brain
+   - verify it is allowed
+6. apply `effective_brain_id` to all reads and writes
+
+The runtime must never trust forwarded identity headers from arbitrary callers.
+That trust is only valid on the local/internal path behind the configured reverse proxy.
 
 ## API Changes
 
-### New Headers / Query Parameters
+### Public Authenticated Route
 
-Add optional request brain selection:
+Add a public OB1 route behind:
 
-- `x-brain-slug`
-- or `brain` query parameter
+- Traefik
+- oauth2-proxy
+- Keycloak
 
-These are optional.
+Do not assume OB1 should reuse the existing dictation role policy.
+Provision a dedicated OB1 Keycloak client and household-access role/group policy for this route.
 
-If omitted:
+Expected forwarded identity inputs from the trusted proxy path:
 
-- use the principal default brain
+- `X-Auth-Request-Preferred-Username`
+- `X-Auth-Request-Email`
+- `X-Auth-Request-User`
+- `Authorization` or forwarded access-token header if needed later
 
-If provided:
+The runtime should primarily bind humans by stable Keycloak subject/user identity, not by client-held static secrets.
 
-- resolve the slug inside the principal's household
-- reject if not allowed
+### Brain Selection
+
+Brain selection should be explicit at the connector or route level, not hidden in arbitrary per-tool headers.
+
+v1 acceptable shapes are:
+
+- one public MCP route per brain context
+- or one connector configuration per brain context
+- or one default brain per user with an optional explicit server-supported override for non-MCP HTTP/admin flows
+
+Do not assume per-tool header switching in v1.
+
+### MCP Connection Model
+
+For MCP specifically:
+
+- OB1 still exposes MCP
+- the human-facing MCP route is protected by Keycloak-authenticated proxying
+- tool schemas do not gain `brain_id` or `brain_slug` parameters in the first slice
+- users may connect to different brains by using different MCP connectors or route targets
+- those connectors should reuse the same human identity session rather than different static user keys
+
+Examples:
+
+- `OB1 Personal (Lucho)` -> Keycloak-authenticated MCP connector targeting Lucho personal brain
+- `OB1 Shared Household` -> Keycloak-authenticated MCP connector targeting shared household brain
+
+This keeps the MCP tool surface stable and avoids relying on client-specific per-call header tricks.
+It also keeps MCP usable for the household model.
 
 ### Existing Endpoints
 
@@ -380,10 +534,16 @@ Graph projection must preserve brain boundaries.
 Requirements:
 
 - projected thought nodes carry `brain_id`
+- projected non-thought nodes use brain-qualified canonical ids
 - source and derived nodes connected to a thought remain scoped to that brain
 - graph neighbor search, lineage, why-connected, and context expansion all constrain to the same brain
 
 If a future shared artifact truly needs cross-brain linkage, it should be modeled explicitly later, not leaked implicitly in v1.
+
+Interim safety rule:
+
+- before graph scoping is implemented, graph-assisted retrieval and graph endpoints must be disabled for non-admin multitenant requests
+- do not allow partially scoped graph behavior to ship
 
 ## Capture And Import Requirements
 
@@ -403,14 +563,39 @@ Service principals are valid principals.
 
 Examples:
 
-- wife's Telegram bot key -> wife's personal brain
-- shared household Telegram bot key -> household shared brain
+- wife's Keycloak-authenticated MCP session -> wife's personal brain
+- household shared MCP session -> household shared brain
+- Telegram bridge service key -> routed personal brain via capture routing
+
+### Telegram Routing Decision
+
+Telegram is the concrete v1 routing case and must be specified explicitly.
+
+Use one household Telegram bot by default.
+
+Routing model:
+
+- the bridge reads `telegram_user_id`
+- `telegram_user_id` resolves through `principal_capture_routes`
+- that route maps to one principal and one target brain
+- the default route for a family member is their personal brain
+
+This avoids requiring one separate bot per household member.
+
+Shared-household Telegram capture is not required in the first implementation slice.
+If we add it later, it should be explicit, for example:
+
+- a second shared bot
+- or a deliberate share command / review action
+
+It should not happen implicitly.
 
 ## Migration Strategy
 
 ### Phase 1: Foundation
 
 - create `households`, `brains`, `brain_principals`, `brain_memberships`, `brain_access_keys`
+- create `principal_identity_bindings`
 - create one bootstrap household
 - create one owner personal brain
 - backfill all existing `thoughts` rows into that owner brain
@@ -418,14 +603,17 @@ Examples:
 
 ### Phase 2: Runtime Auth Context
 
-- replace single-key check with access-key lookup
+- add human identity resolution from trusted proxy headers
 - keep legacy `MCP_ACCESS_KEY` as bootstrap admin key for migration and local admin calls
+- retain OB1-managed service keys for background jobs and integrations
 - add effective-brain resolution to all handlers
+- support connector- or route-level brain targeting for authenticated human MCP use
 
 ### Phase 3: Graph Scoping
 
 - add `brain_id` to graph projection state
 - add `brain_id` to projected nodes
+- brain-qualify canonical ids for non-thought nodes
 - constrain graph traversal by effective brain
 
 ### Phase 4: Capture Integration Wiring
@@ -442,6 +630,7 @@ That means:
 - existing `MCP_ACCESS_KEY` still works as admin/bootstrap access
 - existing thoughts remain retrievable under the migrated owner brain
 - existing integrations can keep working while being gradually reassigned to service principals
+- MCP users can continue with one connector initially, then add per-brain authenticated connectors as household access is introduced
 
 ## Security And Privacy Requirements
 
@@ -449,6 +638,7 @@ That means:
 - identical content across brains must not collide
 - graph expansion must not leak another person's evidence
 - access keys must be hashed at rest
+- human identity headers must only be trusted from the configured reverse-proxy path
 - admin/bootstrap access should be limited and clearly documented
 
 ## Acceptance Criteria
@@ -459,6 +649,7 @@ That means:
 - graph-assisted retrieval never crosses brain boundaries
 - identical content can be stored in two brains without conflict
 - Telegram and dictation captures can be targeted to a chosen brain
+- household users can access MCP through Keycloak-authenticated identity without one static user key per person
 - the existing single-user corpus is migrated safely into the owner brain
 
 ## First Implementation Slice
@@ -468,8 +659,10 @@ The first implementation slice should be:
 1. migration-backed household/brain tables
 2. `brain_id` on `thoughts`
 3. scoped dedupe
-4. access-key resolution with default-brain enforcement
-5. brain-scoped capture, search, ask, list, and stats
+4. trusted human identity resolution from the existing Keycloak/oauth2-proxy/Traefik path
+5. service/admin key resolution for non-human callers
+6. brain-scoped capture, search, ask, list, and stats
+7. graph features disabled for non-admin multitenant requests until phase 3
 
 Do not start with:
 
