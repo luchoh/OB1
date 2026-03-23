@@ -125,11 +125,22 @@ The runtime also exposes:
 
 ## Auth
 
-The MCP and ingest endpoints accept:
+Internal admin/service access still accepts:
 
 - `?key=$MCP_ACCESS_KEY`
 - `x-access-key: $MCP_ACCESS_KEY`
 - `x-brain-key: $MCP_ACCESS_KEY`
+
+When `OB1_ENABLE_HUMAN_TOKEN_AUTH=true`, the stable public service may also
+accept a Keycloak-authenticated human request path via:
+
+- `X-Auth-Request-Access-Token`
+- or `Authorization: Bearer ...` if explicitly enabled by the upstream auth bridge
+
+Human-facing MCP routes in the multitenant model are:
+
+- `POST /mcp` for the default brain
+- `POST /mcp/brains/:brainSlug` for an explicitly selected brain
 
 ## HTTP Ingest
 
