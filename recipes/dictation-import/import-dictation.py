@@ -33,6 +33,7 @@ from recipes.shared_docling import (
     sha256_text,
     truncate_text,
 )
+from recipes.shared_object_store import first_env, resolve_minio_endpoint
 from recipes.shared_telegram_review_state import (
     default_review_state_path,
     locked_review_state,
@@ -50,7 +51,8 @@ DEFAULT_ACCESS_KEY = os.environ.get("MCP_ACCESS_KEY") or os.environ.get("OPEN_BR
 DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
 DEFAULT_BUCKET = os.environ.get("DICTATION_MINIO_BUCKET") or "dictation-artifacts"
 DEFAULT_PREFIX = os.environ.get("DICTATION_MINIO_PREFIX") or "canonical/"
-DEFAULT_MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT") or os.environ.get("DICTATION_MINIO_ENDPOINT") or ""
+DEFAULT_MINIO_ENDPOINT = first_env("MINIO_ENDPOINT", "DICTATION_MINIO_ENDPOINT")
+DEFAULT_MINIO_SERVICE_NAME = first_env("MINIO_SERVICE_NAME", "DICTATION_MINIO_SERVICE_NAME", default="minio")
 DEFAULT_MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY") or os.environ.get("DICTATION_MINIO_ACCESS_KEY") or ""
 DEFAULT_MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY") or os.environ.get("DICTATION_MINIO_SECRET_KEY") or ""
 DEFAULT_MINIO_SECURE = (os.environ.get("MINIO_SECURE") or os.environ.get("DICTATION_MINIO_SECURE") or "true").strip().lower() in (
@@ -176,7 +178,12 @@ def parse_args():
     parser.add_argument("--access-key", default=DEFAULT_ACCESS_KEY, help="Open Brain ingest access key.")
     parser.add_argument("--bucket", default=DEFAULT_BUCKET, help="MinIO bucket containing canonical dictation artifacts.")
     parser.add_argument("--prefix", default=DEFAULT_PREFIX, help="MinIO key prefix to scan.")
-    parser.add_argument("--minio-endpoint", default=DEFAULT_MINIO_ENDPOINT, help="MinIO endpoint host:port.")
+    parser.add_argument(
+        "--minio-endpoint",
+        default=DEFAULT_MINIO_ENDPOINT,
+        help="Explicit MinIO endpoint host:port override. If unset, resolve the service name through Consul.",
+    )
+    parser.add_argument("--minio-service-name", default=DEFAULT_MINIO_SERVICE_NAME, help="Consul service name for MinIO discovery.")
     parser.add_argument("--minio-access-key", default=DEFAULT_MINIO_ACCESS_KEY, help="MinIO access key.")
     parser.add_argument("--minio-secret-key", default=DEFAULT_MINIO_SECRET_KEY, help="MinIO secret key.")
     parser.add_argument("--minio-secure", action=argparse.BooleanOptionalAction, default=DEFAULT_MINIO_SECURE, help="Use HTTPS for MinIO.")
@@ -201,10 +208,10 @@ def parse_args():
     if not args.dry_run and not args.access_key:
         parser.error("Missing access key. Set MCP_ACCESS_KEY or pass --access-key.")
 
-    if not args.artifact_file and not args.object_key and not args.minio_endpoint:
+    if not args.artifact_file and not args.object_key and not (args.minio_endpoint or args.minio_service_name):
         parser.error("Provide --artifact-file, --object-key, or MinIO connection details.")
 
-    if args.object_key and not args.minio_endpoint:
+    if args.object_key and not (args.minio_endpoint or args.minio_service_name):
         parser.error("--object-key requires MinIO connection details.")
 
     return args
@@ -231,8 +238,9 @@ def save_sync_log(path: Path, payload):
 
 
 def minio_client(args):
+    resolved_endpoint = resolve_minio_endpoint(args.minio_endpoint, service_name=args.minio_service_name)
     return Minio(
-        args.minio_endpoint,
+        resolved_endpoint,
         access_key=args.minio_access_key,
         secret_key=args.minio_secret_key,
         secure=args.minio_secure,
@@ -848,7 +856,7 @@ def iter_artifacts(args):
             "text": path.read_text(encoding="utf-8"),
         }
 
-    if not args.minio_endpoint:
+    if not (args.minio_endpoint or args.minio_service_name):
         return
 
     client = minio_client(args)

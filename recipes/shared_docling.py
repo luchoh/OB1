@@ -273,6 +273,55 @@ def collect_chunk_text(chunks):
     ).strip()
 
 
+def _dedupe_preserving_order(values):
+    seen = set()
+    ordered = []
+    for value in values:
+        normalized = (value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        ordered.append(normalized)
+    return ordered
+
+
+def render_markdown_from_chunks(chunks):
+    parts = []
+    last_headings = []
+
+    for chunk in chunks or []:
+        if not isinstance(chunk, dict):
+            continue
+
+        headings = _dedupe_preserving_order(chunk.get("headings") or [])
+        for level, heading in enumerate(headings, start=1):
+            if len(last_headings) >= level and last_headings[level - 1] == heading:
+                continue
+            parts.append(f"{'#' * min(level, 6)} {heading}")
+        if headings:
+            last_headings = headings
+
+        text = (chunk.get("text") or "").strip()
+        if text:
+            parts.append(text)
+
+    return "\n\n".join(part.strip() for part in parts if part and part.strip()).strip()
+
+
+def docling_markdown_artifact(_path_name, extraction):
+    raw_payload = extraction.get("raw_payload") if isinstance(extraction, dict) else None
+    if isinstance(raw_payload, dict):
+        for key in ("markdown", "md", "document_markdown"):
+            value = raw_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    rendered = render_markdown_from_chunks((extraction or {}).get("chunks") or [])
+    if rendered:
+        return rendered
+    return ((extraction or {}).get("document_text") or "").strip()
+
+
 def normalize_extracted_text(text):
     return re.sub(r"\s+", " ", (text or "")).strip()
 

@@ -52,6 +52,7 @@ LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip
 
 from recipes.shared_docling import (
     discover_docling_base_url,
+    docling_markdown_artifact,
     docling_chunk,
     file_content_type,
     ingest_thought,
@@ -59,6 +60,52 @@ from recipes.shared_docling import (
     sha256_text as shared_sha256_text,
     summarize_document,
     truncate_text,
+)
+from recipes.shared_object_store import env_flag, first_env, upload_text
+
+
+DEFAULT_RETAIN_ATTACHMENT_MARKDOWN = env_flag(
+    "OPEN_BRAIN_IMAP_RETAIN_ATTACHMENT_MARKDOWN",
+    "IMAP_ATTACHMENT_RETAIN_MARKDOWN",
+    default=False,
+)
+DEFAULT_MINIO_ENDPOINT = first_env(
+    "MINIO_ENDPOINT",
+    "OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_ENDPOINT",
+    "IMAP_ATTACHMENT_MARKDOWN_MINIO_ENDPOINT",
+)
+DEFAULT_MINIO_SERVICE_NAME = first_env(
+    "MINIO_SERVICE_NAME",
+    "OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_SERVICE_NAME",
+    "IMAP_ATTACHMENT_MARKDOWN_MINIO_SERVICE_NAME",
+    default="minio",
+)
+DEFAULT_MINIO_ACCESS_KEY = first_env(
+    "MINIO_ACCESS_KEY",
+    "OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_ACCESS_KEY",
+    "IMAP_ATTACHMENT_MARKDOWN_MINIO_ACCESS_KEY",
+)
+DEFAULT_MINIO_SECRET_KEY = first_env(
+    "MINIO_SECRET_KEY",
+    "OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_SECRET_KEY",
+    "IMAP_ATTACHMENT_MARKDOWN_MINIO_SECRET_KEY",
+)
+DEFAULT_MINIO_SECURE = env_flag(
+    "MINIO_SECURE",
+    "OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_SECURE",
+    "IMAP_ATTACHMENT_MARKDOWN_MINIO_SECURE",
+    default=True,
+)
+DEFAULT_MINIO_BUCKET = first_env(
+    "OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_BUCKET",
+    "IMAP_ATTACHMENT_MARKDOWN_MINIO_BUCKET",
+    "OPEN_BRAIN_DOCUMENT_MINIO_BUCKET",
+    default="open-brain-document-originals",
+)
+DEFAULT_MINIO_PREFIX = first_env(
+    "OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_PREFIX",
+    "IMAP_ATTACHMENT_MARKDOWN_MINIO_PREFIX",
+    default="imap-attachments/markdown",
 )
 
 THOUGHTS_TOOL = {
@@ -721,7 +768,45 @@ def attachment_virtual_path(record, attachment):
     return f"imap://{mailbox}/{uid}/{attachment['filename']}"
 
 
-def process_attachment(record, attachment, *, docling_base_url, chunker, dry_run=False, no_summaries=False, verbose=False):
+def attachment_markdown_ref(attachment, args, markdown_text):
+    markdown_filename = f"{Path(attachment['filename']).stem}.md"
+    markdown_sha256 = sha256_text(markdown_text)
+
+    if not args.retain_attachment_markdown:
+        return {
+            "storage_backend": "inline_only",
+            "bucket": None,
+            "object_key": None,
+            "retained": False,
+            "filename": markdown_filename,
+            "sha256": markdown_sha256,
+        }
+
+    stored = upload_text(
+        {
+            "endpoint": args.minio_endpoint,
+            "service_name": args.minio_service_name,
+            "access_key": args.minio_access_key,
+            "secret_key": args.minio_secret_key,
+            "secure": args.minio_secure,
+            "bucket": args.minio_bucket,
+            "prefix": args.minio_prefix,
+        },
+        markdown_text,
+        sha256_hex=markdown_sha256,
+        filename=markdown_filename,
+    )
+    return {
+        "storage_backend": stored["storage_backend"],
+        "bucket": stored["bucket"],
+        "object_key": stored["object_key"],
+        "retained": True,
+        "filename": stored["original_filename"],
+        "sha256": markdown_sha256,
+    }
+
+
+def process_attachment(record, attachment, *, docling_base_url, chunker, args, dry_run=False, no_summaries=False, verbose=False):
     with tempfile.TemporaryDirectory(prefix="ob1-imap-attachment-") as tmpdir:
         temp_path = Path(tmpdir) / attachment["filename"]
         temp_path.write_bytes(attachment["data"])
@@ -732,6 +817,15 @@ def process_attachment(record, attachment, *, docling_base_url, chunker, dry_run
         pipeline_used = extraction["pipeline_used"]
         fallback_triggered = extraction["fallback_triggered"]
         quality_signals = extraction["quality_signals"]
+        markdown_text = docling_markdown_artifact(attachment["filename"], extraction)
+        markdown_ref = attachment_markdown_ref(attachment, args, markdown_text) if not dry_run else {
+            "storage_backend": "inline_only",
+            "bucket": None,
+            "object_key": None,
+            "retained": False,
+            "filename": f"{Path(attachment['filename']).stem}.md",
+            "sha256": sha256_text(markdown_text),
+        }
 
         summary_thoughts = []
         summary_error = None
@@ -784,6 +878,20 @@ def process_attachment(record, attachment, *, docling_base_url, chunker, dry_run
             "document_sha256": attachment["sha256"],
             "document_mimetype": attachment["content_type"] or file_content_type(temp_path),
             "document_size_bytes": attachment["size_bytes"],
+            "attachment_original_storage_backend": "imap_attachment",
+            "attachment_original_retained": False,
+            "attachment_markdown_storage_backend": markdown_ref["storage_backend"],
+            "attachment_markdown_bucket": markdown_ref["bucket"],
+            "attachment_markdown_object_key": markdown_ref["object_key"],
+            "attachment_markdown_retained": markdown_ref["retained"],
+            "attachment_markdown_filename": markdown_ref["filename"],
+            "attachment_markdown_sha256": markdown_ref["sha256"],
+            "document_markdown_storage_backend": markdown_ref["storage_backend"],
+            "document_markdown_bucket": markdown_ref["bucket"],
+            "document_markdown_object_key": markdown_ref["object_key"],
+            "document_markdown_retained": markdown_ref["retained"],
+            "document_markdown_filename": markdown_ref["filename"],
+            "document_markdown_sha256": markdown_ref["sha256"],
         }
         dedupe_seed = f"{record['dedupe_key']}:attachment:{attachment['sha256']}"
 
@@ -922,6 +1030,23 @@ def parse_args():
     )
     parser.add_argument("--no-attachment-summaries", action="store_true", help="Skip whole-document summary extraction for attachments.")
     parser.add_argument("--docling-url", help="Override the Docling base URL instead of using env/Consul discovery.")
+    parser.add_argument(
+        "--retain-attachment-markdown",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_RETAIN_ATTACHMENT_MARKDOWN,
+        help="Store attachment-derived Markdown artifacts in MinIO while keeping the original bytes in IMAP.",
+    )
+    parser.add_argument(
+        "--minio-endpoint",
+        default=DEFAULT_MINIO_ENDPOINT,
+        help="Explicit MinIO endpoint host:port override. If unset, resolve the service name through Consul.",
+    )
+    parser.add_argument("--minio-service-name", default=DEFAULT_MINIO_SERVICE_NAME, help="Consul service name for MinIO discovery.")
+    parser.add_argument("--minio-access-key", default=DEFAULT_MINIO_ACCESS_KEY, help="MinIO access key.")
+    parser.add_argument("--minio-secret-key", default=DEFAULT_MINIO_SECRET_KEY, help="MinIO secret key.")
+    parser.add_argument("--minio-secure", action=argparse.BooleanOptionalAction, default=DEFAULT_MINIO_SECURE, help="Use HTTPS for MinIO.")
+    parser.add_argument("--minio-bucket", default=DEFAULT_MINIO_BUCKET, help="MinIO bucket for retained attachment Markdown.")
+    parser.add_argument("--minio-prefix", default=DEFAULT_MINIO_PREFIX, help="MinIO key prefix for retained attachment Markdown.")
     parser.add_argument("--verbose", action="store_true", help="Print sender and subject for each imported message.")
     return parser.parse_args()
 
@@ -961,6 +1086,13 @@ def main():
             return 1
         print(f"docling_base_url={docling_base_url}")
         print(f"attachment_chunker={args.attachment_chunker}")
+        print(f"retain_attachment_markdown={args.retain_attachment_markdown}")
+        if args.retain_attachment_markdown:
+            print(f"minio_service_name={args.minio_service_name}")
+            if args.minio_endpoint:
+                print(f"minio_endpoint_override={args.minio_endpoint}")
+            print(f"minio_bucket={args.minio_bucket}")
+            print(f"minio_prefix={args.minio_prefix}")
     print(f"dry_run={args.dry_run}")
 
     processed = 0
@@ -1046,6 +1178,7 @@ def main():
                                     attachment,
                                     docling_base_url=docling_base_url,
                                     chunker=args.attachment_chunker,
+                                    args=args,
                                     dry_run=True,
                                     no_summaries=args.no_attachment_summaries,
                                     verbose=args.verbose,
@@ -1078,6 +1211,7 @@ def main():
                                 attachment,
                                 docling_base_url=docling_base_url,
                                 chunker=args.attachment_chunker,
+                                args=args,
                                 dry_run=False,
                                 no_summaries=args.no_attachment_summaries,
                                 verbose=args.verbose,
@@ -1119,6 +1253,7 @@ def main():
                                     attachment,
                                     docling_base_url=docling_base_url,
                                     chunker=args.attachment_chunker,
+                                    args=args,
                                     dry_run=True,
                                     no_summaries=args.no_attachment_summaries,
                                     verbose=args.verbose,
@@ -1163,6 +1298,7 @@ def main():
                                 attachment,
                                 docling_base_url=docling_base_url,
                                 chunker=args.attachment_chunker,
+                                args=args,
                                 dry_run=False,
                                 no_summaries=args.no_attachment_summaries,
                                 verbose=args.verbose,

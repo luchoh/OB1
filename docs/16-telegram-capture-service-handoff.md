@@ -24,6 +24,16 @@ Supporting product/infra docs:
 
 ## Required Env
 
+Managed-service auth note:
+
+- the canonical MinIO discovery path for these workers is `CONSUL_HTTP_ADDR` plus `MINIO_SERVICE_NAME`
+- `CONSUL_HTTP_TOKEN` is optional and depends on the Consul ACL setup
+- the MinIO credential contract remains `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, and `MINIO_SECURE`
+- in managed deployments, those values must come from per-service MinIO credentials, not shared developer or admin credentials
+- local workstation development may continue using static MinIO credentials
+- `MINIO_ENDPOINT` is now only an explicit override for isolated/manual runs
+- optional OIDC parity must materialize the same credential env vars before process start; direct worker-side OIDC or STS is not part of this contract today
+
 ### Telegram Bridge
 
 Minimum required values:
@@ -31,7 +41,8 @@ Minimum required values:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_ALLOWED_CHAT_IDS`
 - `MCP_ACCESS_KEY`
-- `MINIO_ENDPOINT`
+- `CONSUL_HTTP_ADDR`
+- `MINIO_SERVICE_NAME=minio`
 - `MINIO_ACCESS_KEY`
 - `MINIO_SECRET_KEY`
 - `TELEGRAM_RAW_AUDIO_BUCKET=telegram-raw-audio`
@@ -52,7 +63,8 @@ Recommended values:
 Minimum required values:
 
 - `MCP_ACCESS_KEY`
-- `MINIO_ENDPOINT`
+- `CONSUL_HTTP_ADDR`
+- `MINIO_SERVICE_NAME=minio`
 - `MINIO_ACCESS_KEY`
 - `MINIO_SECRET_KEY`
 - `DICTATION_MINIO_BUCKET=dictation-artifacts`
@@ -123,7 +135,6 @@ Dictation importer:
 ```bash
 cd /Users/luchoh/Dev/OB1/recipes/dictation-import
 .venv/bin/python import-dictation.py \
-  --minio-endpoint "$MINIO_ENDPOINT" \
   --bucket "$DICTATION_MINIO_BUCKET" \
   --prefix "${DICTATION_MINIO_PREFIX:-canonical/}" \
   --poll \
@@ -148,7 +159,6 @@ After deployment, verify in this order:
    ```bash
    cd /Users/luchoh/Dev/OB1/recipes/dictation-import
    .venv/bin/python import-dictation.py \
-     --minio-endpoint "$MINIO_ENDPOINT" \
      --bucket "$DICTATION_MINIO_BUCKET" \
      --prefix "${DICTATION_MINIO_PREFIX:-canonical/}" \
      --limit 1 \
@@ -211,7 +221,6 @@ Suggested commands:
 - Dictation importer:
   cd /Users/luchoh/Dev/OB1/recipes/dictation-import
   .venv/bin/python import-dictation.py \
-    --minio-endpoint "$MINIO_ENDPOINT" \
     --bucket "$DICTATION_MINIO_BUCKET" \
     --prefix "${DICTATION_MINIO_PREFIX:-canonical/}" \
     --poll \
@@ -222,7 +231,8 @@ Required env for Telegram bridge:
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_ALLOWED_CHAT_IDS
 - MCP_ACCESS_KEY
-- MINIO_ENDPOINT
+- CONSUL_HTTP_ADDR
+- MINIO_SERVICE_NAME=minio
 - MINIO_ACCESS_KEY
 - MINIO_SECRET_KEY
 - TELEGRAM_RAW_AUDIO_BUCKET=telegram-raw-audio
@@ -233,7 +243,8 @@ Required env for Telegram bridge:
 
 Required env for dictation importer:
 - MCP_ACCESS_KEY
-- MINIO_ENDPOINT
+- CONSUL_HTTP_ADDR
+- MINIO_SERVICE_NAME=minio
 - MINIO_ACCESS_KEY
 - MINIO_SECRET_KEY
 - DICTATION_MINIO_BUCKET=dictation-artifacts

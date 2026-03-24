@@ -33,7 +33,8 @@ pip install -r requirements.txt
 
 ```bash
 export MCP_ACCESS_KEY=...
-export MINIO_ENDPOINT=...
+export CONSUL_HTTP_ADDR=...
+export MINIO_SERVICE_NAME=minio
 export MINIO_ACCESS_KEY=...
 export MINIO_SECRET_KEY=...
 export DICTATION_MINIO_BUCKET=dictation-artifacts
@@ -45,6 +46,7 @@ Optional:
 export OPEN_BRAIN_BASE_URL=http://localhost:8787
 export DICTATION_MINIO_PREFIX=canonical/
 export MINIO_SECURE=true
+export CONSUL_HTTP_TOKEN=...  # if Consul ACLs are enabled
 ```
 
 Recommended for Telegram-origin dictation review:
@@ -60,7 +62,6 @@ export TELEGRAM_REVIEW_STATE_FILE=/usr/local/var/ob1-telegram-bridge/telegram-re
 
 ```bash
 python import-dictation.py \
-  --minio-endpoint "$MINIO_ENDPOINT" \
   --bucket "$DICTATION_MINIO_BUCKET" \
   --prefix "${DICTATION_MINIO_PREFIX:-canonical/}"
 ```
@@ -69,7 +70,6 @@ python import-dictation.py \
 
 ```bash
 python import-dictation.py \
-  --minio-endpoint "$MINIO_ENDPOINT" \
   --bucket "$DICTATION_MINIO_BUCKET" \
   --prefix "${DICTATION_MINIO_PREFIX:-canonical/}" \
   --poll \

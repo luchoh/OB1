@@ -33,6 +33,7 @@ from recipes.shared_docling import (
     local_llm_base_url,
     truncate_text,
 )
+from recipes.shared_object_store import first_env, resolve_minio_endpoint
 from recipes.shared_telegram_review_state import (
     default_review_state_path,
     locked_review_state,
@@ -57,7 +58,8 @@ DEFAULT_ALLOWED_CHAT_IDS = [
 ]
 DEFAULT_POLL_TIMEOUT = int(os.environ.get("TELEGRAM_POLL_TIMEOUT_SECONDS", "25"))
 
-DEFAULT_MINIO_ENDPOINT = os.environ.get("MINIO_ENDPOINT") or os.environ.get("TELEGRAM_MINIO_ENDPOINT") or ""
+DEFAULT_MINIO_ENDPOINT = first_env("MINIO_ENDPOINT", "TELEGRAM_MINIO_ENDPOINT")
+DEFAULT_MINIO_SERVICE_NAME = first_env("MINIO_SERVICE_NAME", "TELEGRAM_MINIO_SERVICE_NAME", default="minio")
 DEFAULT_MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY") or os.environ.get("TELEGRAM_MINIO_ACCESS_KEY") or ""
 DEFAULT_MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY") or os.environ.get("TELEGRAM_MINIO_SECRET_KEY") or ""
 DEFAULT_MINIO_SECURE = (os.environ.get("MINIO_SECURE") or os.environ.get("TELEGRAM_MINIO_SECURE") or "true").strip().lower() in (
@@ -196,7 +198,12 @@ def parse_args():
     parser.add_argument("--base-url", default=DEFAULT_OPEN_BRAIN_BASE, help="Open Brain runtime base URL.")
     parser.add_argument("--access-key", default=DEFAULT_OPEN_BRAIN_ACCESS_KEY, help="Open Brain access key.")
     parser.add_argument("--llm-model", default=DEFAULT_LLM_MODEL, help="Local summarizer model.")
-    parser.add_argument("--minio-endpoint", default=DEFAULT_MINIO_ENDPOINT, help="MinIO endpoint host:port.")
+    parser.add_argument(
+        "--minio-endpoint",
+        default=DEFAULT_MINIO_ENDPOINT,
+        help="Explicit MinIO endpoint host:port override. If unset, resolve the service name through Consul.",
+    )
+    parser.add_argument("--minio-service-name", default=DEFAULT_MINIO_SERVICE_NAME, help="Consul service name for MinIO discovery.")
     parser.add_argument("--minio-access-key", default=DEFAULT_MINIO_ACCESS_KEY, help="MinIO access key.")
     parser.add_argument("--minio-secret-key", default=DEFAULT_MINIO_SECRET_KEY, help="MinIO secret key.")
     parser.add_argument("--minio-secure", action=argparse.BooleanOptionalAction, default=DEFAULT_MINIO_SECURE, help="Use HTTPS for MinIO.")
@@ -230,8 +237,8 @@ def parse_args():
         parser.error("Missing Telegram bot token. Set TELEGRAM_BOT_TOKEN or pass --telegram-token.")
     if not args.dry_run and not args.access_key:
         parser.error("Missing OB1 access key. Set MCP_ACCESS_KEY or pass --access-key.")
-    if not args.dry_run and not args.minio_endpoint:
-        parser.error("Missing MinIO endpoint. Set MINIO_ENDPOINT or pass --minio-endpoint.")
+    if not args.dry_run and not (args.minio_endpoint or args.minio_service_name):
+        parser.error("Missing MinIO discovery config. Set MINIO_SERVICE_NAME or pass --minio-endpoint.")
     if not args.dry_run and not args.dictation_access_key:
         parser.error("Missing dictation access key. Set DICTATION_ACCESS_KEY or pass --dictation-access-key.")
 
@@ -262,8 +269,9 @@ def save_state(path: Path, payload):
 
 
 def minio_client(args):
+    resolved_endpoint = resolve_minio_endpoint(args.minio_endpoint, service_name=args.minio_service_name)
     return Minio(
-        args.minio_endpoint,
+        resolved_endpoint,
         access_key=args.minio_access_key,
         secret_key=args.minio_secret_key,
         secure=args.minio_secure,

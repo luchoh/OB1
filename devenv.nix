@@ -7,6 +7,8 @@
   packages = with pkgs; [
     nodejs_22
     python312
+    python312Packages.requests
+    python312Packages.minio
     uv
     jq
     curl
