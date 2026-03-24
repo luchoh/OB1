@@ -24,6 +24,15 @@ def env_flag(*names: str, default: bool = False) -> bool:
     return default
 
 
+def optional_env_flag(*names: str) -> bool | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value is None:
+            continue
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return None
+
+
 def first_env(*names: str, default: str = "") -> str:
     for name in names:
         value = os.environ.get(name)
@@ -163,6 +172,8 @@ def _missing_config_fields(config: dict) -> list[str]:
         if config.get(field):
             continue
         missing.append(field)
+    if config.get("secure") is None:
+        missing.append("secure")
     return missing
 
 

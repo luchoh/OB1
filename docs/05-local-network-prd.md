@@ -65,7 +65,7 @@ The documented OB1 setup depends on external SaaS and public URLs. That conflict
 
 ### Environment Findings
 
-From `.env` and Consul:
+From the local OB1 env contract and Consul:
 
 - Consul is configured and requires a token
 - A PostgreSQL service is registered and reachable on the LAN

@@ -40,7 +40,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 set -a
 source ../../.env.open-brain-local
-source ../../.env
 set +a
 python import-documents.py /path/to/document.pdf --dry-run
 ```
@@ -60,6 +59,8 @@ python import-documents.py /path/to/document.pdf \
   --minio-bucket open-brain-document-originals \
   --minio-prefix documents
 ```
+
+For the current local managed deployment, keep `MINIO_ENDPOINT` unset, discover MinIO through `MINIO_SERVICE_NAME=minio`, and set `MINIO_SECURE=false` explicitly.
 
 To import a directory:
 
@@ -93,6 +94,7 @@ By default the script uses:
 - Docling extraction strategy: OCR-first with automatic VLM fallback on low-quality extraction
 - retained artifact bucket: `OPEN_BRAIN_DOCUMENT_MINIO_BUCKET` or `DOCUMENT_IMPORT_MINIO_BUCKET`, default `open-brain-document-originals`
 - retained artifact prefix: `OPEN_BRAIN_DOCUMENT_MINIO_PREFIX` or `DOCUMENT_IMPORT_MINIO_PREFIX`, default `documents`
+- retained artifact secure mode: set `MINIO_SECURE` explicitly or pass `--minio-secure` / `--no-minio-secure` when using MinIO retention
 
 ## Notes
 
@@ -130,7 +132,7 @@ The harness writes:
 ## Troubleshooting
 
 `Could not discover a passing Docling service in Consul`
-- Load the real `.env` / `.env.open-brain-local`, or pass `--docling-url http://host:port`.
+- Load the real `.env.open-brain-local`, or pass `--docling-url http://host:port`.
 
 `Local OB1 ingest failed (401)`
 - The importer does not have the right `MCP_ACCESS_KEY`.

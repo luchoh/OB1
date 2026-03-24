@@ -13,13 +13,6 @@ if [[ -f ".env.open-brain-local" ]]; then
   set +a
 fi
 
-if [[ -f ".env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source ".env"
-  set +a
-fi
-
 CONSUL_HTTP_ADDR="${CONSUL_HTTP_ADDR:-https://consul.lincoln.luchoh.net}"
 CONSUL_SKIP_TLS_VERIFY="${CONSUL_SKIP_TLS_VERIFY:-false}"
 CONSUL_FORCE_DISCOVERY="${CONSUL_FORCE_DISCOVERY:-false}"

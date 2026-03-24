@@ -61,7 +61,7 @@ from recipes.shared_docling import (
     summarize_document,
     truncate_text,
 )
-from recipes.shared_object_store import env_flag, first_env, upload_text
+from recipes.shared_object_store import env_flag, first_env, optional_env_flag, upload_text
 
 
 DEFAULT_RETAIN_ATTACHMENT_MARKDOWN = env_flag(
@@ -90,11 +90,10 @@ DEFAULT_MINIO_SECRET_KEY = first_env(
     "OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_SECRET_KEY",
     "IMAP_ATTACHMENT_MARKDOWN_MINIO_SECRET_KEY",
 )
-DEFAULT_MINIO_SECURE = env_flag(
+DEFAULT_MINIO_SECURE = optional_env_flag(
     "MINIO_SECURE",
     "OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_SECURE",
     "IMAP_ATTACHMENT_MARKDOWN_MINIO_SECURE",
-    default=True,
 )
 DEFAULT_MINIO_BUCKET = first_env(
     "OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_BUCKET",
@@ -1048,7 +1047,10 @@ def parse_args():
     parser.add_argument("--minio-bucket", default=DEFAULT_MINIO_BUCKET, help="MinIO bucket for retained attachment Markdown.")
     parser.add_argument("--minio-prefix", default=DEFAULT_MINIO_PREFIX, help="MinIO key prefix for retained attachment Markdown.")
     parser.add_argument("--verbose", action="store_true", help="Print sender and subject for each imported message.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.retain_attachment_markdown and not args.dry_run and args.minio_secure is None:
+        parser.error("Missing MinIO secure mode. Set MINIO_SECURE or pass --minio-secure/--no-minio-secure.")
+    return args
 
 
 def main():

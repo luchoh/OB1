@@ -92,7 +92,6 @@ def evaluate_policy(policy_text, cases_path, verbose=False):
         report_path = Path(temp_dir) / "graph-retrieval-report.json"
         policy_path.write_text(policy_text)
 
-        load_env_file(REPO_ROOT / ".env")
         load_env_file(REPO_ROOT / ".env.open-brain-local")
         env = os.environ.copy()
         env.setdefault("OPEN_BRAIN_GRAPH_ENABLED", "true")

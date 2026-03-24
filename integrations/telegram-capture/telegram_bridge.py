@@ -33,7 +33,7 @@ from recipes.shared_docling import (
     local_llm_base_url,
     truncate_text,
 )
-from recipes.shared_object_store import first_env, resolve_minio_endpoint
+from recipes.shared_object_store import first_env, optional_env_flag, resolve_minio_endpoint
 from recipes.shared_telegram_review_state import (
     default_review_state_path,
     locked_review_state,
@@ -62,12 +62,7 @@ DEFAULT_MINIO_ENDPOINT = first_env("MINIO_ENDPOINT", "TELEGRAM_MINIO_ENDPOINT")
 DEFAULT_MINIO_SERVICE_NAME = first_env("MINIO_SERVICE_NAME", "TELEGRAM_MINIO_SERVICE_NAME", default="minio")
 DEFAULT_MINIO_ACCESS_KEY = os.environ.get("MINIO_ACCESS_KEY") or os.environ.get("TELEGRAM_MINIO_ACCESS_KEY") or ""
 DEFAULT_MINIO_SECRET_KEY = os.environ.get("MINIO_SECRET_KEY") or os.environ.get("TELEGRAM_MINIO_SECRET_KEY") or ""
-DEFAULT_MINIO_SECURE = (os.environ.get("MINIO_SECURE") or os.environ.get("TELEGRAM_MINIO_SECURE") or "true").strip().lower() in (
-    "1",
-    "true",
-    "yes",
-    "on",
-)
+DEFAULT_MINIO_SECURE = optional_env_flag("MINIO_SECURE", "TELEGRAM_MINIO_SECURE")
 DEFAULT_RAW_BUCKET = os.environ.get("TELEGRAM_RAW_AUDIO_BUCKET") or "telegram-raw-audio"
 
 DEFAULT_DICTATION_BASE = (os.environ.get("DICTATION_BASE_URL") or "https://dictation.lincoln.luchoh.net").rstrip("/")
@@ -239,6 +234,8 @@ def parse_args():
         parser.error("Missing OB1 access key. Set MCP_ACCESS_KEY or pass --access-key.")
     if not args.dry_run and not (args.minio_endpoint or args.minio_service_name):
         parser.error("Missing MinIO discovery config. Set MINIO_SERVICE_NAME or pass --minio-endpoint.")
+    if not args.dry_run and args.minio_secure is None:
+        parser.error("Missing MinIO secure mode. Set MINIO_SECURE or pass --minio-secure/--no-minio-secure.")
     if not args.dry_run and not args.dictation_access_key:
         parser.error("Missing dictation access key. Set DICTATION_ACCESS_KEY or pass --dictation-access-key.")
 

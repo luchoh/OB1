@@ -115,13 +115,6 @@ for required in HOUSEHOLD_SLUG HOUSEHOLD_NAME OWNER_PRINCIPAL_SLUG OWNER_DISPLAY
   fi
 done
 
-if [[ -f ".env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source ".env"
-  set +a
-fi
-
 if [[ -f ".env.open-brain-local" ]]; then
   set -a
   # shellcheck disable=SC1091

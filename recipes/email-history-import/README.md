@@ -129,6 +129,8 @@ python import-imap.py --host imap.example.com --username you@example.com \
 python watch-imap.py --host imap.example.com --username you@example.com --verbose
 ```
 
+For the current local managed deployment, keep `MINIO_ENDPOINT` unset, discover MinIO through `MINIO_SERVICE_NAME=minio`, and set `MINIO_SECURE=false` explicitly when retaining attachment Markdown.
+
 ## Expected Outcome
 
 After running the import, you should see your emails as rows in the `thoughts` table. Each thought's `content` field contains a structured email snapshot and the `metadata` jsonb field includes:
@@ -157,6 +159,7 @@ You can search for any email content using the local OB1 MCP server's `search_th
 - Attachment processing is enabled by default and uses the shared Docling pipeline.
 - Attachment-derived metadata now records `docling_pipeline_used`, `docling_fallback_triggered`, and the quality signals behind any fallback.
 - When `--retain-attachment-markdown` is enabled, the original attachment still stays in IMAP and only the converted Markdown artifact is written to MinIO.
+- MinIO-backed attachment retention requires an explicit `MINIO_SECURE` value or `--minio-secure` / `--no-minio-secure`.
 - If attachment summary extraction fails, the importer still keeps the attachment chunks and records the summary error in metadata.
 - `--no-attachments` disables attachment processing.
 - `--attachments-only` turns the importer into an attachment reprocess tool and skips email body + email thought ingest.
@@ -179,7 +182,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 set -a
 source ../../.env.open-brain-local
-source ../../.env
 set +a
 python watch-imap.py --verbose
 ```

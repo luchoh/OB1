@@ -6,13 +6,6 @@ cd "$ROOT_DIR"
 
 source "$ROOT_DIR/scripts/lib/consul.sh"
 
-if [[ -f ".env" ]]; then
-  set -a
-  # shellcheck disable=SC1091
-  source ".env"
-  set +a
-fi
-
 if [[ -f ".env.open-brain-local" ]]; then
   set -a
   # shellcheck disable=SC1091

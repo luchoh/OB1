@@ -247,7 +247,7 @@ The graph layer now exposes four read-only inspection surfaces:
 
 ## Notes
 
-- The service loads the repo root `.env` first and then `.env.open-brain-local` so app-specific values win.
+- The service loads the repo root `.env.open-brain-local` only.
 - `LLM_ENABLE_THINKING=false` is the intended default for structured local LLM calls.
 - Structured extraction uses Qwen tool calling rather than `response_format`.
 - The canonical embedding contract is `1536` dimensions, owned by `ob1-embedding`.
@@ -258,4 +258,5 @@ The graph layer now exposes four read-only inspection surfaces:
 - when `OPEN_BRAIN_GRAPH_ENABLED=true`, the runtime can project provenance into Neo4j and expose read-only graph inspection tools
 - The schema migration is idempotent at the SQL object level, and the migration runner records applied filenames in `open_brain_schema_migrations`.
 - The real runtime env file is `.env.open-brain-local` and should remain untracked.
+- `.env` is not part of the local runtime contract.
 - Managed-service handoff details are in [docs/09-open-brain-local-service-handoff.md](/Users/luchoh/Dev/OB1/docs/09-open-brain-local-service-handoff.md#L1).

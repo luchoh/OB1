@@ -36,7 +36,7 @@ from recipes.shared_docling import (
     summarize_document,
     truncate_text,
 )
-from recipes.shared_object_store import env_flag, first_env, upload_file, upload_text
+from recipes.shared_object_store import env_flag, first_env, optional_env_flag, upload_file, upload_text
 
 
 DEFAULT_RETAIN_ARTIFACTS = env_flag(
@@ -67,11 +67,10 @@ DEFAULT_MINIO_SECRET_KEY = first_env(
     "OPEN_BRAIN_DOCUMENT_MINIO_SECRET_KEY",
     "DOCUMENT_IMPORT_MINIO_SECRET_KEY",
 )
-DEFAULT_MINIO_SECURE = env_flag(
+DEFAULT_MINIO_SECURE = optional_env_flag(
     "MINIO_SECURE",
     "OPEN_BRAIN_DOCUMENT_MINIO_SECURE",
     "DOCUMENT_IMPORT_MINIO_SECURE",
-    default=True,
 )
 DEFAULT_MINIO_BUCKET = first_env(
     "OPEN_BRAIN_DOCUMENT_MINIO_BUCKET",
@@ -357,7 +356,10 @@ def parse_args():
     parser.add_argument("--minio-bucket", default=DEFAULT_MINIO_BUCKET, help="MinIO bucket for retained document artifacts.")
     parser.add_argument("--minio-prefix", default=DEFAULT_MINIO_PREFIX, help="MinIO key prefix for retained document artifacts.")
     parser.add_argument("--verbose", action="store_true", help="Print extracted summary thoughts.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.retain_artifacts and not args.dry_run and args.minio_secure is None:
+        parser.error("Missing MinIO secure mode. Set MINIO_SECURE or pass --minio-secure/--no-minio-secure.")
+    return args
 
 
 def main():

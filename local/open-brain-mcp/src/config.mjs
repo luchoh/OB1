@@ -16,16 +16,9 @@ function parsedEnv(filepath) {
 }
 
 function loadRepoEnv() {
-  const baseEnv = parsedEnv(path.join(repoRoot, ".env"));
-  for (const [key, value] of Object.entries(baseEnv)) {
-    if (process.env[key] === undefined) {
-      process.env[key] = value;
-    }
-  }
-
   const localEnv = parsedEnv(path.join(repoRoot, ".env.open-brain-local"));
   for (const [key, value] of Object.entries(localEnv)) {
-    if (process.env[key] === undefined || process.env[key] === baseEnv[key]) {
+    if (process.env[key] === undefined) {
       process.env[key] = value;
     }
   }
