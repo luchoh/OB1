@@ -37,6 +37,7 @@ export CONSUL_HTTP_ADDR=...
 export MINIO_SERVICE_NAME=minio
 export MINIO_ACCESS_KEY=...
 export MINIO_SECRET_KEY=...
+export MINIO_SECURE=false
 export DICTATION_MINIO_BUCKET=dictation-artifacts
 ```
 
@@ -45,9 +46,15 @@ Optional:
 ```bash
 export OPEN_BRAIN_BASE_URL=http://localhost:8787
 export DICTATION_MINIO_PREFIX=canonical/
-export MINIO_SECURE=true
 export CONSUL_HTTP_TOKEN=...  # if Consul ACLs are enabled
+export MINIO_ENDPOINT=minio.example.internal:9000  # explicit override only
 ```
+
+Current local managed deployment note:
+
+- discover MinIO through Consul service name `minio`
+- keep `MINIO_ENDPOINT` unset unless you are deliberately bypassing Consul
+- use `MINIO_SECURE=false`
 
 Recommended for Telegram-origin dictation review:
 

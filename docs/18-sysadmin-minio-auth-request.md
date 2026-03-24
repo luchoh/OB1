@@ -30,6 +30,13 @@ The canonical runtime path is now Consul-backed MinIO discovery plus env-driven 
 
 `MINIO_ENDPOINT` remains available only as an explicit override for isolated/manual scenarios.
 
+Current verified local managed deployment values:
+
+- `MINIO_SERVICE_NAME=minio`
+- `MINIO_SECURE=false`
+
+That means OB1 should not hardcode `MINIO_SECURE=true` in launch examples or wrapper assumptions.
+
 ## Why Not Default To Keycloak For Development
 
 Keycloak-backed human auth and service-to-MinIO auth are different concerns.
@@ -63,6 +70,7 @@ The difference between local development and managed service is the credential s
 
 - local development:
   - static local credentials are acceptable
+  - use a dedicated scoped OB1 dev credential, not the MinIO root/admin credential
 - managed service:
   - per-service credentials issued and rotated by the sysadmin
   - do not reuse shared admin credentials
@@ -167,6 +175,44 @@ Use `MINIO_ENDPOINT` only when explicitly overriding that discovery path for deb
 Do not introduce a second direct worker auth contract for OIDC in v1.
 
 If a stronger identity source is used by the platform later, it should still materialize `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, and `MINIO_SECURE` before process start until the workers explicitly support a different auth contract.
+
+## OB1 Worker Instructions
+
+Treat MinIO as an infra-provided runtime dependency, not a worker-owned control plane.
+
+- discover MinIO through `CONSUL_HTTP_ADDR` plus `MINIO_SERVICE_NAME`
+- treat `MINIO_ENDPOINT` as a manual override only
+- require `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, and `MINIO_SECURE` to be present before attempting MinIO-backed retention or polling
+- do not teach workers to mint or refresh their own OIDC, STS, or Keycloak credentials
+- do not hardcode a MinIO IP, host, or `MINIO_SECURE=true` assumption into worker defaults or deployment examples
+- do not auto-create buckets in managed service mode
+- treat `AccessDenied` outside the assigned bucket/prefix as expected least-privilege behavior, not as a signal to widen policies
+
+For the current local managed deployment, the expected runtime shape is:
+
+- `CONSUL_HTTP_ADDR=<sysadmin-managed Consul URL>`
+- optional `CONSUL_HTTP_TOKEN=<sysadmin-managed Consul ACL token>`
+- `MINIO_SERVICE_NAME=minio`
+- `MINIO_ACCESS_KEY=<per-service MinIO access key>`
+- `MINIO_SECRET_KEY=<per-service MinIO secret key>`
+- `MINIO_SECURE=false`
+
+Service-specific expectations:
+
+- Telegram bridge:
+  - set `TELEGRAM_RAW_AUDIO_BUCKET=telegram-raw-audio`
+  - set `TELEGRAM_ENSURE_RAW_BUCKET=false`
+- dictation importer:
+  - set `DICTATION_MINIO_BUCKET=dictation-artifacts`
+  - set `DICTATION_MINIO_PREFIX=canonical/`
+- document importer:
+  - use `OPEN_BRAIN_DOCUMENT_MINIO_BUCKET=open-brain-document-originals`
+  - use `OPEN_BRAIN_DOCUMENT_MINIO_PREFIX=documents`
+- IMAP attachment Markdown publisher:
+  - use `OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_BUCKET=open-brain-document-originals`
+  - use `OPEN_BRAIN_IMAP_ATTACHMENT_MARKDOWN_MINIO_PREFIX=imap-attachments/markdown`
+
+If a worker is run manually outside the managed wrapper, the operator must still supply the same env contract explicitly.
 
 ## Local Development Default
 

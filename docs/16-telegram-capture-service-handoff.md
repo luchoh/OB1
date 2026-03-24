@@ -33,6 +33,8 @@ Managed-service auth note:
 - local workstation development may continue using static MinIO credentials
 - `MINIO_ENDPOINT` is now only an explicit override for isolated/manual runs
 - optional OIDC parity must materialize the same credential env vars before process start; direct worker-side OIDC or STS is not part of this contract today
+- the current local managed deployment resolves `minio` through Consul with `MINIO_SECURE=false`
+- managed Telegram launchers must set `TELEGRAM_ENSURE_RAW_BUCKET=false`
 
 ### Telegram Bridge
 
@@ -45,14 +47,15 @@ Minimum required values:
 - `MINIO_SERVICE_NAME=minio`
 - `MINIO_ACCESS_KEY`
 - `MINIO_SECRET_KEY`
+- `MINIO_SECURE=false`
 - `TELEGRAM_RAW_AUDIO_BUCKET=telegram-raw-audio`
+- `TELEGRAM_ENSURE_RAW_BUCKET=false`
 - `DICTATION_ACCESS_KEY`
 
 Recommended values:
 
 - `OPEN_BRAIN_BASE_URL=http://localhost:8787`
 - `TELEGRAM_POLL_TIMEOUT_SECONDS=25`
-- `MINIO_SECURE=true`
 - `DICTATION_BASE_URL=https://dictation.lincoln.luchoh.net`
 - `DICTATION_OBJECT_SUBMIT_URL=https://dictation.lincoln.luchoh.net/v1/dictation/notes/from-object`
 - `DICTATION_CLEANUP_MODE=llm`
@@ -67,13 +70,13 @@ Minimum required values:
 - `MINIO_SERVICE_NAME=minio`
 - `MINIO_ACCESS_KEY`
 - `MINIO_SECRET_KEY`
+- `MINIO_SECURE=false`
 - `DICTATION_MINIO_BUCKET=dictation-artifacts`
 
 Recommended values:
 
 - `OPEN_BRAIN_BASE_URL=http://localhost:8787`
 - `DICTATION_MINIO_PREFIX=canonical/`
-- `MINIO_SECURE=true`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_REVIEW_MATCH_THRESHOLD=0.78`
 - `TELEGRAM_REVIEW_MATCH_COUNT=3`
@@ -120,6 +123,8 @@ The sysadmin-managed deployment should:
 8. Pass `--verbose` to both services so progress is visible in logs.
 9. Restart the workers if they exit.
 10. Do not register either worker in Consul; these are background ingest jobs, not network services.
+11. Provide `MINIO_SECURE=false` explicitly in the worker env for the current local managed deployment.
+12. Keep `MINIO_ENDPOINT` unset unless deliberately bypassing Consul for an isolated manual probe.
 
 ## Example Commands
 
@@ -235,7 +240,9 @@ Required env for Telegram bridge:
 - MINIO_SERVICE_NAME=minio
 - MINIO_ACCESS_KEY
 - MINIO_SECRET_KEY
+- MINIO_SECURE=false
 - TELEGRAM_RAW_AUDIO_BUCKET=telegram-raw-audio
+- TELEGRAM_ENSURE_RAW_BUCKET=false
 - DICTATION_ACCESS_KEY
 - OPEN_BRAIN_BASE_URL=http://localhost:8787
 - DICTATION_BASE_URL=https://dictation.lincoln.luchoh.net
@@ -247,6 +254,7 @@ Required env for dictation importer:
 - MINIO_SERVICE_NAME=minio
 - MINIO_ACCESS_KEY
 - MINIO_SECRET_KEY
+- MINIO_SECURE=false
 - DICTATION_MINIO_BUCKET=dictation-artifacts
 - OPEN_BRAIN_BASE_URL=http://localhost:8787
 - DICTATION_MINIO_PREFIX=canonical/
