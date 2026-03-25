@@ -56,6 +56,7 @@ Recommended values:
 
 - `OPEN_BRAIN_BASE_URL=http://localhost:8787`
 - `TELEGRAM_POLL_TIMEOUT_SECONDS=25`
+- `TELEGRAM_REVIEW_MODE=full`
 - `DICTATION_BASE_URL=https://dictation.lincoln.luchoh.net`
 - `DICTATION_OBJECT_SUBMIT_URL=https://dictation.lincoln.luchoh.net/v1/dictation/notes/from-object`
 - `DICTATION_CLEANUP_MODE=llm`
@@ -78,6 +79,7 @@ Recommended values:
 - `OPEN_BRAIN_BASE_URL=http://localhost:8787`
 - `DICTATION_MINIO_PREFIX=canonical/`
 - `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_REVIEW_MODE=full`
 - `TELEGRAM_REVIEW_MATCH_THRESHOLD=0.78`
 - `TELEGRAM_REVIEW_MATCH_COUNT=3`
 - `TELEGRAM_REVIEW_STATE_FILE=/usr/local/var/ob1-telegram-bridge/telegram-review-state.json`
@@ -202,7 +204,8 @@ Target behavior:
 4. Dictation should fetch the object, transcribe/clean it, and publish the canonical markdown artifact into MinIO.
 5. The dictation importer should poll the canonical artifact bucket and ingest resulting dictation notes/thoughts into OB1.
 6. Telegram-origin transcripts must pass the same meaningfulness/novelty gate as typed Telegram text before they are stored in OB1.
-7. Low-signal, duplicate, or uncertain Telegram transcripts must create a Telegram `Record / Ignore` review prompt instead of auto-ingesting.
+7. Telegram-origin text and Telegram-origin dictation thoughts must default to the full Telegram review loop before ingest, using the shared Telegram review-state file.
+8. Zero-thought Telegram captures may still use the simpler `Record / Ignore` override prompt.
 
 Required MinIO setup:
 - Create bucket: telegram-raw-audio
