@@ -9,7 +9,7 @@ Adds a dedicated Telegram bot inbox to OB1.
 - typed messages are ingested directly into OB1 as `telegram_message` source rows plus `telegram_thought` distilled rows
 - voice notes and audio clips are uploaded to MinIO and handed off to the separate dictation service for transcription
 - trivial text like `Hi` is not auto-recorded
-- text that looks duplicate or ambiguous is held for `Record / Ignore` review in Telegram before OB1 ingest
+- Telegram-origin text now defaults to a full thought-review loop in Telegram before OB1 ingest
 
 This integration is bot-based and direct-chat-only in v1.
 
@@ -45,6 +45,7 @@ MINIO_ACCESS_KEY=...
 MINIO_SECRET_KEY=...
 MINIO_SECURE=false
 TELEGRAM_ENSURE_RAW_BUCKET=false
+TELEGRAM_REVIEW_MODE=full
 DICTATION_ACCESS_KEY=...
 ```
 
@@ -79,23 +80,24 @@ python telegram_bridge.py --verbose
 
 Typed message:
 
-- if meaningful and novel:
-  - one `telegram_message` source row
-  - up to 3 `telegram_thought` rows
+- if durable thoughts are extracted:
+  - Telegram shows the candidate thoughts before ingest
+  - the user can `Approve`, `Edit`, `Deny`, `Approve All`, `Commit`, `Deny All`, or `View Raw`
+  - nothing is stored until `Commit`
 - if trivial:
   - nothing is stored automatically
   - Telegram explains why it was not auto-recorded
-  - Telegram offers `Record / Ignore` so the user can override without resending
-- if duplicate or uncertain:
-  - nothing is stored yet
-  - Telegram sends a `Record / Ignore` review prompt
+  - Telegram offers `Record / Ignore` and `View Raw` so the user can override without resending
+- if you need the older behavior:
+  - set `TELEGRAM_REVIEW_MODE=exceptions_only`
+  - the bridge will auto-ingest clearly novel thoughts and only prompt on ambiguous, duplicate, or zero-thought cases
 
 Voice or audio message:
 
 - raw file stored in the configured MinIO bucket
 - object reference submitted to dictation
 - short Telegram acknowledgment confirming it was queued for transcription
-- after transcription, Telegram-origin transcripts follow the same meaningfulness/novelty gate before any OB1 ingest
+- after transcription, Telegram-origin transcripts follow the same Telegram review loop before any OB1 ingest
 
 ## Notes
 
