@@ -217,10 +217,17 @@ So the edit interaction should be a small state machine:
 1. user taps `Edit 2`
 2. bot replies:
    - `Send the replacement text for thought 2.`
-3. next plain-text message from that same chat is consumed as the new content for thought 2
-4. review message is updated to show:
+3. the replacement text must be sent as a direct reply to that bot-issued edit prompt
+4. only that reply-to message is consumed as the edit payload
+5. if the user sends a non-reply plain-text message instead, it is treated as a normal new Telegram capture, not as edit text
+6. only one active edit target may exist per chat at a time
+7. if the user taps `Edit` on another thought before finishing the first edit, the earlier edit target is cancelled and replaced explicitly
+8. the review message is updated to show:
    - new text
    - status `edited`
+
+This reply-to requirement is mandatory.
+The implementation must not use "next plain-text message in chat" as the edit discriminator.
 
 ### Raw-source flow
 
@@ -245,6 +252,9 @@ The review-loop design needs richer pending state, including:
 - session id or action token
 - source payload
 - raw source preview or recoverable source text
+- review origin:
+  - `telegram_text`
+  - `telegram_dictation`
 - candidate thoughts with stable indexes
 - per-thought review state:
   - `pending`
@@ -258,6 +268,13 @@ The review-loop design needs richer pending state, including:
 - whether raw view is enabled
 - optional pending edit target:
   - `thought_index`
+- optional active edit prompt message id
+- for Telegram-origin dictation sessions:
+  - importer artifact reference key
+  - importer sync-log dedupe key
+  - importer pending status handle
+
+For `telegram_dictation` review sessions, the session state must carry enough information to update the dictation importer sync log when the review resolves.
 
 The session must remain durable across bot restarts using the existing JSON-backed review state, unless or until that state store is formally replaced.
 
@@ -283,13 +300,22 @@ In `full` mode:
 
 1. dictation importer reads canonical artifact
 2. extracts candidate thoughts
-3. sends Telegram review message back to the originating chat
-4. waits for user actions
-5. on `Commit`:
+3. writes importer sync-log state as `review_pending`
+4. sends Telegram review message back to the originating chat
+5. waits for user actions
+6. on `Commit`:
    - ingest one source row
    - ingest only thoughts currently marked `approved` or `edited`
-6. on `Deny All`:
+   - move the importer sync-log entry from `review_pending` to `ingested`
+7. on `Deny All`:
    - ingest nothing
+   - move the importer sync-log entry from `review_pending` to `ignored`
+8. on session expiry:
+   - ingest nothing
+   - move the importer sync-log entry from `review_pending` to `expired`
+
+This sync-log transition is required.
+The importer must not leave Telegram-origin dictation artifacts stranded in `review_pending` after commit, deny, or expiry.
 
 ### Zero-thought case
 
@@ -315,7 +341,9 @@ That is a separate UX from per-thought review because there are no candidate tho
 9. The same interaction model works for:
    - direct Telegram text capture
    - Telegram-origin dictation importer review
-10. Expired review sessions fail cleanly and tell the user the prompt expired.
+10. Expired review sessions fail cleanly, tell the user the prompt expired, and move Telegram-origin dictation importer state out of `review_pending`.
+11. Edit text is accepted only when the user replies directly to the active bot-issued edit prompt for that session.
+12. A normal non-reply Telegram message sent while a review session is open is still treated as a new capture, not implicitly consumed as edit text.
 
 ## Risks
 
