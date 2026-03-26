@@ -17,6 +17,7 @@ Attachments are now first-class inputs:
 - attachments use OCR first and automatically escalate to Docling `vlm` when the initial extraction is weak
 - extracted attachment chunks become searchable `document_chunk` rows
 - distilled attachment summaries become searchable `document_summary` rows
+- attachment originals remain in IMAP while the converted Markdown artifact can be retained in MinIO
 - each attachment-derived row links back to the parent email with stable provenance metadata
 
 Each imported email is stored with:
@@ -42,6 +43,7 @@ Use `--no-distill` if you want raw email records only.
 - the local OB1 service running
 - your real `.env.open-brain-local`
 - a reachable Docling service if attachment processing is enabled
+- MinIO access if you want attachment-converted Markdown retention
 
 ## Credential Tracker
 
@@ -116,9 +118,18 @@ python import-imap.py --host imap.example.com --username you@example.com \
   --attachment-name AHIztok_Shema_15_07032026.pdf \
   --attachment-name AHIztok_Shema_15_10032026.pdf
 
+# keep original attachment in IMAP, but retain the converted Markdown artifact in MinIO
+python import-imap.py --host imap.example.com --username you@example.com \
+  --retain-attachment-markdown \
+  --minio-service-name "${MINIO_SERVICE_NAME:-minio}" \
+  --minio-bucket open-brain-document-originals \
+  --minio-prefix imap-attachments/markdown
+
 # watch the mailbox forever and auto-import new mail
 python watch-imap.py --host imap.example.com --username you@example.com --verbose
 ```
+
+For the current local managed deployment, keep `MINIO_ENDPOINT` unset, discover MinIO through `MINIO_SERVICE_NAME=minio`, and set `MINIO_SECURE=false` explicitly when retaining attachment Markdown.
 
 ## Expected Outcome
 
@@ -147,12 +158,15 @@ You can search for any email content using the local OB1 MCP server's `search_th
 - Distillation is enabled by default and creates separate `email_thought` rows linked back to the source email with stable dedupe keys.
 - Attachment processing is enabled by default and uses the shared Docling pipeline.
 - Attachment-derived metadata now records `docling_pipeline_used`, `docling_fallback_triggered`, and the quality signals behind any fallback.
+- When `--retain-attachment-markdown` is enabled, the original attachment still stays in IMAP and only the converted Markdown artifact is written to MinIO.
+- MinIO-backed attachment retention requires an explicit `MINIO_SECURE` value or `--minio-secure` / `--no-minio-secure`.
 - If attachment summary extraction fails, the importer still keeps the attachment chunks and records the summary error in metadata.
 - `--no-attachments` disables attachment processing.
 - `--attachments-only` turns the importer into an attachment reprocess tool and skips email body + email thought ingest.
 - `--attachment-name FILE` limits attachment processing to exact filenames. Repeatable.
 - `--no-attachment-summaries` keeps attachment chunks but skips attachment summary thoughts.
 - `--attachment-chunker hierarchical|hybrid` controls the Docling chunker used for attachments.
+- `--retain-attachment-markdown` plus the `--minio-*` flags publishes the attachment-derived Markdown artifact to MinIO.
 - The sync log now records an importer schema version, so older body-only imports are reprocessed once and pick up attachments safely under the existing dedupe model.
 - The current search flags are `SINCE`, `BEFORE`, `UNSEEN`, `FROM`, `SUBJECT`, and `TEXT`.
 - `watch-imap.py` is the unattended mode. It polls the mailbox forever, reuses the same importer, and relies on `imap-sync-log.json` for idempotency and retry behavior.
@@ -168,7 +182,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 set -a
 source ../../.env.open-brain-local
-source ../../.env
 set +a
 python watch-imap.py --verbose
 ```

@@ -24,6 +24,18 @@ Supporting product/infra docs:
 
 ## Required Env
 
+Managed-service auth note:
+
+- the canonical MinIO discovery path for these workers is `CONSUL_HTTP_ADDR` plus `MINIO_SERVICE_NAME`
+- `CONSUL_HTTP_TOKEN` is optional and depends on the Consul ACL setup
+- the MinIO credential contract remains `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, and `MINIO_SECURE`
+- in managed deployments, those values must come from per-service MinIO credentials, not shared developer or admin credentials
+- local workstation development may continue using static MinIO credentials
+- `MINIO_ENDPOINT` is now only an explicit override for isolated/manual runs
+- optional OIDC parity must materialize the same credential env vars before process start; direct worker-side OIDC or STS is not part of this contract today
+- the current local managed deployment resolves `minio` through Consul with `MINIO_SECURE=false`
+- managed Telegram launchers must set `TELEGRAM_ENSURE_RAW_BUCKET=false`
+
 ### Telegram Bridge
 
 Minimum required values:
@@ -31,17 +43,19 @@ Minimum required values:
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_ALLOWED_CHAT_IDS`
 - `MCP_ACCESS_KEY`
-- `MINIO_ENDPOINT`
+- `CONSUL_HTTP_ADDR`
+- `MINIO_SERVICE_NAME=minio`
 - `MINIO_ACCESS_KEY`
 - `MINIO_SECRET_KEY`
+- `MINIO_SECURE=false`
 - `TELEGRAM_RAW_AUDIO_BUCKET=telegram-raw-audio`
+- `TELEGRAM_ENSURE_RAW_BUCKET=false`
 - `DICTATION_ACCESS_KEY`
 
 Recommended values:
 
 - `OPEN_BRAIN_BASE_URL=http://localhost:8787`
 - `TELEGRAM_POLL_TIMEOUT_SECONDS=25`
-- `MINIO_SECURE=true`
 - `DICTATION_BASE_URL=https://dictation.lincoln.luchoh.net`
 - `DICTATION_OBJECT_SUBMIT_URL=https://dictation.lincoln.luchoh.net/v1/dictation/notes/from-object`
 - `DICTATION_CLEANUP_MODE=llm`
@@ -52,16 +66,17 @@ Recommended values:
 Minimum required values:
 
 - `MCP_ACCESS_KEY`
-- `MINIO_ENDPOINT`
+- `CONSUL_HTTP_ADDR`
+- `MINIO_SERVICE_NAME=minio`
 - `MINIO_ACCESS_KEY`
 - `MINIO_SECRET_KEY`
+- `MINIO_SECURE=false`
 - `DICTATION_MINIO_BUCKET=dictation-artifacts`
 
 Recommended values:
 
 - `OPEN_BRAIN_BASE_URL=http://localhost:8787`
 - `DICTATION_MINIO_PREFIX=canonical/`
-- `MINIO_SECURE=true`
 - `TELEGRAM_BOT_TOKEN`
 - `TELEGRAM_REVIEW_MATCH_THRESHOLD=0.78`
 - `TELEGRAM_REVIEW_MATCH_COUNT=3`
@@ -108,6 +123,8 @@ The sysadmin-managed deployment should:
 8. Pass `--verbose` to both services so progress is visible in logs.
 9. Restart the workers if they exit.
 10. Do not register either worker in Consul; these are background ingest jobs, not network services.
+11. Provide `MINIO_SECURE=false` explicitly in the worker env for the current local managed deployment.
+12. Keep `MINIO_ENDPOINT` unset unless deliberately bypassing Consul for an isolated manual probe.
 
 ## Example Commands
 
@@ -123,7 +140,6 @@ Dictation importer:
 ```bash
 cd /Users/luchoh/Dev/OB1/recipes/dictation-import
 .venv/bin/python import-dictation.py \
-  --minio-endpoint "$MINIO_ENDPOINT" \
   --bucket "$DICTATION_MINIO_BUCKET" \
   --prefix "${DICTATION_MINIO_PREFIX:-canonical/}" \
   --poll \
@@ -148,7 +164,6 @@ After deployment, verify in this order:
    ```bash
    cd /Users/luchoh/Dev/OB1/recipes/dictation-import
    .venv/bin/python import-dictation.py \
-     --minio-endpoint "$MINIO_ENDPOINT" \
      --bucket "$DICTATION_MINIO_BUCKET" \
      --prefix "${DICTATION_MINIO_PREFIX:-canonical/}" \
      --limit 1 \
@@ -211,7 +226,6 @@ Suggested commands:
 - Dictation importer:
   cd /Users/luchoh/Dev/OB1/recipes/dictation-import
   .venv/bin/python import-dictation.py \
-    --minio-endpoint "$MINIO_ENDPOINT" \
     --bucket "$DICTATION_MINIO_BUCKET" \
     --prefix "${DICTATION_MINIO_PREFIX:-canonical/}" \
     --poll \
@@ -222,10 +236,13 @@ Required env for Telegram bridge:
 - TELEGRAM_BOT_TOKEN
 - TELEGRAM_ALLOWED_CHAT_IDS
 - MCP_ACCESS_KEY
-- MINIO_ENDPOINT
+- CONSUL_HTTP_ADDR
+- MINIO_SERVICE_NAME=minio
 - MINIO_ACCESS_KEY
 - MINIO_SECRET_KEY
+- MINIO_SECURE=false
 - TELEGRAM_RAW_AUDIO_BUCKET=telegram-raw-audio
+- TELEGRAM_ENSURE_RAW_BUCKET=false
 - DICTATION_ACCESS_KEY
 - OPEN_BRAIN_BASE_URL=http://localhost:8787
 - DICTATION_BASE_URL=https://dictation.lincoln.luchoh.net
@@ -233,9 +250,11 @@ Required env for Telegram bridge:
 
 Required env for dictation importer:
 - MCP_ACCESS_KEY
-- MINIO_ENDPOINT
+- CONSUL_HTTP_ADDR
+- MINIO_SERVICE_NAME=minio
 - MINIO_ACCESS_KEY
 - MINIO_SECRET_KEY
+- MINIO_SECURE=false
 - DICTATION_MINIO_BUCKET=dictation-artifacts
 - OPEN_BRAIN_BASE_URL=http://localhost:8787
 - DICTATION_MINIO_PREFIX=canonical/

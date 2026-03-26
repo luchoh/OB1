@@ -29,11 +29,6 @@ function parseDotenv(filepath) {
 }
 
 function loadRepoEnv() {
-  for (const [key, value] of parseDotenv(path.join(repoRoot, ".env"))) {
-    if (process.env[key] === undefined) {
-      process.env[key] = value;
-    }
-  }
   for (const [key, value] of parseDotenv(path.join(repoRoot, ".env.open-brain-local"))) {
     if (process.env[key] === undefined) {
       process.env[key] = value;

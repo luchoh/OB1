@@ -27,6 +27,7 @@ from recipes.shared_docling import (
     LOCAL_INGEST_KEY,
     LOCAL_INGEST_URL,
     discover_docling_base_url,
+    docling_markdown_artifact,
     docling_chunk,
     file_content_type,
     ingest_thought,
@@ -34,6 +35,52 @@ from recipes.shared_docling import (
     sha256_text,
     summarize_document,
     truncate_text,
+)
+from recipes.shared_object_store import env_flag, first_env, optional_env_flag, upload_file, upload_text
+
+
+DEFAULT_RETAIN_ARTIFACTS = env_flag(
+    "OPEN_BRAIN_DOCUMENT_RETAIN_ARTIFACTS",
+    "OPEN_BRAIN_DOCUMENT_RETAIN_ORIGINALS",
+    "DOCUMENT_IMPORT_RETAIN_ARTIFACTS",
+    "DOCUMENT_IMPORT_RETAIN_ORIGINALS",
+    default=False,
+)
+DEFAULT_MINIO_ENDPOINT = first_env(
+    "MINIO_ENDPOINT",
+    "OPEN_BRAIN_DOCUMENT_MINIO_ENDPOINT",
+    "DOCUMENT_IMPORT_MINIO_ENDPOINT",
+)
+DEFAULT_MINIO_SERVICE_NAME = first_env(
+    "MINIO_SERVICE_NAME",
+    "OPEN_BRAIN_DOCUMENT_MINIO_SERVICE_NAME",
+    "DOCUMENT_IMPORT_MINIO_SERVICE_NAME",
+    default="minio",
+)
+DEFAULT_MINIO_ACCESS_KEY = first_env(
+    "MINIO_ACCESS_KEY",
+    "OPEN_BRAIN_DOCUMENT_MINIO_ACCESS_KEY",
+    "DOCUMENT_IMPORT_MINIO_ACCESS_KEY",
+)
+DEFAULT_MINIO_SECRET_KEY = first_env(
+    "MINIO_SECRET_KEY",
+    "OPEN_BRAIN_DOCUMENT_MINIO_SECRET_KEY",
+    "DOCUMENT_IMPORT_MINIO_SECRET_KEY",
+)
+DEFAULT_MINIO_SECURE = optional_env_flag(
+    "MINIO_SECURE",
+    "OPEN_BRAIN_DOCUMENT_MINIO_SECURE",
+    "DOCUMENT_IMPORT_MINIO_SECURE",
+)
+DEFAULT_MINIO_BUCKET = first_env(
+    "OPEN_BRAIN_DOCUMENT_MINIO_BUCKET",
+    "DOCUMENT_IMPORT_MINIO_BUCKET",
+    default="open-brain-document-originals",
+)
+DEFAULT_MINIO_PREFIX = first_env(
+    "OPEN_BRAIN_DOCUMENT_MINIO_PREFIX",
+    "DOCUMENT_IMPORT_MINIO_PREFIX",
+    default="documents",
 )
 
 
@@ -60,6 +107,77 @@ def iter_files(paths, recursive):
         seen.add(key)
         unique.append(path)
     return unique
+
+
+def minio_config(args, suffix):
+    safe_prefix = "/".join(part for part in (args.minio_prefix.strip("/"), suffix.strip("/")) if part)
+    return {
+        "endpoint": args.minio_endpoint,
+        "service_name": args.minio_service_name,
+        "access_key": args.minio_access_key,
+        "secret_key": args.minio_secret_key,
+        "secure": args.minio_secure,
+        "bucket": args.minio_bucket,
+        "prefix": safe_prefix,
+    }
+
+
+def document_artifact_refs(path, args, *, extraction, document_hash):
+    markdown_text = docling_markdown_artifact(path.name, extraction)
+    markdown_filename = f"{path.stem}.md"
+    markdown_hash = sha256_text(markdown_text)
+
+    if args.dry_run or not args.retain_artifacts:
+        return {
+            "markdown_text": markdown_text,
+            "original": {
+                "storage_backend": "file",
+                "bucket": None,
+                "object_key": None,
+                "retained": False,
+                "filename": path.name,
+            },
+            "markdown": {
+                "storage_backend": "inline_only",
+                "bucket": None,
+                "object_key": None,
+                "retained": False,
+                "filename": markdown_filename,
+                "sha256": markdown_hash,
+            },
+        }
+
+    original_ref = upload_file(
+        minio_config(args, "originals"),
+        path,
+        sha256_hex=document_hash,
+        content_type=file_content_type(path),
+    )
+    markdown_ref = upload_text(
+        minio_config(args, "markdown"),
+        markdown_text,
+        sha256_hex=markdown_hash,
+        filename=markdown_filename,
+    )
+
+    return {
+        "markdown_text": markdown_text,
+        "original": {
+            "storage_backend": original_ref["storage_backend"],
+            "bucket": original_ref["bucket"],
+            "object_key": original_ref["object_key"],
+            "retained": True,
+            "filename": original_ref["original_filename"],
+        },
+        "markdown": {
+            "storage_backend": markdown_ref["storage_backend"],
+            "bucket": markdown_ref["bucket"],
+            "object_key": markdown_ref["object_key"],
+            "retained": True,
+            "filename": markdown_ref["original_filename"],
+            "sha256": markdown_hash,
+        },
+    }
 
 
 def process_document(path, args, docling_base_url):
@@ -95,11 +213,18 @@ def process_document(path, args, docling_base_url):
     else:
         print("summary_thoughts=0 (no convertible document text)")
 
+    artifact_refs = document_artifact_refs(path, args, extraction=extraction, document_hash=document_hash)
+    print(f"document_original_retained={artifact_refs['original']['retained']}")
+    print(f"document_markdown_retained={artifact_refs['markdown']['retained']}")
+    if args.verbose:
+        print(f"document_markdown_sha256={artifact_refs['markdown']['sha256']}")
+
     if args.dry_run:
         return {
             "chunk_count": len(chunks),
             "summary_count": len(summary_thoughts),
             "document_sha256": document_hash,
+            "document_markdown_sha256": artifact_refs["markdown"]["sha256"],
         }
 
     ingested_chunks = 0
@@ -117,6 +242,17 @@ def process_document(path, args, docling_base_url):
             "document_sha256": document_hash,
             "document_mimetype": origin.get("mimetype") or file_content_type(path),
             "document_size_bytes": path.stat().st_size,
+            "document_original_storage_backend": artifact_refs["original"]["storage_backend"],
+            "document_original_bucket": artifact_refs["original"]["bucket"],
+            "document_original_object_key": artifact_refs["original"]["object_key"],
+            "document_original_retained": artifact_refs["original"]["retained"],
+            "document_original_filename": artifact_refs["original"]["filename"],
+            "document_markdown_storage_backend": artifact_refs["markdown"]["storage_backend"],
+            "document_markdown_bucket": artifact_refs["markdown"]["bucket"],
+            "document_markdown_object_key": artifact_refs["markdown"]["object_key"],
+            "document_markdown_retained": artifact_refs["markdown"]["retained"],
+            "document_markdown_filename": artifact_refs["markdown"]["filename"],
+            "document_markdown_sha256": artifact_refs["markdown"]["sha256"],
             "document_chunk_index": chunk.get("chunk_index"),
             "document_chunk_count": len(chunks),
             "document_page_numbers": chunk.get("page_numbers") or [],
@@ -152,6 +288,17 @@ def process_document(path, args, docling_base_url):
             "document_path": str(path),
             "document_sha256": document_hash,
             "document_chunk_count": len(chunks),
+            "document_original_storage_backend": artifact_refs["original"]["storage_backend"],
+            "document_original_bucket": artifact_refs["original"]["bucket"],
+            "document_original_object_key": artifact_refs["original"]["object_key"],
+            "document_original_retained": artifact_refs["original"]["retained"],
+            "document_original_filename": artifact_refs["original"]["filename"],
+            "document_markdown_storage_backend": artifact_refs["markdown"]["storage_backend"],
+            "document_markdown_bucket": artifact_refs["markdown"]["bucket"],
+            "document_markdown_object_key": artifact_refs["markdown"]["object_key"],
+            "document_markdown_retained": artifact_refs["markdown"]["retained"],
+            "document_markdown_filename": artifact_refs["markdown"]["filename"],
+            "document_markdown_sha256": artifact_refs["markdown"]["sha256"],
             "docling_chunker": args.chunker,
             "docling_pipeline_used": pipeline_used,
             "docling_fallback_triggered": fallback_triggered,
@@ -191,8 +338,28 @@ def parse_args():
     parser.add_argument("--dry-run", action="store_true", help="Convert and summarize, but do not ingest.")
     parser.add_argument("--no-summaries", action="store_true", help="Skip whole-document summary extraction.")
     parser.add_argument("--docling-url", help="Override the Docling base URL instead of using env/Consul discovery.")
+    parser.add_argument(
+        "--retain-artifacts",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_RETAIN_ARTIFACTS,
+        help="Store both the original document and the converted Markdown artifact in MinIO and attach those references to ingested metadata.",
+    )
+    parser.add_argument(
+        "--minio-endpoint",
+        default=DEFAULT_MINIO_ENDPOINT,
+        help="Explicit MinIO endpoint host:port override. If unset, resolve the service name through Consul.",
+    )
+    parser.add_argument("--minio-service-name", default=DEFAULT_MINIO_SERVICE_NAME, help="Consul service name for MinIO discovery.")
+    parser.add_argument("--minio-access-key", default=DEFAULT_MINIO_ACCESS_KEY, help="MinIO access key.")
+    parser.add_argument("--minio-secret-key", default=DEFAULT_MINIO_SECRET_KEY, help="MinIO secret key.")
+    parser.add_argument("--minio-secure", action=argparse.BooleanOptionalAction, default=DEFAULT_MINIO_SECURE, help="Use HTTPS for MinIO.")
+    parser.add_argument("--minio-bucket", default=DEFAULT_MINIO_BUCKET, help="MinIO bucket for retained document artifacts.")
+    parser.add_argument("--minio-prefix", default=DEFAULT_MINIO_PREFIX, help="MinIO key prefix for retained document artifacts.")
     parser.add_argument("--verbose", action="store_true", help="Print extracted summary thoughts.")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.retain_artifacts and not args.dry_run and args.minio_secure is None:
+        parser.error("Missing MinIO secure mode. Set MINIO_SECURE or pass --minio-secure/--no-minio-secure.")
+    return args
 
 
 def main():
@@ -214,6 +381,13 @@ def main():
     print(f"docling_base_url={docling_base_url}")
     print(f"ingest_url={LOCAL_INGEST_URL}")
     print(f"chunker={args.chunker}")
+    print(f"retain_artifacts={args.retain_artifacts}")
+    if args.retain_artifacts:
+        print(f"minio_service_name={args.minio_service_name}")
+        if args.minio_endpoint:
+            print(f"minio_endpoint_override={args.minio_endpoint}")
+        print(f"minio_bucket={args.minio_bucket}")
+        print(f"minio_prefix={args.minio_prefix}")
     print(f"dry_run={args.dry_run}")
 
     if not args.dry_run and not LOCAL_INGEST_KEY:

@@ -1,6 +1,6 @@
 {
   "name": "Email History Import",
-  "description": "Import a standard IMAP mailbox into the local Open Brain service as searchable email thoughts with sender, subject, mailbox, flag, and date metadata.",
+  "description": "Import a standard IMAP mailbox into the local Open Brain service as searchable email thoughts and Docling-derived attachment knowledge, with optional MinIO retention for attachment Markdown artifacts.",
   "category": "recipes",
   "author": {
     "name": "OB1 Team"
@@ -8,12 +8,12 @@
   "version": "1.0.0",
   "requires": {
     "open_brain": true,
-    "services": ["IMAP account"],
+    "services": ["IMAP account", "Docling", "MinIO"],
     "tools": ["Python 3.10+"]
   },
-  "tags": ["email", "imap", "import", "history"],
+  "tags": ["email", "imap", "import", "history", "docling", "minio"],
   "difficulty": "intermediate",
   "estimated_time": "20 minutes",
   "created": "2026-03-10",
-  "updated": "2026-03-14"
+  "updated": "2026-03-23"
 }

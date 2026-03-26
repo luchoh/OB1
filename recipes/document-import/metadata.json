@@ -1,6 +1,6 @@
 {
   "name": "Document Import",
-  "description": "Convert local documents with Docling, chunk them, and ingest them into the local Open Brain service as searchable document chunks and summary thoughts.",
+  "description": "Convert local documents with Docling, retain original and Markdown artifacts in MinIO when desired, and ingest searchable document chunks and summary thoughts into OB1.",
   "category": "recipes",
   "author": {
     "name": "OB1 Team"
@@ -8,12 +8,12 @@
   "version": "1.0.0",
   "requires": {
     "open_brain": true,
-    "services": ["Docling", "mlx-server"],
+    "services": ["Docling", "mlx-server", "MinIO"],
     "tools": ["Python 3.10+"]
   },
-  "tags": ["documents", "pdf", "docling", "import", "chunking", "local"],
+  "tags": ["documents", "pdf", "docling", "import", "chunking", "minio", "local"],
   "difficulty": "intermediate",
   "estimated_time": "20 minutes",
   "created": "2026-03-14",
-  "updated": "2026-03-14"
+  "updated": "2026-03-23"
 }

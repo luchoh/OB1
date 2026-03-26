@@ -39,11 +39,20 @@ Minimum required values:
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_ALLOWED_CHAT_IDS=123456789
 MCP_ACCESS_KEY=...
-MINIO_ENDPOINT=...
+CONSUL_HTTP_ADDR=...
+MINIO_SERVICE_NAME=minio
 MINIO_ACCESS_KEY=...
 MINIO_SECRET_KEY=...
+MINIO_SECURE=false
+TELEGRAM_ENSURE_RAW_BUCKET=false
 DICTATION_ACCESS_KEY=...
 ```
+
+Notes:
+
+- the canonical MinIO path is Consul discovery through `MINIO_SERVICE_NAME`
+- `MINIO_ENDPOINT` is only an explicit manual override
+- the current local managed deployment uses `MINIO_SECURE=false`
 
 ## One Batch Test
 
@@ -93,3 +102,4 @@ Voice or audio message:
 - v1 only supports direct private chat capture.
 - v1 does not use TDLib or Telegram-native transcription.
 - v1 sends raw audio through MinIO first, then hands off an object reference to dictation.
+- managed deployments should not auto-create the raw-audio bucket; set `TELEGRAM_ENSURE_RAW_BUCKET=false`.
