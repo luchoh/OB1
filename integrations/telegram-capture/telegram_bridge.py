@@ -35,10 +35,27 @@ from recipes.shared_docling import (
 )
 from recipes.shared_object_store import first_env, optional_env_flag, resolve_minio_endpoint
 from recipes.shared_telegram_review_state import (
+    DICTATION_RESOLUTION_IGNORED,
+    DICTATION_RESOLUTION_INGESTED,
+    REVIEW_MODE_EXCEPTIONS_ONLY,
+    REVIEW_MODE_FULL,
+    THOUGHT_STATUS_APPROVED,
+    THOUGHT_STATUS_DENIED,
+    approved_session_payloads,
+    apply_edit_reply,
+    build_review_reply_markup,
+    build_review_session,
     default_review_state_path,
+    find_edit_session,
     locked_review_state,
+    normalize_review_mode,
+    parse_callback_data,
     pending_action_token,
     prune_pending_actions,
+    record_resolution,
+    render_review_text,
+    review_session_has_thoughts,
+    start_edit_prompt,
 )
 
 
@@ -78,6 +95,11 @@ DEFAULT_ENSURE_BUCKET = (os.environ.get("TELEGRAM_ENSURE_RAW_BUCKET") or "false"
 DEFAULT_REVIEW_MATCH_THRESHOLD = float(os.environ.get("TELEGRAM_REVIEW_MATCH_THRESHOLD", "0.78"))
 DEFAULT_REVIEW_MATCH_COUNT = int(os.environ.get("TELEGRAM_REVIEW_MATCH_COUNT", "3"))
 DEFAULT_PENDING_ACTION_TTL_SECONDS = int(os.environ.get("TELEGRAM_PENDING_ACTION_TTL_SECONDS", "86400"))
+DEFAULT_REVIEW_MODE = normalize_review_mode(
+    first_env("TELEGRAM_REVIEW_MODE", "TELEGRAM_CAPTURE_REVIEW_MODE", default=REVIEW_MODE_FULL),
+    default=REVIEW_MODE_FULL,
+)
+MAX_RAW_MESSAGE_CHARS = 3500
 
 DEFAULT_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
     "1",
@@ -208,6 +230,12 @@ def parse_args():
     parser.add_argument("--cleanup-mode", default=DEFAULT_DICTATION_CLEANUP_MODE, help="Cleanup mode forwarded to dictation.")
     parser.add_argument("--review-match-threshold", type=float, default=DEFAULT_REVIEW_MATCH_THRESHOLD, help="Similarity threshold for Telegram novelty review.")
     parser.add_argument("--review-match-count", type=int, default=DEFAULT_REVIEW_MATCH_COUNT, help="Max similar rows per candidate for Telegram novelty review.")
+    parser.add_argument(
+        "--review-mode",
+        choices=[REVIEW_MODE_FULL, REVIEW_MODE_EXCEPTIONS_ONLY],
+        default=DEFAULT_REVIEW_MODE,
+        help="Telegram review mode for text captures.",
+    )
     parser.add_argument("--pending-action-ttl-seconds", type=int, default=DEFAULT_PENDING_ACTION_TTL_SECONDS, help="How long review prompts remain actionable.")
     parser.add_argument("--state-file", default=str(DEFAULT_STATE_PATH), help="Path to persistent bridge state JSON.")
     parser.add_argument("--review-state-file", default=str(DEFAULT_REVIEW_STATE_PATH), help="Path to shared Telegram review-state JSON.")
@@ -320,48 +348,37 @@ def download_file_bytes(token: str, file_path: str):
     return response.content
 
 
-def send_reply(token: str, chat_id: str, reply_to_message_id: int, text: str):
-    telegram_api_call(
+def send_reply(token: str, chat_id: str, reply_to_message_id: int, text: str, *, reply_markup: dict | None = None):
+    payload = {
+        "chat_id": chat_id,
+        "reply_to_message_id": reply_to_message_id,
+        "text": text,
+        "allow_sending_without_reply": True,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    return telegram_api_call(token, "sendMessage", payload)
+
+
+def send_action_prompt(token: str, chat_id: str, reply_to_message_id: int, text: str, *, reply_markup: dict):
+    return send_reply(
         token,
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "reply_to_message_id": reply_to_message_id,
-            "text": text,
-            "allow_sending_without_reply": True,
-        },
+        chat_id,
+        reply_to_message_id,
+        text,
+        reply_markup=reply_markup,
     )
 
 
-def send_action_prompt(token: str, chat_id: str, reply_to_message_id: int, text: str, action_token: str):
-    return telegram_api_call(
-        token,
-        "sendMessage",
-        {
-            "chat_id": chat_id,
-            "reply_to_message_id": reply_to_message_id,
-            "text": text,
-            "allow_sending_without_reply": True,
-            "reply_markup": {
-                "inline_keyboard": [[
-                    {"text": "Record", "callback_data": f"ob1:record:{action_token}"},
-                    {"text": "Ignore", "callback_data": f"ob1:ignore:{action_token}"},
-                ]]
-            },
-        },
-    )
-
-
-def edit_message(token: str, chat_id: str, message_id: int, text: str):
-    telegram_api_call(
-        token,
-        "editMessageText",
-        {
-            "chat_id": chat_id,
-            "message_id": message_id,
-            "text": text,
-        },
-    )
+def edit_message(token: str, chat_id: str, message_id: int, text: str, *, reply_markup: dict | None = None):
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+    }
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    telegram_api_call(token, "editMessageText", payload)
 
 
 def answer_callback_query(token: str, callback_query_id: str, text: str | None = None):
@@ -631,31 +648,77 @@ def ingest_text_capture(args, source_payload: dict, thought_payloads: list[dict]
         ingest_row(args.base_url, args.access_key, payload)
 
 
-def register_pending_action(state: dict, args, message: dict, *, kind: str, prompt_text: str, source_payload: dict, thought_payloads: list[dict]):
+def register_review_session(args, message: dict, session: dict):
+    if args.dry_run:
+        return "dry-run"
     token = pending_action_token()
     prompt_result = None
 
-    if args.telegram_token and not args.dry_run:
+    if args.telegram_token:
         prompt_result = send_action_prompt(
             args.telegram_token,
             str(message["chat"]["id"]),
             message["message_id"],
-            prompt_text,
-            token,
+            render_review_text(session),
+            reply_markup=build_review_reply_markup(session, token),
         )
+    if isinstance(prompt_result, dict):
+        session["review_message_id"] = prompt_result.get("message_id")
 
-    pending_entry = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "kind": kind,
-        "chat_id": str(message["chat"]["id"]),
-        "message_id": message["message_id"],
-        "review_message_id": prompt_result.get("message_id") if isinstance(prompt_result, dict) else None,
-        "source_payload": source_payload,
-        "thought_payloads": thought_payloads,
-    }
     with locked_review_state(args.review_state_file) as review_state:
-        review_state.setdefault("pending_actions", {})[token] = pending_entry
+        review_state.setdefault("pending_actions", {})[token] = session
     return token
+
+
+def refresh_review_message(args, token: str, session: dict):
+    review_message_id = session.get("review_message_id")
+    if not args.telegram_token or not review_message_id or args.dry_run:
+        return
+    edit_message(
+        args.telegram_token,
+        str(session.get("chat_id")),
+        int(review_message_id),
+        render_review_text(session),
+        reply_markup=build_review_reply_markup(session, token),
+    )
+
+
+def send_review_raw_source(args, session: dict):
+    if not args.telegram_token or args.dry_run:
+        return
+    raw_text = (session.get("source_text") or "").strip()
+    if not raw_text:
+        raw_text = "(Raw source text was empty.)"
+    suffix = ""
+    if len(raw_text) > MAX_RAW_MESSAGE_CHARS:
+        raw_text = raw_text[:MAX_RAW_MESSAGE_CHARS].rstrip()
+        suffix = "\n\n[truncated]"
+    label = "Raw voice transcript" if session.get("origin") == "telegram_dictation" else "Raw Telegram message"
+    reply_target = session.get("review_message_id") or session.get("message_id")
+    send_reply(
+        args.telegram_token,
+        str(session.get("chat_id")),
+        int(reply_target),
+        f"{label}:\n\n{raw_text}{suffix}",
+    )
+
+
+def prompt_for_thought_edit(args, review_state: dict, token: str, session: dict, thought_index: int):
+    if thought_index < 0 or thought_index >= len(session.get("thoughts", [])):
+        return False
+    if not args.telegram_token or args.dry_run:
+        return False
+    reply_target = session.get("review_message_id") or session.get("message_id")
+    prompt_result = send_reply(
+        args.telegram_token,
+        str(session.get("chat_id")),
+        int(reply_target),
+        f"Send the replacement text for thought {thought_index + 1} as a reply to this message.",
+    )
+    if not isinstance(prompt_result, dict) or prompt_result.get("message_id") is None:
+        return False
+    start_edit_prompt(review_state, token, thought_index, int(prompt_result["message_id"]))
+    return True
 
 
 def message_audio_descriptor(message: dict):
@@ -779,19 +842,24 @@ def process_text_message(args, state: dict, message: dict):
     ]
 
     if not thoughts:
-        prompt_text = (
-            "I did not auto-record this.\n\n"
-            f"Reason: {ignored_reason}\n\n"
-            "Record the raw message anyway, or ignore it?"
-        )
-        token = register_pending_action(
-            state,
-            args,
-            message,
+        session = build_review_session(
+            origin="telegram_text",
             kind="no_durable_thought",
-            prompt_text=prompt_text,
+            chat_id=str(message["chat"]["id"]),
+            message_id=message["message_id"],
             source_payload=source_payload,
             thought_payloads=[],
+            prompt_text=(
+                "I did not auto-record this.\n\n"
+                f"Reason: {ignored_reason}\n\n"
+                "Record the raw message anyway, ignore it, or view the raw source?"
+            ),
+            mode=args.review_mode,
+        )
+        token = register_review_session(
+            args,
+            message,
+            session,
         )
         return {
             "handled": True,
@@ -819,6 +887,7 @@ def process_text_message(args, state: dict, message: dict):
         novelty_reviews = [{"thought": thought, "decision": "record", "reason": "dry-run"} for thought in thoughts]
 
     review_by_thought = {item["thought"]: item for item in novelty_reviews}
+    suggested_decisions = {item["thought"]: item.get("decision", "") for item in novelty_reviews}
     approved_payloads = []
     duplicate_count = 0
     uncertain_count = 0
@@ -831,27 +900,49 @@ def process_text_message(args, state: dict, message: dict):
         else:
             uncertain_count += 1
 
-    if not approved_payloads:
-        review_kind = "duplicate" if duplicate_count else "uncertain"
-        prompt_text = (
-            "This looks like it may already be recorded. Record it anyway or ignore it?"
-            if duplicate_count
-            else "I am not confident this should be recorded automatically. Record it anyway or ignore it?"
-        )
-        token = register_pending_action(
-            state,
-            args,
-            message,
-            kind=review_kind,
-            prompt_text=prompt_text,
+    if args.review_mode == REVIEW_MODE_FULL:
+        session = build_review_session(
+            origin="telegram_text",
+            kind="review",
+            chat_id=str(message["chat"]["id"]),
+            message_id=message["message_id"],
             source_payload=source_payload,
             thought_payloads=thought_payloads,
+            suggested_decisions=suggested_decisions,
+            similar_matches=similar_matches,
+            mode=args.review_mode,
         )
+        token = register_review_session(args, message, session)
         return {
             "handled": True,
             "path": "text",
             "decision": "review_required",
-            "review_kind": review_kind,
+            "review_kind": "review",
+            "action_token": token,
+            "thought_count": len(thought_payloads),
+            "source_dedupe_key": source_payload["dedupe_key"],
+            "duplicate_count": duplicate_count,
+            "uncertain_count": uncertain_count,
+        }
+
+    if not approved_payloads:
+        session = build_review_session(
+            origin="telegram_text",
+            kind="review",
+            chat_id=str(message["chat"]["id"]),
+            message_id=message["message_id"],
+            source_payload=source_payload,
+            thought_payloads=thought_payloads,
+            suggested_decisions=suggested_decisions,
+            similar_matches=similar_matches,
+            mode=args.review_mode,
+        )
+        token = register_review_session(args, message, session)
+        return {
+            "handled": True,
+            "path": "text",
+            "decision": "review_required",
+            "review_kind": "review",
             "action_token": token,
             "thought_count": len(thought_payloads),
             "source_dedupe_key": source_payload["dedupe_key"],
@@ -934,6 +1025,38 @@ def process_audio_message(args, message: dict):
     }
 
 
+def process_edit_reply_message(args, message: dict):
+    text = message_text(message)
+    if not text:
+        return None
+    chat = message.get("chat") or {}
+    reply_to = message.get("reply_to_message") or {}
+    reply_to_message_id = reply_to.get("message_id")
+    chat_id = str(chat.get("id"))
+    with locked_review_state(args.review_state_file) as review_state:
+        prune_pending_actions(review_state, args.pending_action_ttl_seconds)
+        token, session = find_edit_session(review_state, chat_id, reply_to_message_id)
+        if not token or not isinstance(session, dict):
+            return None
+        if not apply_edit_reply(session, text):
+            return {"handled": True, "path": "edit_reply", "reason": "invalid_edit_reply"}
+        refresh_review_message(args, token, session)
+
+    if args.telegram_token and not args.dry_run:
+        send_reply(
+            args.telegram_token,
+            chat_id,
+            message["message_id"],
+            "Updated the thought. Press Commit when ready.",
+        )
+    return {
+        "handled": True,
+        "path": "edit_reply",
+        "decision": "edited",
+        "telegram_message_id": message.get("message_id"),
+    }
+
+
 def process_callback_query(args, state: dict, callback_query: dict):
     callback_id = callback_query.get("id")
     data = callback_query.get("data") or ""
@@ -947,13 +1070,15 @@ def process_callback_query(args, state: dict, callback_query: dict):
             answer_callback_query(args.telegram_token, callback_id, "This chat is not allowed.")
         return {"handled": False, "reason": "chat_not_allowed"}
 
-    match = re.fullmatch(r"ob1:(record|ignore):([0-9a-f]+)", data.strip())
-    if not match:
+    parsed = parse_callback_data(data)
+    if not parsed:
         if args.telegram_token and callback_id:
             answer_callback_query(args.telegram_token, callback_id, "Unknown action.")
         return {"handled": False, "reason": "unknown_callback"}
 
-    action, token = match.groups()
+    action = parsed["action"]
+    token = parsed["token"]
+    thought_index = parsed["index"]
     with locked_review_state(args.review_state_file) as review_state:
         prune_pending_actions(review_state, args.pending_action_ttl_seconds)
         pending = review_state.setdefault("pending_actions", {}).get(token)
@@ -968,39 +1093,182 @@ def process_callback_query(args, state: dict, callback_query: dict):
             return {"handled": False, "reason": "chat_mismatch"}
 
         source_payload = pending.get("source_payload") or {}
-        thought_payloads = pending.get("thought_payloads") or []
         review_message_id = pending.get("review_message_id")
         kind = pending.get("kind") or "review"
+        thoughts = pending.get("thoughts") or []
 
-        if action == "record" and not args.dry_run:
-            ingest_text_capture(args, source_payload, thought_payloads)
+        if action == "view_raw":
+            send_review_raw_source(args, pending)
+            if args.telegram_token and callback_id:
+                answer_callback_query(args.telegram_token, callback_id, "Sent raw source.")
+            return {
+                "handled": True,
+                "path": "callback",
+                "decision": "view_raw",
+                "review_kind": kind,
+                "telegram_user_id": from_user.get("id"),
+            }
+
+        if not review_session_has_thoughts(pending):
+            if action not in {"record", "ignore"}:
+                if args.telegram_token and callback_id:
+                    answer_callback_query(args.telegram_token, callback_id, "Use Record or Ignore for this prompt.")
+                return {"handled": False, "reason": "invalid_simple_review_action"}
+            if action == "record" and not args.dry_run:
+                ingest_text_capture(args, source_payload, [])
+                record_resolution(review_state, token, pending, DICTATION_RESOLUTION_INGESTED)
+            elif action == "ignore":
+                record_resolution(review_state, token, pending, DICTATION_RESOLUTION_IGNORED)
+            if args.telegram_token and callback_id:
+                answer_callback_query(
+                    args.telegram_token,
+                    callback_id,
+                    "Recorded." if action == "record" else "Ignored.",
+                )
+            if args.telegram_token and review_message_id and not args.dry_run:
+                final_text = (
+                    "Recorded by request. Stored 1 source row and 0 thought rows."
+                    if action == "record"
+                    else f"Ignored. Nothing was stored from this {kind.replace('_', ' ')} capture."
+                )
+                edit_message(args.telegram_token, chat_id, int(review_message_id), final_text)
+            review_state.setdefault("pending_actions", {}).pop(token, None)
+            return {
+                "handled": True,
+                "path": "callback",
+                "decision": action,
+                "review_kind": kind,
+                "source_dedupe_key": source_payload.get("dedupe_key"),
+                "thought_count": 0,
+                "telegram_user_id": from_user.get("id"),
+            }
+
+        if action == "approve":
+            if thought_index is None or thought_index >= len(thoughts):
+                return {"handled": False, "reason": "invalid_thought_index"}
+            thoughts[thought_index]["status"] = THOUGHT_STATUS_APPROVED
+            refresh_review_message(args, token, pending)
+            if args.telegram_token and callback_id:
+                answer_callback_query(args.telegram_token, callback_id, f"Approved thought {thought_index + 1}.")
+            return {
+                "handled": True,
+                "path": "callback",
+                "decision": "approved",
+                "review_kind": kind,
+                "source_dedupe_key": source_payload.get("dedupe_key"),
+                "thought_count": len(thoughts),
+                "telegram_user_id": from_user.get("id"),
+            }
+
+        if action == "deny":
+            if thought_index is None or thought_index >= len(thoughts):
+                return {"handled": False, "reason": "invalid_thought_index"}
+            thoughts[thought_index]["status"] = THOUGHT_STATUS_DENIED
+            refresh_review_message(args, token, pending)
+            if args.telegram_token and callback_id:
+                answer_callback_query(args.telegram_token, callback_id, f"Denied thought {thought_index + 1}.")
+            return {
+                "handled": True,
+                "path": "callback",
+                "decision": "denied",
+                "review_kind": kind,
+                "source_dedupe_key": source_payload.get("dedupe_key"),
+                "thought_count": len(thoughts),
+                "telegram_user_id": from_user.get("id"),
+            }
+
+        if action == "approve_all":
+            for thought in thoughts:
+                if thought.get("status") != "edited":
+                    thought["status"] = THOUGHT_STATUS_APPROVED
+            refresh_review_message(args, token, pending)
+            if args.telegram_token and callback_id:
+                answer_callback_query(args.telegram_token, callback_id, "Approved all thoughts.")
+            return {
+                "handled": True,
+                "path": "callback",
+                "decision": "approved_all",
+                "review_kind": kind,
+                "source_dedupe_key": source_payload.get("dedupe_key"),
+                "thought_count": len(thoughts),
+                "telegram_user_id": from_user.get("id"),
+            }
+
+        if action == "edit":
+            if thought_index is None or thought_index >= len(thoughts):
+                return {"handled": False, "reason": "invalid_thought_index"}
+            if not prompt_for_thought_edit(args, review_state, token, pending, thought_index):
+                return {"handled": False, "reason": "edit_prompt_failed"}
+            if args.telegram_token and callback_id:
+                answer_callback_query(args.telegram_token, callback_id, "Reply to the edit prompt with the replacement text.")
+            return {
+                "handled": True,
+                "path": "callback",
+                "decision": "edit_requested",
+                "review_kind": kind,
+                "source_dedupe_key": source_payload.get("dedupe_key"),
+                "thought_count": len(thoughts),
+                "telegram_user_id": from_user.get("id"),
+            }
+
+        if action == "commit":
+            final_thoughts = approved_session_payloads(pending)
+            if not final_thoughts:
+                if args.telegram_token and callback_id:
+                    answer_callback_query(args.telegram_token, callback_id, "No approved thoughts to commit.")
+                return {"handled": True, "path": "callback", "decision": "commit_blocked", "reason": "no_approved_thoughts"}
+            if not args.dry_run:
+                ingest_text_capture(args, source_payload, final_thoughts)
+                record_resolution(review_state, token, pending, DICTATION_RESOLUTION_INGESTED)
+            if args.telegram_token and callback_id:
+                answer_callback_query(args.telegram_token, callback_id, "Recorded.")
+            if args.telegram_token and review_message_id and not args.dry_run:
+                edit_message(
+                    args.telegram_token,
+                    chat_id,
+                    int(review_message_id),
+                    f"Recorded by request. Stored 1 source row and {len(final_thoughts)} thought rows.",
+                    reply_markup={"inline_keyboard": []},
+                )
+            review_state.setdefault("pending_actions", {}).pop(token, None)
+            return {
+                "handled": True,
+                "path": "callback",
+                "decision": "commit",
+                "review_kind": kind,
+                "source_dedupe_key": source_payload.get("dedupe_key"),
+                "thought_count": len(final_thoughts),
+                "telegram_user_id": from_user.get("id"),
+            }
+
+        if action == "deny_all":
+            record_resolution(review_state, token, pending, DICTATION_RESOLUTION_IGNORED)
+            if args.telegram_token and callback_id:
+                answer_callback_query(args.telegram_token, callback_id, "Ignored.")
+            if args.telegram_token and review_message_id and not args.dry_run:
+                edit_message(
+                    args.telegram_token,
+                    chat_id,
+                    int(review_message_id),
+                    f"Ignored. Nothing was stored from this {kind.replace('_', ' ')} capture.",
+                    reply_markup={"inline_keyboard": []},
+                )
+            review_state.setdefault("pending_actions", {}).pop(token, None)
+            return {
+                "handled": True,
+                "path": "callback",
+                "decision": "deny_all",
+                "review_kind": kind,
+                "source_dedupe_key": source_payload.get("dedupe_key"),
+                "thought_count": len(thoughts),
+                "telegram_user_id": from_user.get("id"),
+            }
 
         if args.telegram_token and callback_id:
-            answer_callback_query(
-                args.telegram_token,
-                callback_id,
-                "Recorded." if action == "record" else "Ignored.",
-            )
+            answer_callback_query(args.telegram_token, callback_id, "Unknown action.")
+        return {"handled": False, "reason": "unknown_review_action"}
 
-        if args.telegram_token and review_message_id and not args.dry_run:
-            final_text = (
-                f"Recorded by request. Stored 1 source row and {len(thought_payloads)} thought rows."
-                if action == "record"
-                else f"Ignored. Nothing was stored from this {kind.replace('_', ' ')} capture."
-            )
-            edit_message(args.telegram_token, chat_id, int(review_message_id), final_text)
-
-        review_state.setdefault("pending_actions", {}).pop(token, None)
-
-    return {
-        "handled": True,
-        "path": "callback",
-        "decision": action,
-        "review_kind": kind,
-        "source_dedupe_key": source_payload.get("dedupe_key"),
-        "thought_count": len(thought_payloads),
-        "telegram_user_id": from_user.get("id"),
-    }
+    return {"handled": False, "reason": "callback_fell_through"}
 
 
 def process_message(args, state: dict, message: dict):
@@ -1012,6 +1280,9 @@ def process_message(args, state: dict, message: dict):
         return {"handled": False, "reason": "chat_not_allowed"}
 
     if message_text(message):
+        edit_result = process_edit_reply_message(args, message)
+        if edit_result:
+            return edit_result
         return process_text_message(args, state, message)
     if message_audio_descriptor(message):
         return process_audio_message(args, message)
