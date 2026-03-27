@@ -35,10 +35,19 @@ from recipes.shared_docling import (
 )
 from recipes.shared_object_store import first_env, optional_env_flag, resolve_minio_endpoint
 from recipes.shared_telegram_review_state import (
+    DICTATION_RESOLUTION_EXPIRED,
+    DICTATION_RESOLUTION_IGNORED,
+    DICTATION_RESOLUTION_INGESTED,
+    REVIEW_MODE_EXCEPTIONS_ONLY,
+    REVIEW_MODE_FULL,
+    build_review_reply_markup,
+    build_review_session,
     default_review_state_path,
     locked_review_state,
+    normalize_review_mode,
     pending_action_token,
     prune_pending_actions,
+    render_review_text,
 )
 
 
@@ -67,6 +76,10 @@ DEFAULT_TELEGRAM_REVIEW_MATCH_THRESHOLD = float(os.environ.get("TELEGRAM_REVIEW_
 DEFAULT_TELEGRAM_REVIEW_MATCH_COUNT = int(os.environ.get("TELEGRAM_REVIEW_MATCH_COUNT", "3"))
 DEFAULT_TELEGRAM_PENDING_ACTION_TTL_SECONDS = int(os.environ.get("TELEGRAM_PENDING_ACTION_TTL_SECONDS", "86400"))
 DEFAULT_TELEGRAM_REVIEW_STATE_PATH = default_review_state_path(RECIPE_DIR / "telegram-review-state.json")
+DEFAULT_TELEGRAM_REVIEW_MODE = normalize_review_mode(
+    first_env("TELEGRAM_REVIEW_MODE", "DICTATION_TELEGRAM_REVIEW_MODE", default=REVIEW_MODE_FULL),
+    default=REVIEW_MODE_FULL,
+)
 
 THOUGHTS_TOOL = {
     "type": "function",
@@ -192,6 +205,12 @@ def parse_args():
     parser.add_argument("--telegram-bot-token", default=DEFAULT_TELEGRAM_BOT_TOKEN, help="Telegram bot token for review prompts on Telegram-origin transcripts.")
     parser.add_argument("--telegram-review-match-threshold", type=float, default=DEFAULT_TELEGRAM_REVIEW_MATCH_THRESHOLD, help="Similarity threshold for Telegram transcript novelty review.")
     parser.add_argument("--telegram-review-match-count", type=int, default=DEFAULT_TELEGRAM_REVIEW_MATCH_COUNT, help="Max similar rows per candidate for Telegram transcript novelty review.")
+    parser.add_argument(
+        "--telegram-review-mode",
+        choices=[REVIEW_MODE_FULL, REVIEW_MODE_EXCEPTIONS_ONLY],
+        default=DEFAULT_TELEGRAM_REVIEW_MODE,
+        help="Telegram review mode for Telegram-origin dictation artifacts.",
+    )
     parser.add_argument("--telegram-pending-action-ttl-seconds", type=int, default=DEFAULT_TELEGRAM_PENDING_ACTION_TTL_SECONDS, help="How long Telegram review prompts remain actionable.")
     parser.add_argument("--telegram-review-state-file", default=str(DEFAULT_TELEGRAM_REVIEW_STATE_PATH), help="Path to shared Telegram review-state JSON.")
     parser.add_argument("--dry-run", action="store_true", help="Parse and report without ingesting.")
@@ -234,6 +253,51 @@ def save_sync_log(path: Path, payload):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2, sort_keys=True)
+
+
+def reconcile_telegram_review_resolutions(args, log: dict) -> int:
+    if args.dry_run:
+        return 0
+    with locked_review_state(args.telegram_review_state_file) as review_state:
+        prune_pending_actions(review_state, args.telegram_pending_action_ttl_seconds)
+        resolved = review_state.setdefault("resolved_actions", {})
+        if not resolved:
+            return 0
+        processed = log.setdefault("processed", {})
+        acknowledged = []
+        now = datetime.now(timezone.utc).isoformat()
+        for token, resolution in list(resolved.items()):
+            if not isinstance(resolution, dict):
+                continue
+            dictation_sync = resolution.get("dictation_sync")
+            if not isinstance(dictation_sync, dict):
+                continue
+            status = resolution.get("status")
+            if status not in {
+                DICTATION_RESOLUTION_INGESTED,
+                DICTATION_RESOLUTION_IGNORED,
+                DICTATION_RESOLUTION_EXPIRED,
+            }:
+                continue
+            keys = []
+            for key_name in ("dedupe_key", "ref_key"):
+                key = dictation_sync.get(key_name)
+                if key and key not in keys:
+                    keys.append(key)
+            updated = False
+            for key in keys:
+                entry = processed.get(key)
+                if not isinstance(entry, dict):
+                    continue
+                entry["status"] = status
+                entry["updated_at"] = now
+                entry["review_resolved_at"] = resolution.get("resolved_at")
+                updated = True
+            if updated:
+                acknowledged.append(token)
+        for token in acknowledged:
+            resolved.pop(token, None)
+        return len(acknowledged)
 
 
 def minio_client(args):
@@ -408,7 +472,7 @@ def send_reply(token: str, chat_id: str, reply_to_message_id: int, text: str):
     )
 
 
-def send_action_prompt(token: str, chat_id: str, reply_to_message_id: int, text: str, action_token: str):
+def send_action_prompt(token: str, chat_id: str, reply_to_message_id: int, text: str, *, reply_markup: dict):
     return telegram_api_call(
         token,
         "sendMessage",
@@ -417,12 +481,7 @@ def send_action_prompt(token: str, chat_id: str, reply_to_message_id: int, text:
             "reply_to_message_id": reply_to_message_id,
             "text": text,
             "allow_sending_without_reply": True,
-            "reply_markup": {
-                "inline_keyboard": [[
-                    {"text": "Record", "callback_data": f"ob1:record:{action_token}"},
-                    {"text": "Ignore", "callback_data": f"ob1:ignore:{action_token}"},
-                ]]
-            },
+            "reply_markup": reply_markup,
         },
     )
 
@@ -644,7 +703,18 @@ def build_review_prompt(reason: str, *, review_kind: str):
     return "I am not confident this voice transcript should be recorded automatically. Record it anyway or ignore it?"
 
 
-def register_telegram_review(args, metadata: dict, *, review_kind: str, prompt_text: str, source_payload: dict, thought_payloads: list[dict]):
+def register_telegram_review(
+    args,
+    metadata: dict,
+    *,
+    review_kind: str,
+    prompt_text: str,
+    source_payload: dict,
+    thought_payloads: list[dict],
+    suggested_decisions: dict[str, str] | None = None,
+    similar_matches: dict[str, list[dict]] | None = None,
+    dictation_sync: dict | None = None,
+):
     if not args.telegram_bot_token:
         raise RuntimeError("Telegram bot token is required to review Telegram-origin dictation artifacts.")
 
@@ -655,17 +725,28 @@ def register_telegram_review(args, metadata: dict, *, review_kind: str, prompt_t
 
     message_id = int(message_id_raw)
     action_token = pending_action_token()
-    prompt_result = send_action_prompt(args.telegram_bot_token, chat_id, message_id, prompt_text, action_token)
-
-    pending_entry = {
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "kind": review_kind,
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "review_message_id": prompt_result.get("message_id") if isinstance(prompt_result, dict) else None,
-        "source_payload": source_payload,
-        "thought_payloads": thought_payloads,
-    }
+    pending_entry = build_review_session(
+        origin="telegram_dictation",
+        kind=review_kind,
+        chat_id=chat_id,
+        message_id=message_id,
+        source_payload=source_payload,
+        thought_payloads=thought_payloads,
+        suggested_decisions=suggested_decisions,
+        similar_matches=similar_matches,
+        prompt_text=prompt_text,
+        mode=args.telegram_review_mode,
+        dictation_sync=dictation_sync,
+    )
+    prompt_result = send_action_prompt(
+        args.telegram_bot_token,
+        chat_id,
+        message_id,
+        render_review_text(pending_entry),
+        reply_markup=build_review_reply_markup(pending_entry, action_token),
+    )
+    if isinstance(prompt_result, dict):
+        pending_entry["review_message_id"] = prompt_result.get("message_id")
 
     with locked_review_state(args.telegram_review_state_file) as review_state:
         prune_pending_actions(review_state, args.telegram_pending_action_ttl_seconds)
@@ -709,6 +790,10 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
 
     duplicate_count = 0
     uncertain_count = 0
+    dictation_sync = {
+        "dedupe_key": source_dedupe_key,
+        "ref_key": ref_key,
+    }
 
     if is_telegram_capture(metadata):
         if not thoughts:
@@ -723,6 +808,7 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
                     prompt_text=prompt_text,
                     source_payload=source_payload,
                     thought_payloads=[],
+                    dictation_sync=dictation_sync,
                 )
             mark_review_pending(
                 log,
@@ -759,6 +845,7 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
             novelty_reviews = [{"thought": thought, "decision": "record", "reason": "dry-run"} for thought in thoughts]
 
         review_by_thought = {item["thought"]: item for item in novelty_reviews}
+        suggested_decisions = {item["thought"]: item.get("decision", "") for item in novelty_reviews}
         approved_payloads = []
         for payload in thought_payloads:
             decision = review_by_thought.get(payload["content"], {}).get("decision", "uncertain")
@@ -768,6 +855,42 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
                 duplicate_count += 1
             else:
                 uncertain_count += 1
+
+        if args.telegram_review_mode == REVIEW_MODE_FULL:
+            if args.dry_run:
+                action_token = "dry-run"
+            else:
+                action_token = register_telegram_review(
+                    args,
+                    metadata,
+                    review_kind="review",
+                    prompt_text="",
+                    source_payload=source_payload,
+                    thought_payloads=thought_payloads,
+                    suggested_decisions=suggested_decisions,
+                    similar_matches=similar_matches,
+                    dictation_sync=dictation_sync,
+                )
+            mark_review_pending(
+                log,
+                source_dedupe_key,
+                ref_key,
+                metadata,
+                len(thought_payloads),
+                review_kind="review",
+                action_token=action_token,
+            )
+            return {
+                "skipped": False,
+                "dry_run": args.dry_run,
+                "source_dedupe_key": source_dedupe_key,
+                "title": normalize_optional_string(metadata.get("title")),
+                "thoughts": thoughts,
+                "review_required": True,
+                "review_kind": "review",
+                "duplicate_count": duplicate_count,
+                "uncertain_count": uncertain_count,
+            }
 
         if not approved_payloads:
             review_kind = "duplicate" if duplicate_count else "uncertain"
@@ -782,6 +905,9 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
                     prompt_text=prompt_text,
                     source_payload=source_payload,
                     thought_payloads=thought_payloads,
+                    suggested_decisions=suggested_decisions,
+                    similar_matches=similar_matches,
+                    dictation_sync=dictation_sync,
                 )
             mark_review_pending(
                 log,
@@ -875,6 +1001,7 @@ def iter_artifacts(args):
 
 
 def run_once(args, log: dict):
+    reconciled = reconcile_telegram_review_resolutions(args, log)
     processed = 0
     skipped = 0
     for artifact in iter_artifacts(args):
@@ -893,7 +1020,7 @@ def run_once(args, log: dict):
                 )
             else:
                 print(f"Imported {result['title'] or '(untitled)'} -> {len(result.get('thoughts', []))} thoughts")
-    return {"processed": processed, "skipped": skipped}
+    return {"processed": processed, "skipped": skipped, "reconciled": reconciled}
 
 
 def poll_loop(args, log: dict):
@@ -901,7 +1028,10 @@ def poll_loop(args, log: dict):
         stats = run_once(args, log)
         save_sync_log(args.sync_log_file, log)
         if args.verbose:
-            print(f"Poll cycle complete: processed={stats['processed']} skipped={stats['skipped']}")
+            print(
+                f"Poll cycle complete: processed={stats['processed']} "
+                f"skipped={stats['skipped']} reconciled={stats['reconciled']}"
+            )
         time.sleep(max(args.poll_interval, 1))
 
 

@@ -60,6 +60,7 @@ Recommended for Telegram-origin dictation review:
 
 ```bash
 export TELEGRAM_BOT_TOKEN=...
+export TELEGRAM_REVIEW_MODE=full
 export TELEGRAM_REVIEW_MATCH_THRESHOLD=0.78
 export TELEGRAM_REVIEW_MATCH_COUNT=3
 export TELEGRAM_REVIEW_STATE_FILE=/usr/local/var/ob1-telegram-bridge/telegram-review-state.json
@@ -104,8 +105,11 @@ For each imported artifact:
 For Telegram-origin artifacts:
 
 - low-signal transcripts are not auto-ingested
-- duplicate or uncertain transcripts are not auto-ingested
-- the bot sends a `Record / Ignore` review prompt instead
+- extracted thoughts are shown in Telegram before ingest
+- the user can approve, edit, deny, commit, or view the raw transcript
+- nothing is stored until `Commit`
+- zero-thought transcripts still use the simpler `Record / Ignore` override path
+- set `TELEGRAM_REVIEW_MODE=exceptions_only` to keep the older auto-ingest behavior for clearly novel thoughts
 
 ## Notes
 
