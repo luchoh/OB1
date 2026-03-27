@@ -57,6 +57,33 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
             ],
         )
 
+    def test_render_review_text_shows_closest_existing_memories(self):
+        session = review_state.build_review_session(
+            origin="telegram_dictation",
+            kind="review",
+            chat_id="123",
+            message_id=456,
+            source_payload={"content": "raw source", "dedupe_key": "dictation:1"},
+            thought_payloads=[{"content": "Reality is the training context for humans.", "metadata": {"summary": "Reality is the training context for humans."}}],
+            suggested_decisions={"Reality is the training context for humans.": "duplicate"},
+            similar_matches={
+                "Reality is the training context for humans.": [
+                    {
+                        "summary": "Humans can be conceptualized as neural networks currently in training.",
+                        "similarity": 0.8419,
+                        "source": "dictation",
+                        "type": "dictation_thought",
+                    }
+                ]
+            },
+            prompt_text="This voice transcript looks like it may already be recorded. Record it anyway or ignore it?",
+        )
+
+        rendered = review_state.render_review_text(session)
+        self.assertIn("Closest existing memories:", rendered)
+        self.assertIn("similarity=0.84", rendered)
+        self.assertIn("Humans can be conceptualized as neural networks currently in training.", rendered)
+
     def test_parse_callback_data(self):
         parsed = review_state.parse_callback_data("ob1:approve:0123456789abcdef:2")
         self.assertEqual(
@@ -200,6 +227,48 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
             self.assertEqual(
                 log["processed"]["minio:canonical/item.md"]["status"],
                 review_state.DICTATION_RESOLUTION_IGNORED,
+            )
+            persisted = json.loads(review_state_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["resolved_actions"], {})
+
+    def test_dictation_reconciliation_updates_review_pending_entries_to_ingested(self):
+        fake_yaml = types.ModuleType("yaml")
+        fake_yaml.safe_load = lambda text: {}
+        sys.modules.setdefault("yaml", fake_yaml)
+        importer = load_module("dictation_import_test_record", "recipes/dictation-import/import-dictation.py")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            review_state_path = Path(tmpdir) / "telegram-review-state.json"
+            token = "0011223344556677"
+            payload = review_state.review_state_payload_default()
+            payload["resolved_actions"][token] = {
+                "resolved_at": "2026-03-26T00:00:00+00:00",
+                "status": review_state.DICTATION_RESOLUTION_INGESTED,
+                "dictation_sync": {
+                    "dedupe_key": "dictation:def",
+                    "ref_key": "minio:canonical/other-item.md",
+                },
+            }
+            review_state_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            log = {
+                "schema_version": 1,
+                "processed": {
+                    "dictation:def": {"status": "review_pending", "action_token": token},
+                    "minio:canonical/other-item.md": {"status": "review_pending", "action_token": token},
+                },
+            }
+            args = SimpleNamespace(
+                dry_run=False,
+                telegram_review_state_file=review_state_path,
+                telegram_pending_action_ttl_seconds=86400,
+            )
+            reconciled = importer.reconcile_telegram_review_resolutions(args, log)
+            self.assertEqual(reconciled, 1)
+            self.assertEqual(log["processed"]["dictation:def"]["status"], review_state.DICTATION_RESOLUTION_INGESTED)
+            self.assertEqual(
+                log["processed"]["minio:canonical/other-item.md"]["status"],
+                review_state.DICTATION_RESOLUTION_INGESTED,
             )
             persisted = json.loads(review_state_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["resolved_actions"], {})
