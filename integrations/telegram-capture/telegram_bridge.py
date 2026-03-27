@@ -909,6 +909,7 @@ def process_text_message(args, state: dict, message: dict):
             source_payload=source_payload,
             thought_payloads=thought_payloads,
             suggested_decisions=suggested_decisions,
+            similar_matches=similar_matches,
             mode=args.review_mode,
         )
         token = register_review_session(args, message, session)
@@ -933,6 +934,7 @@ def process_text_message(args, state: dict, message: dict):
             source_payload=source_payload,
             thought_payloads=thought_payloads,
             suggested_decisions=suggested_decisions,
+            similar_matches=similar_matches,
             mode=args.review_mode,
         )
         token = register_review_session(args, message, session)

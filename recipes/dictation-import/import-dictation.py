@@ -712,6 +712,7 @@ def register_telegram_review(
     source_payload: dict,
     thought_payloads: list[dict],
     suggested_decisions: dict[str, str] | None = None,
+    similar_matches: dict[str, list[dict]] | None = None,
     dictation_sync: dict | None = None,
 ):
     if not args.telegram_bot_token:
@@ -732,6 +733,7 @@ def register_telegram_review(
         source_payload=source_payload,
         thought_payloads=thought_payloads,
         suggested_decisions=suggested_decisions,
+        similar_matches=similar_matches,
         prompt_text=prompt_text,
         mode=args.telegram_review_mode,
         dictation_sync=dictation_sync,
@@ -866,6 +868,7 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
                     source_payload=source_payload,
                     thought_payloads=thought_payloads,
                     suggested_decisions=suggested_decisions,
+                    similar_matches=similar_matches,
                     dictation_sync=dictation_sync,
                 )
             mark_review_pending(
@@ -903,6 +906,7 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
                     source_payload=source_payload,
                     thought_payloads=thought_payloads,
                     suggested_decisions=suggested_decisions,
+                    similar_matches=similar_matches,
                     dictation_sync=dictation_sync,
                 )
             mark_review_pending(

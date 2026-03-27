@@ -56,6 +56,50 @@ def truncate_for_summary(text: str, limit: int = 120) -> str:
     return f"{cleaned[: max(limit - 1, 1)].rstrip()}..."
 
 
+def _normalize_match_text(value: object, *, limit: int = 160) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        cleaned = " ".join(value.split()).strip()
+    else:
+        cleaned = " ".join(str(value).split()).strip()
+    if not cleaned:
+        return None
+    return truncate_for_summary(cleaned, limit)
+
+
+def _normalize_match_similarity(value: object) -> str | None:
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_similar_match_entries(
+    content: str,
+    similar_matches: dict[str, list[dict]] | None,
+) -> list[dict]:
+    if not isinstance(similar_matches, dict):
+        return []
+
+    condensed = []
+    for match in similar_matches.get(content, [])[:2]:
+        if not isinstance(match, dict):
+            continue
+        summary = _normalize_match_text(match.get("summary")) or _normalize_match_text(match.get("content"))
+        if not summary:
+            continue
+        condensed.append(
+            {
+                "summary": summary,
+                "similarity": _normalize_match_similarity(match.get("similarity")),
+                "source": _normalize_match_text(match.get("source"), limit=48),
+                "type": _normalize_match_text(match.get("type"), limit=48),
+            }
+        )
+    return condensed
+
+
 def _ensure_review_payload(payload: dict) -> dict:
     if not isinstance(payload, dict):
         payload = review_state_payload_default()
@@ -71,6 +115,7 @@ def build_review_thought_entries(
     thought_payloads: list[dict],
     *,
     suggested_decisions: dict[str, str] | None = None,
+    similar_matches: dict[str, list[dict]] | None = None,
 ) -> list[dict]:
     entries = []
     decisions = suggested_decisions or {}
@@ -92,6 +137,7 @@ def build_review_thought_entries(
                 "original_content": content,
                 "payload": payload_copy,
                 "suggested_decision": decision or None,
+                "similar_matches": _build_similar_match_entries(content, similar_matches),
             }
         )
     return entries
@@ -106,6 +152,7 @@ def build_review_session(
     source_payload: dict,
     thought_payloads: list[dict],
     suggested_decisions: dict[str, str] | None = None,
+    similar_matches: dict[str, list[dict]] | None = None,
     prompt_text: str | None = None,
     mode: str = REVIEW_MODE_FULL,
     view_raw_enabled: bool = True,
@@ -127,6 +174,7 @@ def build_review_session(
         "thoughts": build_review_thought_entries(
             thought_payloads,
             suggested_decisions=suggested_decisions,
+            similar_matches=similar_matches,
         ),
         "edit_target_index": None,
         "edit_prompt_message_id": None,
@@ -212,24 +260,47 @@ def find_edit_session(review_state: dict, chat_id: str, reply_to_message_id: int
 
 
 def render_review_text(session: dict) -> str:
+    prompt_text = (session.get("prompt_text") or "").strip()
     thoughts = session.get("thoughts", [])
     if not thoughts:
-        return (session.get("prompt_text") or "Record this anyway or ignore it?").strip()
+        return prompt_text or "Record this anyway or ignore it?"
 
     origin = session.get("origin") or "telegram_text"
     source_label = "voice transcript" if origin == "telegram_dictation" else "Telegram capture"
-    lines = [
-        f"OB1 extracted {len(thoughts)} candidate thoughts from this {source_label}.",
-        "",
-        "Nothing is stored until you press Commit.",
-        "",
-    ]
+    lines = []
+    if prompt_text:
+        lines.extend([prompt_text, ""])
+    lines.extend(
+        [
+            f"OB1 extracted {len(thoughts)} candidate thoughts from this {source_label}.",
+            "",
+            "Nothing is stored until you press Commit.",
+            "",
+        ]
+    )
     for thought in thoughts:
         index = int(thought.get("index", 0)) + 1
         content = thought.get("content") or ""
         status = (thought.get("status") or THOUGHT_STATUS_PENDING).replace("_", " ")
         lines.append(f"{index}. {content}")
         lines.append(f"   Status: {status}")
+        similar_matches = thought.get("similar_matches") or []
+        if similar_matches:
+            lines.append("   Closest existing memories:")
+            for match_index, match in enumerate(similar_matches, start=1):
+                details = []
+                if match.get("similarity"):
+                    details.append(f"similarity={match['similarity']}")
+                if match.get("type"):
+                    details.append(f"type={match['type']}")
+                if match.get("source"):
+                    details.append(f"source={match['source']}")
+                prefix = f"   {match_index}."
+                if details:
+                    lines.append(f"{prefix} {' '.join(details)}")
+                    lines.append(f"      {match.get('summary')}")
+                else:
+                    lines.append(f"{prefix} {match.get('summary')}")
         lines.append("")
     return "\n".join(lines).strip()
 
