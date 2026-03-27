@@ -698,6 +698,15 @@ def refresh_review_message(args, token: str, session: dict):
     )
 
 
+def single_thought_payloads(session: dict) -> list[dict]:
+    thoughts = session.get("thoughts") or []
+    if len(thoughts) != 1:
+        return []
+    forced = dict(thoughts[0])
+    forced["status"] = THOUGHT_STATUS_APPROVED
+    return approved_session_payloads({"thoughts": [forced]})
+
+
 def send_review_raw_source(args, session: dict):
     if not args.telegram_token or args.dry_run:
         return
@@ -1155,6 +1164,59 @@ def process_callback_query(args, state: dict, callback_query: dict):
                 "review_kind": kind,
                 "source_dedupe_key": source_payload.get("dedupe_key"),
                 "thought_count": 0,
+                "telegram_user_id": from_user.get("id"),
+            }
+
+        if len(thoughts) == 1 and action in {"record", "ignore"}:
+            if action == "record":
+                final_thoughts = single_thought_payloads(pending)
+                if not final_thoughts:
+                    if args.telegram_token and callback_id:
+                        answer_callback_query(args.telegram_token, callback_id, "No thought available to record.")
+                    return {"handled": True, "path": "callback", "decision": "record_blocked", "reason": "missing_single_thought"}
+                if not args.dry_run:
+                    ingest_text_capture(args, source_payload, final_thoughts)
+                    record_resolution(review_state, token, pending, DICTATION_RESOLUTION_INGESTED)
+                if args.telegram_token and callback_id:
+                    answer_callback_query(args.telegram_token, callback_id, "Recorded.")
+                if args.telegram_token and review_message_id and not args.dry_run:
+                    edit_message(
+                        args.telegram_token,
+                        chat_id,
+                        int(review_message_id),
+                        f"Recorded by request. Stored 1 source row and {len(final_thoughts)} thought rows.",
+                        reply_markup={"inline_keyboard": []},
+                    )
+                review_state.setdefault("pending_actions", {}).pop(token, None)
+                return {
+                    "handled": True,
+                    "path": "callback",
+                    "decision": "record",
+                    "review_kind": kind,
+                    "source_dedupe_key": source_payload.get("dedupe_key"),
+                    "thought_count": len(final_thoughts),
+                    "telegram_user_id": from_user.get("id"),
+                }
+
+            record_resolution(review_state, token, pending, DICTATION_RESOLUTION_IGNORED)
+            if args.telegram_token and callback_id:
+                answer_callback_query(args.telegram_token, callback_id, "Ignored.")
+            if args.telegram_token and review_message_id and not args.dry_run:
+                edit_message(
+                    args.telegram_token,
+                    chat_id,
+                    int(review_message_id),
+                    f"Ignored. Nothing was stored from this {kind.replace('_', ' ')} capture.",
+                    reply_markup={"inline_keyboard": []},
+                )
+            review_state.setdefault("pending_actions", {}).pop(token, None)
+            return {
+                "handled": True,
+                "path": "callback",
+                "decision": "ignore",
+                "review_kind": kind,
+                "source_dedupe_key": source_payload.get("dedupe_key"),
+                "thought_count": len(thoughts),
                 "telegram_user_id": from_user.get("id"),
             }
 

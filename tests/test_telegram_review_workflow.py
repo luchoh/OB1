@@ -350,6 +350,155 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
                 updated = payload["pending_actions"][token]
                 self.assertEqual(updated["thoughts"][0]["status"], review_state.THOUGHT_STATUS_APPROVED)
 
+    def test_single_thought_review_markup_uses_terminal_actions(self):
+        session = review_state.build_review_session(
+            origin="telegram_text",
+            kind="review",
+            chat_id="123",
+            message_id=456,
+            source_payload={"content": "raw source", "dedupe_key": "telegram:123:456"},
+            thought_payloads=[{"content": "One thought", "metadata": {"summary": "One thought"}}],
+            suggested_decisions={"One thought": "uncertain"},
+        )
+
+        markup = review_state.build_review_reply_markup(session, "0123456789abcdef")
+        labels = [button["text"] for row in markup["inline_keyboard"] for button in row]
+
+        self.assertIn("Record", labels)
+        self.assertIn("Edit", labels)
+        self.assertIn("Ignore", labels)
+        self.assertNotIn("Approve All", labels)
+        self.assertNotIn("Commit", labels)
+        self.assertNotIn("Deny All", labels)
+
+    def test_single_thought_ignore_closes_review_and_records_resolution(self):
+        bridge = load_module("telegram_bridge_single_ignore", "integrations/telegram-capture/telegram_bridge.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "review-state.json"
+            token = "1111222233334444"
+            session = review_state.build_review_session(
+                origin="telegram_dictation",
+                kind="review",
+                chat_id="123",
+                message_id=456,
+                source_payload={"content": "raw source", "dedupe_key": "dictation:123"},
+                thought_payloads=[{"content": "Duplicate thought", "metadata": {"summary": "Duplicate thought"}}],
+                suggested_decisions={"Duplicate thought": "duplicate"},
+                dictation_sync={"dedupe_key": "dictation:123", "ref_key": "minio:canonical/item.md"},
+            )
+            with review_state.locked_review_state(state_path) as payload:
+                payload["pending_actions"][token] = session
+
+            args = SimpleNamespace(
+                allowed_chat_ids={"123"},
+                review_state_file=state_path,
+                pending_action_ttl_seconds=86400,
+                telegram_token="",
+                dry_run=False,
+            )
+            handled = bridge.process_callback_query(
+                args,
+                {},
+                {
+                    "id": "callback-4",
+                    "data": f"ob1:ignore:{token}",
+                    "from": {"id": 1},
+                    "message": {"chat": {"id": 123, "type": "private"}},
+                },
+            )
+
+            self.assertTrue(handled["handled"])
+            self.assertEqual(handled["decision"], "ignore")
+            with review_state.locked_review_state(state_path) as payload:
+                self.assertNotIn(token, payload["pending_actions"])
+                self.assertEqual(
+                    payload["resolved_actions"][token]["status"],
+                    review_state.DICTATION_RESOLUTION_IGNORED,
+                )
+
+    def test_single_thought_record_stores_thought_and_closes_review(self):
+        bridge = load_module("telegram_bridge_single_record", "integrations/telegram-capture/telegram_bridge.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "review-state.json"
+            token = "5555666677778888"
+            session = review_state.build_review_session(
+                origin="telegram_dictation",
+                kind="review",
+                chat_id="123",
+                message_id=456,
+                source_payload={"content": "raw source", "dedupe_key": "dictation:456"},
+                thought_payloads=[{"content": "Duplicate thought", "metadata": {"summary": "Duplicate thought"}}],
+                suggested_decisions={"Duplicate thought": "duplicate"},
+                dictation_sync={"dedupe_key": "dictation:456", "ref_key": "minio:canonical/item-2.md"},
+            )
+            with review_state.locked_review_state(state_path) as payload:
+                payload["pending_actions"][token] = session
+
+            ingests = []
+            bridge.ingest_text_capture = lambda _args, source_payload, thought_payloads: ingests.append((source_payload, thought_payloads))
+
+            args = SimpleNamespace(
+                allowed_chat_ids={"123"},
+                review_state_file=state_path,
+                pending_action_ttl_seconds=86400,
+                telegram_token="",
+                dry_run=False,
+            )
+            handled = bridge.process_callback_query(
+                args,
+                {},
+                {
+                    "id": "callback-5",
+                    "data": f"ob1:record:{token}",
+                    "from": {"id": 1},
+                    "message": {"chat": {"id": 123, "type": "private"}},
+                },
+            )
+
+            self.assertTrue(handled["handled"])
+            self.assertEqual(handled["decision"], "record")
+            self.assertEqual(len(ingests), 1)
+            self.assertEqual(ingests[0][0]["dedupe_key"], "dictation:456")
+            self.assertEqual(len(ingests[0][1]), 1)
+            self.assertEqual(ingests[0][1][0]["content"], "Duplicate thought")
+            with review_state.locked_review_state(state_path) as payload:
+                self.assertNotIn(token, payload["pending_actions"])
+                self.assertEqual(
+                    payload["resolved_actions"][token]["status"],
+                    review_state.DICTATION_RESOLUTION_INGESTED,
+                )
+
+    def test_single_thought_duplicate_review_shows_evidence_and_ignore(self):
+        session = review_state.build_review_session(
+            origin="telegram_dictation",
+            kind="review",
+            chat_id="123",
+            message_id=456,
+            source_payload={"content": "raw source", "dedupe_key": "dictation:789"},
+            thought_payloads=[{"content": "One duplicate", "metadata": {"summary": "One duplicate"}}],
+            suggested_decisions={"One duplicate": "duplicate"},
+            similar_matches={
+                "One duplicate": [
+                    {
+                        "summary": "Existing memory",
+                        "similarity": 0.91,
+                        "source": "dictation",
+                        "type": "dictation_thought",
+                    }
+                ]
+            },
+        )
+
+        rendered = review_state.render_review_text(session)
+        markup = review_state.build_review_reply_markup(session, "9999aaaabbbbcccc")
+        labels = [button["text"] for row in markup["inline_keyboard"] for button in row]
+
+        self.assertIn("Closest existing memories:", rendered)
+        self.assertIn("Existing memory", rendered)
+        self.assertIn("Ignore", labels)
+        self.assertNotIn("Deny All", labels)
+        self.assertNotIn("Deny 1", labels)
+
     def test_dictation_reconciliation_updates_review_pending_entries(self):
         fake_yaml = types.ModuleType("yaml")
         fake_yaml.safe_load = lambda text: {}
