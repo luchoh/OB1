@@ -85,6 +85,21 @@ function envOptionalString(name) {
   return trimmed === "" ? undefined : trimmed;
 }
 
+function envEnum(name, allowedValues, fallback) {
+  const value = envOptionalString(name);
+  if (value === undefined) {
+    return fallback;
+  }
+
+  if (allowedValues.includes(value)) {
+    return value;
+  }
+
+  throw new Error(
+    `Environment variable ${name} must be one of: ${allowedValues.join(", ")}`,
+  );
+}
+
 function withTlsPreference(consul) {
   if (
     consul.skipTlsVerify
@@ -120,6 +135,9 @@ async function discoverConsulService(consul, serviceName) {
 
   const payload = await response.json();
   const entry = payload?.[0];
+  if (!entry) {
+    throw new Error(`No passing Consul instances for ${serviceName}`);
+  }
   const service = entry?.Service ?? {};
   const address = service.Address || entry?.Node?.Address;
   const port = service.Port;
@@ -219,6 +237,8 @@ async function pgConfig(consul) {
 
 async function loadConfig() {
   const runtimeRole = envOptionalString("OPEN_BRAIN_RUNTIME_ROLE") ?? "service";
+  const runtimeArtifactDir = envOptionalString("OPEN_BRAIN_RUNTIME_ARTIFACT_DIR")
+    ?? path.join(serviceDir, ".runtime");
   const consul = {
     addr: envOptionalString("CONSUL_HTTP_ADDR") ?? "https://consul.lincoln.luchoh.net",
     token: envOptionalString("CONSUL_HTTP_TOKEN") ?? "",
@@ -306,6 +326,20 @@ async function loadConfig() {
   const oidcJwksUrl = humanTokenAuthEnabled
     ? envOptionalString("OB1_OIDC_JWKS_URL") ?? `${oidcIssuer}/protocol/openid-connect/certs`
     : envOptionalString("OB1_OIDC_JWKS_URL");
+  const observabilityEnabledByDefault = runtimeRole === "service";
+  const retrievalTelemetryEnabled = envBoolean(
+    "OPEN_BRAIN_RETRIEVAL_TELEMETRY_ENABLED",
+    observabilityEnabledByDefault,
+  );
+  const policyHistoryEnabled = envBoolean(
+    "OPEN_BRAIN_GRAPH_RETRIEVAL_POLICY_HISTORY_ENABLED",
+    observabilityEnabledByDefault,
+  );
+  const retrievalTelemetryPreviewMode = envEnum(
+    "OPEN_BRAIN_RETRIEVAL_TELEMETRY_PREVIEW_MODE",
+    ["none", "hashed_only", "truncated"],
+    "truncated",
+  );
 
   return {
     serviceName: process.env.OPEN_BRAIN_SERVICE_NAME ?? "open-brain-local",
@@ -331,6 +365,21 @@ async function loadConfig() {
         audience: oidcAudience,
         jwksUrl: oidcJwksUrl,
       },
+    },
+    observability: {
+      runtimeArtifactDir,
+      retrievalTelemetry: {
+        enabled: retrievalTelemetryEnabled,
+        path: path.join(runtimeArtifactDir, "retrieval-events.jsonl"),
+        previewMode: retrievalTelemetryPreviewMode,
+        previewChars: envOptionalNumber("OPEN_BRAIN_RETRIEVAL_TELEMETRY_PREVIEW_CHARS", 96) ?? 96,
+      },
+      policyHistory: {
+        enabled: policyHistoryEnabled,
+        path: path.join(runtimeArtifactDir, "graph-retrieval-policy.history.jsonl"),
+        reason: envOptionalString("OPEN_BRAIN_GRAPH_RETRIEVAL_POLICY_REASON") ?? null,
+      },
+      evalsDir: path.join(runtimeArtifactDir, "evals"),
     },
     graph,
     postgres: await pgConfig(consul),

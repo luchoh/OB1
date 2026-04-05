@@ -1,6 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { serviceDir } from "./config.mjs";
+import {
+  appendPolicyRevision,
+  sha256Hex,
+  stableJsonStringify,
+} from "./observability.mjs";
 
 const defaultPolicy = Object.freeze({
   version: 1,
@@ -52,8 +57,7 @@ const defaultPolicy = Object.freeze({
   },
 });
 
-let cachedPath = null;
-let cachedPolicy = null;
+let cachedState = null;
 
 function readJson(filepath) {
   return JSON.parse(fs.readFileSync(filepath, "utf8"));
@@ -155,15 +159,63 @@ function normalizePolicy(raw) {
   };
 }
 
+function policyArtifact(policy) {
+  return {
+    version: policy.version,
+    default_max_hops: policy.defaultMaxHops,
+    default_added_rows: policy.defaultAddedRows,
+    per_seed_traversal_limit: policy.perSeedTraversalLimit,
+    allowed_node_labels: [...policy.allowedNodeLabels],
+    allowed_retrieval_roles: [...policy.allowedRetrievalRoles],
+    ranking: {
+      similarity_weight: policy.ranking.similarityWeight,
+      seed_bonus: policy.ranking.seedBonus,
+      vector_rank_penalty: policy.ranking.vectorRankPenalty,
+      hop_penalty: policy.ranking.hopPenalty,
+      retrieval_role_penalties: { ...policy.ranking.retrievalRolePenalties },
+      anchor_type_bonuses: { ...policy.ranking.anchorTypeBonuses },
+      entity_anchor_exact_bonus: policy.ranking.entityAnchorExactBonus,
+      entity_anchor_partial_bonus: policy.ranking.entityAnchorPartialBonus,
+      entity_anchor_exact_base_bonus: policy.ranking.entityAnchorExactBaseBonus,
+      entity_anchor_exact_per_matched_term_bonus: policy.ranking.entityAnchorExactPerMatchedTermBonus,
+      entity_anchor_residual_question_penalty: policy.ranking.entityAnchorResidualQuestionPenalty,
+      entity_anchor_label_bonuses: { ...policy.ranking.entityAnchorLabelBonuses },
+      bundle_count_bonus: policy.ranking.bundleCountBonus,
+      bundle_graph_support_bonus: policy.ranking.bundleGraphSupportBonus,
+      bundle_seed_graph_bridge_bonus: policy.ranking.bundleSeedGraphBridgeBonus,
+      primary_bundle_row_bonus: policy.ranking.primaryBundleRowBonus,
+      primary_bundle_min_items: policy.ranking.primaryBundleMinItems,
+      same_title_bonus: policy.ranking.sameTitleBonus,
+      same_source_bonus: policy.ranking.sameSourceBonus,
+      same_type_bonus: policy.ranking.sameTypeBonus,
+      different_type_penalty: policy.ranking.differentTypePenalty,
+    },
+  };
+}
+
+function fileSignature(filepath) {
+  if (!fs.existsSync(filepath)) {
+    return "missing";
+  }
+
+  const stats = fs.statSync(filepath);
+  return `${Math.round(stats.mtimeMs)}:${stats.size}`;
+}
+
 export function graphRetrievalPolicyPath() {
   return process.env.OPEN_BRAIN_GRAPH_RETRIEVAL_POLICY_PATH
     ?? path.join(serviceDir, "config", "graph-retrieval-policy.json");
 }
 
-export function loadGraphRetrievalPolicy() {
+export function loadGraphRetrievalPolicyState() {
   const filepath = graphRetrievalPolicyPath();
-  if (cachedPath === filepath && cachedPolicy) {
-    return cachedPolicy;
+  const signature = fileSignature(filepath);
+  if (
+    cachedState
+    && cachedState.filepath === filepath
+    && cachedState.signature === signature
+  ) {
+    return cachedState;
   }
 
   let raw = {};
@@ -171,12 +223,50 @@ export function loadGraphRetrievalPolicy() {
     raw = readJson(filepath);
   }
 
-  cachedPath = filepath;
-  cachedPolicy = normalizePolicy(raw);
-  return cachedPolicy;
+  const policy = normalizePolicy(raw);
+  const artifact = policyArtifact(policy);
+  const policyHash = sha256Hex(stableJsonStringify(artifact));
+
+  const nextState = {
+    filepath,
+    signature,
+    policy,
+    artifact,
+    policyHash,
+    policyVersion: policy.version,
+  };
+
+  if (
+    !cachedState
+    || cachedState.filepath !== nextState.filepath
+    || cachedState.policyHash !== nextState.policyHash
+  ) {
+    appendPolicyRevision({
+      policyPath: filepath,
+      policyVersion: policy.version,
+      policyHash,
+      policyPayload: artifact,
+    });
+  }
+
+  cachedState = nextState;
+  return cachedState;
+}
+
+export function loadGraphRetrievalPolicy() {
+  return loadGraphRetrievalPolicyState().policy;
+}
+
+export function loadGraphRetrievalPolicyMetadata() {
+  const state = loadGraphRetrievalPolicyState();
+  return {
+    path: state.filepath,
+    hash: state.policyHash,
+    version: state.policyVersion,
+    policy: state.artifact,
+  };
 }
 
 export function resetGraphRetrievalPolicyCache() {
-  cachedPath = null;
-  cachedPolicy = null;
+  cachedState = null;
 }

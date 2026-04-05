@@ -232,6 +232,59 @@ node scripts/eval-open-brain-ask-ab.mjs \
 
 Default cases live in [ask-brain-graph-ab-cases.json](/Users/luchoh/Dev/OB1/local/open-brain-mcp/evals/ask-brain-graph-ab-cases.json).
 
+## Retrieval Observability
+
+The local runtime now keeps append-only non-canonical observability artifacts under:
+
+- [`local/open-brain-mcp/.runtime/retrieval-events.jsonl`](/Users/luchoh/Dev/OB1/local/open-brain-mcp/.runtime/retrieval-events.jsonl)
+- [`local/open-brain-mcp/.runtime/graph-retrieval-policy.history.jsonl`](/Users/luchoh/Dev/OB1/local/open-brain-mcp/.runtime/graph-retrieval-policy.history.jsonl)
+- optional comparison reports under [`local/open-brain-mcp/.runtime/evals`](/Users/luchoh/Dev/OB1/local/open-brain-mcp/.runtime/evals)
+
+Current runtime coverage:
+
+- `search_thoughts` retrieval telemetry
+- `ask_brain` retrieval telemetry, including graph expansion metadata when enabled
+- `expand_context` retrieval telemetry
+- graph retrieval policy revision history keyed by stable normalized policy hash
+
+Default env knobs:
+
+- `OPEN_BRAIN_RETRIEVAL_TELEMETRY_ENABLED=true`
+- `OPEN_BRAIN_RETRIEVAL_TELEMETRY_PREVIEW_MODE=truncated`
+- `OPEN_BRAIN_RETRIEVAL_TELEMETRY_PREVIEW_CHARS=96`
+- `OPEN_BRAIN_GRAPH_RETRIEVAL_POLICY_HISTORY_ENABLED=true`
+- optional `OPEN_BRAIN_GRAPH_RETRIEVAL_POLICY_REASON="..."` for the next explicit policy change
+
+Preview modes:
+
+- `none`: record no query preview
+- `hashed_only`: record only the query SHA-256 and length
+- `truncated`: record a short whitespace-collapsed preview plus hash and length
+
+Inspection examples:
+
+```bash
+tail -f local/open-brain-mcp/.runtime/retrieval-events.jsonl
+tail -n 20 local/open-brain-mcp/.runtime/graph-retrieval-policy.history.jsonl
+```
+
+Rotation example:
+
+```bash
+mv local/open-brain-mcp/.runtime/retrieval-events.jsonl local/open-brain-mcp/.runtime/retrieval-events.$(date +%Y%m%d-%H%M%S).jsonl
+mv local/open-brain-mcp/.runtime/graph-retrieval-policy.history.jsonl local/open-brain-mcp/.runtime/graph-retrieval-policy.history.$(date +%Y%m%d-%H%M%S).jsonl
+```
+
+The runtime will recreate the active JSONL files on the next successful write. Observability write failures do not fail retrieval.
+
+Policy comparison workflow:
+
+```bash
+python local/open-brain-mcp/evals/compare-graph-retrieval-policies.py \
+  --candidate-file /tmp/graph-retrieval-policy.candidate.json \
+  --output local/open-brain-mcp/.runtime/evals/graph-policy-compare.json
+```
+
 ## Graph Read APIs
 
 The graph layer now exposes four read-only inspection surfaces:

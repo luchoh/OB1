@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { projectThoughts, closeGraph } from "../local/open-brain-mcp/src/graph.mjs";
 import { retrieveEvidenceRows } from "../local/open-brain-mcp/src/retrieval.mjs";
 import { closePool, query } from "../local/open-brain-mcp/src/db.mjs";
-import { graphRetrievalPolicyPath, loadGraphRetrievalPolicy } from "../local/open-brain-mcp/src/graph-retrieval-policy.mjs";
+import { loadGraphRetrievalPolicyMetadata } from "../local/open-brain-mcp/src/graph-retrieval-policy.mjs";
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(currentDir, "..");
@@ -311,14 +311,17 @@ async function main() {
 
   const meanScore = results.reduce((sum, item) => sum + item.judgment.total_score, 0) / results.length;
   const accepted = results.filter((item) => item.judgment.decision === "accept").length;
+  const policyMetadata = loadGraphRetrievalPolicyMetadata();
   const report = {
     generated_at: new Date().toISOString(),
     database: args.database,
     schema_variant: args.schemaVariant,
     brain_id: evaluationBrain.id,
     brain_slug: evaluationBrain.slug,
-    policy_path: graphRetrievalPolicyPath(),
-    policy: loadGraphRetrievalPolicy(),
+    policy_path: policyMetadata.path,
+    policy_hash: policyMetadata.hash,
+    policy_version: policyMetadata.version,
+    policy: policyMetadata.policy,
     case_count: results.length,
     mean_score: Number(meanScore.toFixed(2)),
     accepted,

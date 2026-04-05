@@ -1,7 +1,7 @@
 import { config } from "./config.mjs";
 import { query, formatVector } from "./db.mjs";
 import { graphThoughtNeighbors } from "./graph.mjs";
-import { loadGraphRetrievalPolicy } from "./graph-retrieval-policy.mjs";
+import { loadGraphRetrievalPolicyState } from "./graph-retrieval-policy.mjs";
 import { createEmbedding } from "./models.mjs";
 
 function nestedUserMetadata(row) {
@@ -297,7 +297,7 @@ export async function fetchThoughtRowsByIds({ brainId, ids, filter, embedding })
           t.embedding_model,
           t.embedding_dimension,
           t.metadata,
-          (1 - (t.embedding <=> $2::vector))::float as similarity,
+          (1 - (t.embedding <=> $3::vector))::float as similarity,
           t.created_at,
           t.updated_at
         from thoughts t
@@ -819,7 +819,8 @@ export async function expandThoughtsWithGraph({
     throw new Error("Graph-assisted retrieval requested but graph integration is disabled");
   }
 
-  const policy = loadGraphRetrievalPolicy();
+  const policyState = loadGraphRetrievalPolicyState();
+  const policy = policyState.policy;
   const resolvedHops = Math.max(1, Math.min(3, Number(maxHops) || policy.defaultMaxHops));
   const resolvedLimit = Math.max(1, Math.min(48, Number(limit) || policy.defaultAddedRows));
 
@@ -834,8 +835,12 @@ export async function expandThoughtsWithGraph({
         added_ids: [],
         max_hops: resolvedHops,
         limit: resolvedLimit,
+        policy_version: policyState.policyVersion,
+        policy_hash: policyState.policyHash,
+        policy_path: policyState.filepath,
       },
       metadataById: new Map(),
+      policyState,
     };
   }
 
@@ -886,9 +891,12 @@ export async function expandThoughtsWithGraph({
       added_ids: [],
       max_hops: resolvedHops,
       limit: resolvedLimit,
-      policy_version: policy.version,
+      policy_version: policyState.policyVersion,
+      policy_hash: policyState.policyHash,
+      policy_path: policyState.filepath,
     },
     metadataById,
+    policyState,
   };
 }
 
@@ -944,7 +952,7 @@ export async function retrieveEvidenceRows({
     };
   }
 
-  const policy = loadGraphRetrievalPolicy();
+  const policy = graphExpansion.policyState?.policy ?? loadGraphRetrievalPolicyState().policy;
   const seeds = seedContext(retrieval.results);
   const selected = selectEvidenceRows({
     seedRows: retrieval.results,
@@ -982,7 +990,7 @@ export async function expandContextRows({
   if (!brainId) {
     throw new Error("brainId is required for expandContextRows");
   }
-  const policy = loadGraphRetrievalPolicy();
+  const policy = loadGraphRetrievalPolicyState().policy;
   const resolvedLimit = Math.max(1, Math.min(24, Number(limit) || policy.defaultAddedRows));
   const resolvedThoughtId = resolveThoughtIdInput({ thoughtId, canonicalId });
   const seedRows = await fetchThoughtRowsByIds({

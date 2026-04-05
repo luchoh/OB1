@@ -19,6 +19,7 @@ import {
   healthcheckUpstreams,
   normalizeMetadata,
 } from "./models.mjs";
+import { appendRetrievalTelemetry } from "./observability.mjs";
 import {
   expandContextRows,
   retrieveThoughts as retrieveThoughtRows,
@@ -327,25 +328,55 @@ async function handleCaptureThought(args, accessContext) {
 }
 
 async function handleSearchThoughts(args, accessContext) {
+  const startedAt = Date.now();
   const threshold = args.match_threshold ?? 0.4;
   const matchCount = args.match_count ?? 10;
   const filter = args.filter ?? {};
-  const retrieval = await retrieveThoughtRows({
-    brainId: accessContext.effectiveBrainId,
-    queryText: args.query,
-    threshold,
-    count: matchCount,
-    filter,
-  });
+  try {
+    const retrieval = await retrieveThoughtRows({
+      brainId: accessContext.effectiveBrainId,
+      queryText: args.query,
+      threshold,
+      count: matchCount,
+      filter,
+    });
 
-  return {
-    success: true,
-    query: args.query,
-    retrieval_strategy: retrieval.retrieval_strategy,
-    fallback_used: retrieval.fallback_used,
-    count: retrieval.results.length,
-    results: retrieval.results,
-  };
+    const response = {
+      success: true,
+      query: args.query,
+      retrieval_strategy: retrieval.retrieval_strategy,
+      fallback_used: retrieval.fallback_used,
+      count: retrieval.results.length,
+      results: retrieval.results,
+    };
+
+    appendRetrievalTelemetry({
+      eventType: "search_thoughts_retrieval",
+      accessContext,
+      queryText: args.query,
+      threshold,
+      requestedCount: matchCount,
+      retrievalStrategy: retrieval.retrieval_strategy,
+      fallbackUsed: retrieval.fallback_used,
+      resultRows: retrieval.results,
+      elapsedMs: Date.now() - startedAt,
+      success: true,
+    });
+
+    return response;
+  } catch (error) {
+    appendRetrievalTelemetry({
+      eventType: "search_thoughts_retrieval",
+      accessContext,
+      queryText: args.query,
+      threshold,
+      requestedCount: matchCount,
+      elapsedMs: Date.now() - startedAt,
+      success: false,
+      error,
+    });
+    throw error;
+  }
 }
 
 async function handleAskBrain(args, accessContext) {
@@ -353,57 +384,139 @@ async function handleAskBrain(args, accessContext) {
     throw new HttpError(400, "graph_assisted is disabled for non-admin multitenant requests");
   }
 
+  const startedAt = Date.now();
   const threshold = args.match_threshold ?? 0.4;
   const matchCount = args.match_count ?? 6;
   const filter = args.filter ?? {};
-  const { retrieval, graphExpansion, evidenceRows, questionIntent } = await retrieveEvidenceRows({
-    brainId: accessContext.effectiveBrainId,
-    queryText: args.question,
-    threshold,
-    count: matchCount,
-    filter,
-    graphAssisted: args.graph_assisted ?? false,
-    graphMaxHops: args.graph_max_hops ?? 2,
-    graphNeighborLimit: args.graph_neighbor_limit ?? matchCount,
-  });
-  const evidence = evidenceRows.map(evidenceCitation);
+  let retrieval = null;
+  let graphExpansion = {
+    enabled: Boolean(args.graph_assisted ?? false),
+    reason: "not_started",
+  };
+  let evidenceRows = [];
+  let questionIntent = null;
 
-  if (evidence.length === 0) {
-    return {
+  try {
+    ({
+      retrieval,
+      graphExpansion,
+      evidenceRows,
+      questionIntent,
+    } = await retrieveEvidenceRows({
+      brainId: accessContext.effectiveBrainId,
+      queryText: args.question,
+      threshold,
+      count: matchCount,
+      filter,
+      graphAssisted: args.graph_assisted ?? false,
+      graphMaxHops: args.graph_max_hops ?? 2,
+      graphNeighborLimit: args.graph_neighbor_limit ?? matchCount,
+    }));
+    const evidence = evidenceRows.map(evidenceCitation);
+
+    if (evidence.length === 0) {
+      const response = {
+        success: true,
+        question: args.question,
+        answer: "I do not have enough evidence in memory to answer that reliably.",
+        grounded: false,
+        insufficient_evidence: true,
+        retrieval_strategy: retrieval.retrieval_strategy,
+        fallback_used: retrieval.fallback_used,
+        question_intent: questionIntent,
+        graph_assisted: args.graph_assisted ?? false,
+        graph_expansion: graphExpansion,
+        evidence_count: 0,
+        citations: [],
+      };
+
+      appendRetrievalTelemetry({
+        eventType: "ask_brain_retrieval",
+        accessContext,
+        queryText: args.question,
+        threshold,
+        requestedCount: matchCount,
+        retrievalStrategy: retrieval.retrieval_strategy,
+        fallbackUsed: retrieval.fallback_used,
+        resultRows: evidenceRows,
+        graphAssisted: args.graph_assisted ?? false,
+        graphExpansion,
+        elapsedMs: Date.now() - startedAt,
+        success: true,
+        extra: {
+          question_intent: questionIntent,
+          grounded: false,
+          insufficient_evidence: true,
+          citation_ids: [],
+        },
+      });
+
+      return response;
+    }
+
+    const grounded = await answerFromEvidence(args.question, evidence, {
+      questionIntent,
+    });
+    const citations = evidence.filter((item) => grounded.citations.includes(item.id));
+
+    const response = {
       success: true,
       question: args.question,
-      answer: "I do not have enough evidence in memory to answer that reliably.",
-      grounded: false,
-      insufficient_evidence: true,
+      answer: grounded.answer,
+      grounded: grounded.grounded,
+      insufficient_evidence: grounded.insufficient_evidence,
       retrieval_strategy: retrieval.retrieval_strategy,
       fallback_used: retrieval.fallback_used,
       question_intent: questionIntent,
       graph_assisted: args.graph_assisted ?? false,
       graph_expansion: graphExpansion,
-      evidence_count: 0,
-      citations: [],
+      evidence_count: evidence.length,
+      citations,
     };
+
+    appendRetrievalTelemetry({
+      eventType: "ask_brain_retrieval",
+      accessContext,
+      queryText: args.question,
+      threshold,
+      requestedCount: matchCount,
+      retrievalStrategy: retrieval.retrieval_strategy,
+      fallbackUsed: retrieval.fallback_used,
+      resultRows: evidenceRows,
+      graphAssisted: args.graph_assisted ?? false,
+      graphExpansion,
+      elapsedMs: Date.now() - startedAt,
+      success: true,
+      extra: {
+        question_intent: questionIntent,
+        grounded: grounded.grounded,
+        insufficient_evidence: grounded.insufficient_evidence,
+        citation_ids: citations.map((item) => item.id),
+      },
+    });
+
+    return response;
+  } catch (error) {
+    appendRetrievalTelemetry({
+      eventType: "ask_brain_retrieval",
+      accessContext,
+      queryText: args.question,
+      threshold,
+      requestedCount: matchCount,
+      retrievalStrategy: retrieval?.retrieval_strategy,
+      fallbackUsed: retrieval?.fallback_used,
+      resultRows: evidenceRows,
+      graphAssisted: args.graph_assisted ?? false,
+      graphExpansion,
+      elapsedMs: Date.now() - startedAt,
+      success: false,
+      error,
+      extra: {
+        question_intent: questionIntent,
+      },
+    });
+    throw error;
   }
-
-  const grounded = await answerFromEvidence(args.question, evidence, {
-    questionIntent,
-  });
-  const citations = evidence.filter((item) => grounded.citations.includes(item.id));
-
-  return {
-    success: true,
-    question: args.question,
-    answer: grounded.answer,
-    grounded: grounded.grounded,
-    insufficient_evidence: grounded.insufficient_evidence,
-    retrieval_strategy: retrieval.retrieval_strategy,
-    fallback_used: retrieval.fallback_used,
-    question_intent: questionIntent,
-    graph_assisted: args.graph_assisted ?? false,
-    graph_expansion: graphExpansion,
-    evidence_count: evidence.length,
-    citations,
-  };
 }
 
 async function updateThoughtMetadata({ brainId, thoughtId, metadataPatch }) {
@@ -612,25 +725,64 @@ async function handleExpandContext(args, accessContext) {
     throw new Error("Either thought_id or canonical_id is required");
   }
 
-  const result = await expandContextRows({
-    brainId: accessContext.effectiveBrainId,
-    thoughtId: args.thought_id,
-    canonicalId: args.canonical_id,
-    questionText: args.question ?? "",
-    filter: args.filter ?? {},
-    maxHops: args.max_hops ?? 2,
-    limit: args.limit ?? 6,
-  });
+  const startedAt = Date.now();
+  const requestedLimit = args.limit ?? 6;
 
-  return {
-    success: true,
-    seed: evidenceCitation(result.seedRow),
-    question: args.question ?? null,
-    question_intent: result.questionIntent,
-    graph_expansion: result.graphExpansion,
-    count: result.relatedRows.length,
-    results: result.relatedRows.map((row) => graphContextItem(row, result.metadataById.get(row.id))),
-  };
+  try {
+    const result = await expandContextRows({
+      brainId: accessContext.effectiveBrainId,
+      thoughtId: args.thought_id,
+      canonicalId: args.canonical_id,
+      questionText: args.question ?? "",
+      filter: args.filter ?? {},
+      maxHops: args.max_hops ?? 2,
+      limit: requestedLimit,
+    });
+
+    const response = {
+      success: true,
+      seed: evidenceCitation(result.seedRow),
+      question: args.question ?? null,
+      question_intent: result.questionIntent,
+      graph_expansion: result.graphExpansion,
+      count: result.relatedRows.length,
+      results: result.relatedRows.map((row) => graphContextItem(row, result.metadataById.get(row.id))),
+    };
+
+    appendRetrievalTelemetry({
+      eventType: "expand_context_retrieval",
+      accessContext,
+      queryText: args.question ?? "",
+      requestedCount: requestedLimit,
+      retrievalStrategy: "graph-context",
+      fallbackUsed: false,
+      resultRows: result.relatedRows,
+      graphAssisted: true,
+      graphExpansion: result.graphExpansion,
+      elapsedMs: Date.now() - startedAt,
+      success: true,
+      extra: {
+        seed_id: result.seedRow.id,
+        question_intent: result.questionIntent,
+      },
+    });
+
+    return response;
+  } catch (error) {
+    appendRetrievalTelemetry({
+      eventType: "expand_context_retrieval",
+      accessContext,
+      queryText: args.question ?? "",
+      requestedCount: requestedLimit,
+      retrievalStrategy: "graph-context",
+      fallbackUsed: false,
+      graphAssisted: true,
+      elapsedMs: Date.now() - startedAt,
+      success: false,
+      error,
+    });
+    throw error;
+  }
 }
 
 function buildMcpServer(accessContext) {
