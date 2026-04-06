@@ -319,6 +319,19 @@ def build_review_reply_markup(session: dict, token: str) -> dict:
             keyboard.append([{"text": "View Raw", "callback_data": f"ob1:view_raw:{token}"}])
         return {"inline_keyboard": keyboard}
 
+    if len(thoughts) == 1:
+        index = int(thoughts[0].get("index", 0))
+        keyboard.append(
+            [
+                {"text": "Record", "callback_data": f"ob1:record:{token}"},
+                {"text": "Edit", "callback_data": f"ob1:edit:{token}:{index}"},
+                {"text": "Ignore", "callback_data": f"ob1:ignore:{token}"},
+            ]
+        )
+        if session.get("view_raw_enabled", True):
+            keyboard.append([{"text": "View Raw", "callback_data": f"ob1:view_raw:{token}"}])
+        return {"inline_keyboard": keyboard}
+
     for thought in thoughts:
         index = int(thought.get("index", 0))
         label_index = index + 1
