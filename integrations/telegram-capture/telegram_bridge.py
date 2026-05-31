@@ -388,6 +388,26 @@ def answer_callback_query(token: str, callback_query_id: str, text: str | None =
     telegram_api_call(token, "answerCallbackQuery", payload)
 
 
+def best_effort_telegram(label: str, func, *args, **kwargs):
+    try:
+        return func(*args, **kwargs)
+    except Exception as exc:
+        response = getattr(exc, "response", None)
+        status = (
+            f" status={response.status_code}"
+            if response is not None and getattr(response, "status_code", None)
+            else ""
+        )
+        print(f"Warning: Telegram {label} failed{status}; continuing.", file=sys.stderr)
+        return None
+
+
+def acknowledge_callback(args, callback_id: str | None, text: str):
+    if not args.telegram_token or not callback_id:
+        return None
+    return best_effort_telegram("callback acknowledgement", answer_callback_query, args.telegram_token, callback_id, text)
+
+
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -674,7 +694,9 @@ def refresh_review_message(args, token: str, session: dict):
     review_message_id = session.get("review_message_id")
     if not args.telegram_token or not review_message_id or args.dry_run:
         return
-    edit_message(
+    best_effort_telegram(
+        "review message refresh",
+        edit_message,
         args.telegram_token,
         str(session.get("chat_id")),
         int(review_message_id),
@@ -1066,14 +1088,12 @@ def process_callback_query(args, state: dict, callback_query: dict):
     chat_id = str(chat.get("id"))
 
     if args.allowed_chat_ids and chat_id not in args.allowed_chat_ids:
-        if args.telegram_token and callback_id:
-            answer_callback_query(args.telegram_token, callback_id, "This chat is not allowed.")
+        acknowledge_callback(args, callback_id, "This chat is not allowed.")
         return {"handled": False, "reason": "chat_not_allowed"}
 
     parsed = parse_callback_data(data)
     if not parsed:
-        if args.telegram_token and callback_id:
-            answer_callback_query(args.telegram_token, callback_id, "Unknown action.")
+        acknowledge_callback(args, callback_id, "Unknown action.")
         return {"handled": False, "reason": "unknown_callback"}
 
     action = parsed["action"]
@@ -1083,13 +1103,11 @@ def process_callback_query(args, state: dict, callback_query: dict):
         prune_pending_actions(review_state, args.pending_action_ttl_seconds)
         pending = review_state.setdefault("pending_actions", {}).get(token)
         if not pending:
-            if args.telegram_token and callback_id:
-                answer_callback_query(args.telegram_token, callback_id, "This review prompt expired.")
+            acknowledge_callback(args, callback_id, "This review prompt expired.")
             return {"handled": False, "reason": "missing_pending_action"}
 
         if str(pending.get("chat_id")) != chat_id:
-            if args.telegram_token and callback_id:
-                answer_callback_query(args.telegram_token, callback_id, "This review prompt belongs to a different chat.")
+            acknowledge_callback(args, callback_id, "This review prompt belongs to a different chat.")
             return {"handled": False, "reason": "chat_mismatch"}
 
         source_payload = pending.get("source_payload") or {}
@@ -1099,8 +1117,7 @@ def process_callback_query(args, state: dict, callback_query: dict):
 
         if action == "view_raw":
             send_review_raw_source(args, pending)
-            if args.telegram_token and callback_id:
-                answer_callback_query(args.telegram_token, callback_id, "Sent raw source.")
+            acknowledge_callback(args, callback_id, "Sent raw source.")
             return {
                 "handled": True,
                 "path": "callback",
@@ -1111,27 +1128,28 @@ def process_callback_query(args, state: dict, callback_query: dict):
 
         if not review_session_has_thoughts(pending):
             if action not in {"record", "ignore"}:
-                if args.telegram_token and callback_id:
-                    answer_callback_query(args.telegram_token, callback_id, "Use Record or Ignore for this prompt.")
+                acknowledge_callback(args, callback_id, "Use Record or Ignore for this prompt.")
                 return {"handled": False, "reason": "invalid_simple_review_action"}
             if action == "record" and not args.dry_run:
                 ingest_text_capture(args, source_payload, [])
                 record_resolution(review_state, token, pending, DICTATION_RESOLUTION_INGESTED)
             elif action == "ignore":
                 record_resolution(review_state, token, pending, DICTATION_RESOLUTION_IGNORED)
-            if args.telegram_token and callback_id:
-                answer_callback_query(
-                    args.telegram_token,
-                    callback_id,
-                    "Recorded." if action == "record" else "Ignored.",
-                )
+            acknowledge_callback(args, callback_id, "Recorded." if action == "record" else "Ignored.")
             if args.telegram_token and review_message_id and not args.dry_run:
                 final_text = (
                     "Recorded by request. Stored 1 source row and 0 thought rows."
                     if action == "record"
                     else f"Ignored. Nothing was stored from this {kind.replace('_', ' ')} capture."
                 )
-                edit_message(args.telegram_token, chat_id, int(review_message_id), final_text)
+                best_effort_telegram(
+                    "review message finalization",
+                    edit_message,
+                    args.telegram_token,
+                    chat_id,
+                    int(review_message_id),
+                    final_text,
+                )
             review_state.setdefault("pending_actions", {}).pop(token, None)
             return {
                 "handled": True,
@@ -1148,8 +1166,7 @@ def process_callback_query(args, state: dict, callback_query: dict):
                 return {"handled": False, "reason": "invalid_thought_index"}
             thoughts[thought_index]["status"] = THOUGHT_STATUS_APPROVED
             refresh_review_message(args, token, pending)
-            if args.telegram_token and callback_id:
-                answer_callback_query(args.telegram_token, callback_id, f"Approved thought {thought_index + 1}.")
+            acknowledge_callback(args, callback_id, f"Approved thought {thought_index + 1}.")
             return {
                 "handled": True,
                 "path": "callback",
@@ -1165,8 +1182,7 @@ def process_callback_query(args, state: dict, callback_query: dict):
                 return {"handled": False, "reason": "invalid_thought_index"}
             thoughts[thought_index]["status"] = THOUGHT_STATUS_DENIED
             refresh_review_message(args, token, pending)
-            if args.telegram_token and callback_id:
-                answer_callback_query(args.telegram_token, callback_id, f"Denied thought {thought_index + 1}.")
+            acknowledge_callback(args, callback_id, f"Denied thought {thought_index + 1}.")
             return {
                 "handled": True,
                 "path": "callback",
@@ -1182,8 +1198,7 @@ def process_callback_query(args, state: dict, callback_query: dict):
                 if thought.get("status") != "edited":
                     thought["status"] = THOUGHT_STATUS_APPROVED
             refresh_review_message(args, token, pending)
-            if args.telegram_token and callback_id:
-                answer_callback_query(args.telegram_token, callback_id, "Approved all thoughts.")
+            acknowledge_callback(args, callback_id, "Approved all thoughts.")
             return {
                 "handled": True,
                 "path": "callback",
@@ -1199,8 +1214,7 @@ def process_callback_query(args, state: dict, callback_query: dict):
                 return {"handled": False, "reason": "invalid_thought_index"}
             if not prompt_for_thought_edit(args, review_state, token, pending, thought_index):
                 return {"handled": False, "reason": "edit_prompt_failed"}
-            if args.telegram_token and callback_id:
-                answer_callback_query(args.telegram_token, callback_id, "Reply to the edit prompt with the replacement text.")
+            acknowledge_callback(args, callback_id, "Reply to the edit prompt with the replacement text.")
             return {
                 "handled": True,
                 "path": "callback",
@@ -1214,16 +1228,16 @@ def process_callback_query(args, state: dict, callback_query: dict):
         if action == "commit":
             final_thoughts = approved_session_payloads(pending)
             if not final_thoughts:
-                if args.telegram_token and callback_id:
-                    answer_callback_query(args.telegram_token, callback_id, "No approved thoughts to commit.")
+                acknowledge_callback(args, callback_id, "No approved thoughts to commit.")
                 return {"handled": True, "path": "callback", "decision": "commit_blocked", "reason": "no_approved_thoughts"}
             if not args.dry_run:
                 ingest_text_capture(args, source_payload, final_thoughts)
                 record_resolution(review_state, token, pending, DICTATION_RESOLUTION_INGESTED)
-            if args.telegram_token and callback_id:
-                answer_callback_query(args.telegram_token, callback_id, "Recorded.")
+            acknowledge_callback(args, callback_id, "Recorded.")
             if args.telegram_token and review_message_id and not args.dry_run:
-                edit_message(
+                best_effort_telegram(
+                    "review message finalization",
+                    edit_message,
                     args.telegram_token,
                     chat_id,
                     int(review_message_id),
@@ -1243,10 +1257,11 @@ def process_callback_query(args, state: dict, callback_query: dict):
 
         if action == "deny_all":
             record_resolution(review_state, token, pending, DICTATION_RESOLUTION_IGNORED)
-            if args.telegram_token and callback_id:
-                answer_callback_query(args.telegram_token, callback_id, "Ignored.")
+            acknowledge_callback(args, callback_id, "Ignored.")
             if args.telegram_token and review_message_id and not args.dry_run:
-                edit_message(
+                best_effort_telegram(
+                    "review message finalization",
+                    edit_message,
                     args.telegram_token,
                     chat_id,
                     int(review_message_id),
@@ -1264,8 +1279,7 @@ def process_callback_query(args, state: dict, callback_query: dict):
                 "telegram_user_id": from_user.get("id"),
             }
 
-        if args.telegram_token and callback_id:
-            answer_callback_query(args.telegram_token, callback_id, "Unknown action.")
+        acknowledge_callback(args, callback_id, "Unknown action.")
         return {"handled": False, "reason": "unknown_review_action"}
 
     return {"handled": False, "reason": "callback_fell_through"}

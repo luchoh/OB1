@@ -195,6 +195,117 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
             )
             self.assertIsNone(not_an_edit)
 
+    def test_callback_approve_all_persists_when_review_message_refresh_fails(self):
+        bridge = load_module("telegram_bridge_approve_all_test", "integrations/telegram-capture/telegram_bridge.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "review-state.json"
+            token = "0123456789abcdef"
+            session = review_state.build_review_session(
+                origin="telegram_text",
+                kind="review",
+                chat_id="123",
+                message_id=456,
+                source_payload={"content": "raw source", "dedupe_key": "telegram:123:456"},
+                thought_payloads=[
+                    {"content": "First thought", "metadata": {"summary": "First thought"}},
+                    {"content": "Second thought", "metadata": {"summary": "Second thought"}},
+                ],
+            )
+            session["review_message_id"] = 999
+            with review_state.locked_review_state(state_path) as payload:
+                payload["pending_actions"][token] = session
+
+            bridge.edit_message = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Telegram edit failed"))
+            bridge.answer_callback_query = lambda *args, **kwargs: None
+
+            args = SimpleNamespace(
+                review_state_file=state_path,
+                pending_action_ttl_seconds=86400,
+                telegram_token="telegram-token",
+                dry_run=False,
+                allowed_chat_ids=set(),
+            )
+            result = bridge.process_callback_query(
+                args,
+                {},
+                {
+                    "id": "callback-id",
+                    "data": f"ob1:approve_all:{token}",
+                    "from": {"id": 123},
+                    "message": {"chat": {"id": 123}, "message_id": 999},
+                },
+            )
+
+            self.assertEqual(result["decision"], "approved_all")
+            with review_state.locked_review_state(state_path) as payload:
+                thoughts = payload["pending_actions"][token]["thoughts"]
+            self.assertEqual(
+                [thought["status"] for thought in thoughts],
+                [review_state.THOUGHT_STATUS_APPROVED, review_state.THOUGHT_STATUS_APPROVED],
+            )
+
+    def test_callback_commit_persists_when_telegram_ui_calls_fail(self):
+        bridge = load_module("telegram_bridge_commit_test", "integrations/telegram-capture/telegram_bridge.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "review-state.json"
+            token = "fedcba9876543210"
+            source_payload = {"content": "raw source", "dedupe_key": "dictation:abc"}
+            thought_payload = {
+                "content": "Approved thought",
+                "metadata": {"summary": "Approved thought"},
+                "dedupe_key": "dictation:abc:thought:0",
+            }
+            session = review_state.build_review_session(
+                origin="telegram_dictation",
+                kind="review",
+                chat_id="123",
+                message_id=456,
+                source_payload=source_payload,
+                thought_payloads=[thought_payload],
+                suggested_decisions={"Approved thought": "record"},
+                dictation_sync={"dedupe_key": "dictation:abc", "ref_key": "minio:canonical/item.md"},
+            )
+            session["review_message_id"] = 999
+            with review_state.locked_review_state(state_path) as payload:
+                payload["pending_actions"][token] = session
+
+            ingested = []
+            bridge.ingest_text_capture = lambda args, source, thoughts: ingested.append(
+                {"source": source, "thoughts": thoughts}
+            )
+            bridge.answer_callback_query = lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("Telegram answer failed")
+            )
+            bridge.edit_message = lambda *args, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("Telegram edit failed")
+            )
+
+            args = SimpleNamespace(
+                review_state_file=state_path,
+                pending_action_ttl_seconds=86400,
+                telegram_token="telegram-token",
+                dry_run=False,
+                allowed_chat_ids=set(),
+            )
+            result = bridge.process_callback_query(
+                args,
+                {},
+                {
+                    "id": "callback-id",
+                    "data": f"ob1:commit:{token}",
+                    "from": {"id": 123},
+                    "message": {"chat": {"id": 123}, "message_id": 999},
+                },
+            )
+
+            self.assertEqual(result["decision"], "commit")
+            self.assertEqual(len(ingested), 1)
+            self.assertEqual(ingested[0]["source"], source_payload)
+            self.assertEqual(ingested[0]["thoughts"][0]["dedupe_key"], "dictation:abc:thought:0")
+            with review_state.locked_review_state(state_path) as payload:
+                self.assertNotIn(token, payload["pending_actions"])
+                self.assertEqual(payload["resolved_actions"][token]["status"], review_state.DICTATION_RESOLUTION_INGESTED)
+
     def test_dictation_reconciliation_updates_review_pending_entries(self):
         install_fake_yaml_module()
         importer = load_module("dictation_import_test", "recipes/dictation-import/import-dictation.py")
