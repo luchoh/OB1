@@ -273,6 +273,74 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
             persisted = json.loads(review_state_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["resolved_actions"], {})
 
+    def test_dictation_import_ingests_source_row_when_thought_extraction_fails(self):
+        importer = load_module("dictation_import_source_only", "recipes/dictation-import/import-dictation.py")
+
+        ingested_payloads = []
+        status_messages = []
+
+        importer.summarize_dictation = lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("Model did not return a tool call"))
+        importer.ingest_row = lambda base_url, access_key, payload: ingested_payloads.append(payload)
+        importer.send_reply = lambda token, chat_id, reply_to_message_id, text: status_messages.append(
+            {
+                "token": token,
+                "chat_id": chat_id,
+                "reply_to_message_id": reply_to_message_id,
+                "text": text,
+            }
+        )
+        importer.register_telegram_review = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("review should not be requested"))
+
+        args = SimpleNamespace(
+            dry_run=False,
+            base_url="http://127.0.0.1:8788",
+            access_key="test-key",
+            llm_model="mlx-community/Qwen3.5-397B-A17B-nvfp4",
+            telegram_bot_token="telegram-token",
+            telegram_review_match_threshold=0.78,
+            telegram_review_match_count=3,
+            telegram_review_mode=review_state.REVIEW_MODE_FULL,
+        )
+        log = {"schema_version": 1, "processed": {}}
+        artifact_text = """---
+title: "Epic voice note"
+created_at: "2026-05-31T19:32:07+00:00"
+artifact_id: "artifact-123"
+audio_sha256: "audio-123"
+audio_filename: "voice.oga"
+capture_channel: "telegram"
+telegram_chat_id: "8795344081"
+telegram_message_id: 100
+---
+
+This is the raw dictated note body.
+"""
+
+        result = importer.process_artifact(
+            args,
+            log,
+            artifact_text=artifact_text,
+            artifact_ref={
+                "storage_backend": "minio",
+                "bucket": "dictation-artifacts",
+                "object_key": "canonical/2026/05/31/artifact-123.md",
+                "path": None,
+            },
+        )
+
+        self.assertTrue(result["source_only"])
+        self.assertEqual(result["thoughts"], [])
+        self.assertEqual(len(ingested_payloads), 1)
+        self.assertEqual(ingested_payloads[0]["type"], "dictation_note")
+        self.assertEqual(ingested_payloads[0]["dedupe_key"], "dictation:audio-123")
+        self.assertEqual(len(status_messages), 1)
+        self.assertIn("Stored 1 source row and 0 thought rows", status_messages[0]["text"])
+        self.assertEqual(log["processed"]["dictation:audio-123"]["status"], "ingested")
+        self.assertEqual(
+            log["processed"]["minio:canonical/2026/05/31/artifact-123.md"]["status"],
+            "ingested",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

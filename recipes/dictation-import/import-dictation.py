@@ -486,6 +486,16 @@ def send_action_prompt(token: str, chat_id: str, reply_to_message_id: int, text:
     )
 
 
+def send_telegram_status_reply(metadata: dict, token: str, text: str):
+    if not token:
+        return
+    chat_id = normalize_optional_string(metadata.get("telegram_chat_id"))
+    message_id_raw = metadata.get("telegram_message_id")
+    if not chat_id or message_id_raw is None:
+        return
+    send_reply(token, chat_id, int(message_id_raw), text)
+
+
 def normalize_text(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
@@ -755,6 +765,38 @@ def register_telegram_review(
     return action_token
 
 
+def record_source_only_import(
+    args,
+    log: dict,
+    *,
+    metadata: dict,
+    source_dedupe_key: str,
+    ref_key: str,
+    source_payload: dict,
+    title: str | None,
+    reason: str,
+):
+    if not args.dry_run:
+        ingest_row(args.base_url, args.access_key, source_payload)
+        if is_telegram_capture(metadata):
+            send_telegram_status_reply(
+                metadata,
+                args.telegram_bot_token,
+                "Transcript recorded. Stored 1 source row and 0 thought rows because automatic thought extraction was unavailable.",
+            )
+
+    mark_processed(log, source_dedupe_key, ref_key, metadata, 0)
+    return {
+        "skipped": False,
+        "dry_run": args.dry_run,
+        "source_dedupe_key": source_dedupe_key,
+        "title": title,
+        "thoughts": [],
+        "source_only": True,
+        "reason": reason,
+    }
+
+
 def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict):
     metadata, body_text = parse_markdown_artifact(artifact_text)
     if not body_text:
@@ -773,7 +815,24 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
         dedupe_key=source_dedupe_key,
         artifact_ref=artifact_ref,
     )
-    summary = summarize_dictation(body_text, metadata, args.llm_model)
+    title = normalize_optional_string(metadata.get("title"))
+    try:
+        summary = summarize_dictation(body_text, metadata, args.llm_model)
+    except Exception as exc:
+        print(
+            f"Warning: automatic thought extraction failed for {title or '(untitled)'}; ingesting source row only: {exc}",
+            file=sys.stderr,
+        )
+        return record_source_only_import(
+            args,
+            log,
+            metadata=metadata,
+            source_dedupe_key=source_dedupe_key,
+            ref_key=ref_key,
+            source_payload=source_payload,
+            title=title,
+            reason="Automatic thought extraction failed.",
+        )
     thoughts = summary.get("thoughts", [])
     ignored_reason = summary.get("reason") or "It does not look like a durable memory worth storing automatically."
     thought_payloads = [
@@ -823,7 +882,7 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
                 "skipped": False,
                 "dry_run": args.dry_run,
                 "source_dedupe_key": source_dedupe_key,
-                "title": normalize_optional_string(metadata.get("title")),
+                "title": title,
                 "thoughts": [],
                 "review_required": True,
                 "review_kind": "no_durable_thought",
@@ -884,7 +943,7 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
                 "skipped": False,
                 "dry_run": args.dry_run,
                 "source_dedupe_key": source_dedupe_key,
-                "title": normalize_optional_string(metadata.get("title")),
+                "title": title,
                 "thoughts": thoughts,
                 "review_required": True,
                 "review_kind": "review",
@@ -922,7 +981,7 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
                 "skipped": False,
                 "dry_run": args.dry_run,
                 "source_dedupe_key": source_dedupe_key,
-                "title": normalize_optional_string(metadata.get("title")),
+                "title": title,
                 "thoughts": thoughts,
                 "review_required": True,
                 "review_kind": review_kind,
@@ -938,7 +997,7 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
             "skipped": False,
             "dry_run": True,
             "source_dedupe_key": source_dedupe_key,
-            "title": normalize_optional_string(metadata.get("title")),
+            "title": title,
             "thoughts": thoughts,
         }
 
@@ -965,7 +1024,7 @@ def process_artifact(args, log: dict, *, artifact_text: str, artifact_ref: dict)
         "skipped": False,
         "dry_run": False,
         "source_dedupe_key": source_dedupe_key,
-        "title": normalize_optional_string(metadata.get("title")),
+        "title": title,
         "thoughts": thoughts,
     }
 
