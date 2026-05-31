@@ -156,13 +156,80 @@ def extract_json_payload(text):
         return json.loads(trimmed[start : end + 1])
 
 
+def normalize_chat_content(content):
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict) and isinstance(part.get("text"), str):
+                parts.append(part["text"])
+        return "".join(parts).strip()
+
+    return ""
+
+
+def extract_inline_tool_arguments(content, expected_name):
+    text = normalize_chat_content(content)
+    if "<function=" not in text:
+        return None
+
+    function_match = re.search(r"<function=([^>\n]+)>\s*([\s\S]*)", text)
+    if not function_match:
+        return None
+
+    function_name = function_match.group(1).strip()
+    if not function_name or (expected_name and function_name != expected_name):
+        return None
+
+    body = function_match.group(2) or ""
+    params = {}
+    for match in re.finditer(r"<parameter=([^>\n]+)>\s*([\s\S]*?)\s*</parameter>", body):
+        key = match.group(1).strip()
+        if not key:
+            continue
+        raw_value = (match.group(2) or "").strip()
+        try:
+            params[key] = json.loads(raw_value)
+        except json.JSONDecodeError:
+            params[key] = raw_value
+
+    return params or None
+
+
 def extract_tool_arguments(response_json, expected_name):
+    message = response_json.get("choices", [{}])[0].get("message", {})
     try:
-        tool_calls = response_json["choices"][0]["message"]["tool_calls"]
+        tool_calls = message["tool_calls"]
     except (KeyError, IndexError, TypeError) as exc:
+        inline_tool_args = extract_inline_tool_arguments(message.get("content"), expected_name)
+        if inline_tool_args:
+            return inline_tool_args
+
+        content = normalize_chat_content(message.get("content"))
+        if content:
+            try:
+                return extract_json_payload(content)
+            except (TypeError, json.JSONDecodeError, ValueError):
+                pass
+
         raise ValueError("Model did not return a tool call") from exc
 
     if not isinstance(tool_calls, list) or not tool_calls:
+        inline_tool_args = extract_inline_tool_arguments(message.get("content"), expected_name)
+        if inline_tool_args:
+            return inline_tool_args
+
+        content = normalize_chat_content(message.get("content"))
+        if content:
+            try:
+                return extract_json_payload(content)
+            except (TypeError, json.JSONDecodeError, ValueError):
+                pass
+
         raise ValueError("Model did not return a tool call")
 
     call = None
