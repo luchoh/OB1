@@ -26,6 +26,12 @@ def load_module(module_name: str, relative_path: str):
     return module
 
 
+def install_fake_yaml_module():
+    fake_yaml = types.ModuleType("yaml")
+    fake_yaml.safe_load = lambda text: json.loads(text)
+    sys.modules.setdefault("yaml", fake_yaml)
+
+
 class TelegramReviewWorkflowTests(unittest.TestCase):
     def test_build_review_session_uses_suggested_decisions(self):
         source_payload = {"content": "raw source", "dedupe_key": "telegram:1:2"}
@@ -190,9 +196,7 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
             self.assertIsNone(not_an_edit)
 
     def test_dictation_reconciliation_updates_review_pending_entries(self):
-        fake_yaml = types.ModuleType("yaml")
-        fake_yaml.safe_load = lambda text: {}
-        sys.modules.setdefault("yaml", fake_yaml)
+        install_fake_yaml_module()
         importer = load_module("dictation_import_test", "recipes/dictation-import/import-dictation.py")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -232,9 +236,7 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
             self.assertEqual(persisted["resolved_actions"], {})
 
     def test_dictation_reconciliation_updates_review_pending_entries_to_ingested(self):
-        fake_yaml = types.ModuleType("yaml")
-        fake_yaml.safe_load = lambda text: {}
-        sys.modules.setdefault("yaml", fake_yaml)
+        install_fake_yaml_module()
         importer = load_module("dictation_import_test_record", "recipes/dictation-import/import-dictation.py")
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -274,6 +276,7 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
             self.assertEqual(persisted["resolved_actions"], {})
 
     def test_dictation_import_ingests_source_row_when_thought_extraction_fails(self):
+        install_fake_yaml_module()
         importer = load_module("dictation_import_source_only", "recipes/dictation-import/import-dictation.py")
 
         ingested_payloads = []
@@ -303,14 +306,7 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
         )
         log = {"schema_version": 1, "processed": {}}
         artifact_text = """---
-title: "Epic voice note"
-created_at: "2026-05-31T19:32:07+00:00"
-artifact_id: "artifact-123"
-audio_sha256: "audio-123"
-audio_filename: "voice.oga"
-capture_channel: "telegram"
-telegram_chat_id: "8795344081"
-telegram_message_id: 100
+{"title":"Epic voice note","created_at":"2026-05-31T19:32:07+00:00","artifact_id":"artifact-123","audio_sha256":"audio-123","audio_filename":"voice.oga","capture_channel":"telegram","telegram_chat_id":"8795344081","telegram_message_id":100}
 ---
 
 This is the raw dictated note body.
