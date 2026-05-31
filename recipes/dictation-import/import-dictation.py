@@ -405,7 +405,7 @@ def summarize_dictation(body_text: str, metadata: dict, llm_model: str):
         headers={"Content-Type": "application/json"},
         json_body={
             "model": llm_model,
-            "temperature": 0.2,
+            "temperature": 0,
             "max_tokens": 900,
             "chat_template_kwargs": {"enable_thinking": DEFAULT_LLM_ENABLE_THINKING},
             "messages": [
@@ -413,7 +413,7 @@ def summarize_dictation(body_text: str, metadata: dict, llm_model: str):
                 {"role": "user", "content": prompt},
             ],
             "tools": [THOUGHTS_TOOL],
-            "tool_choice": {"type": "function", "function": {"name": "submit_thoughts"}},
+            "tool_choice": "required",
         },
         timeout=300,
     )
@@ -547,7 +547,7 @@ def review_thought_novelty(candidate_thoughts: list[str], similar_matches: dict[
         headers={"Content-Type": "application/json"},
         json_body={
             "model": llm_model,
-            "temperature": 0.1,
+            "temperature": 0,
             "max_tokens": 1200,
             "chat_template_kwargs": {"enable_thinking": DEFAULT_LLM_ENABLE_THINKING},
             "messages": [
@@ -555,7 +555,7 @@ def review_thought_novelty(candidate_thoughts: list[str], similar_matches: dict[
                 {"role": "user", "content": "\n".join(lines).strip()},
             ],
             "tools": [NOVELTY_REVIEW_TOOL],
-            "tool_choice": {"type": "function", "function": {"name": "submit_review"}},
+            "tool_choice": "required",
         },
         timeout=300,
     )
