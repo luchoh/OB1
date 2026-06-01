@@ -705,6 +705,25 @@ def refresh_review_message(args, token: str, session: dict):
     )
 
 
+def finalize_ignored_review(args, review_state: dict, token: str, pending: dict, callback_id: str | None) -> None:
+    chat_id = str(pending.get("chat_id"))
+    review_message_id = pending.get("review_message_id")
+    kind = pending.get("kind") or "review"
+    record_resolution(review_state, token, pending, DICTATION_RESOLUTION_IGNORED)
+    acknowledge_callback(args, callback_id, "Ignored.")
+    if args.telegram_token and review_message_id and not args.dry_run:
+        best_effort_telegram(
+            "review message finalization",
+            edit_message,
+            args.telegram_token,
+            chat_id,
+            int(review_message_id),
+            f"Ignored. Nothing was stored from this {kind.replace('_', ' ')} capture.",
+            reply_markup={"inline_keyboard": []},
+        )
+    review_state.setdefault("pending_actions", {}).pop(token, None)
+
+
 def send_review_raw_source(args, session: dict):
     if not args.telegram_token or args.dry_run:
         return
@@ -1228,6 +1247,18 @@ def process_callback_query(args, state: dict, callback_query: dict):
         if action == "commit":
             final_thoughts = approved_session_payloads(pending)
             if not final_thoughts:
+                if thoughts and all(thought.get("status") == THOUGHT_STATUS_DENIED for thought in thoughts):
+                    finalize_ignored_review(args, review_state, token, pending, callback_id)
+                    return {
+                        "handled": True,
+                        "path": "callback",
+                        "decision": "commit_ignored",
+                        "reason": "all_thoughts_denied",
+                        "review_kind": kind,
+                        "source_dedupe_key": source_payload.get("dedupe_key"),
+                        "thought_count": len(thoughts),
+                        "telegram_user_id": from_user.get("id"),
+                    }
                 acknowledge_callback(args, callback_id, "No approved thoughts to commit.")
                 return {"handled": True, "path": "callback", "decision": "commit_blocked", "reason": "no_approved_thoughts"}
             if not args.dry_run:
@@ -1256,19 +1287,7 @@ def process_callback_query(args, state: dict, callback_query: dict):
             }
 
         if action == "deny_all":
-            record_resolution(review_state, token, pending, DICTATION_RESOLUTION_IGNORED)
-            acknowledge_callback(args, callback_id, "Ignored.")
-            if args.telegram_token and review_message_id and not args.dry_run:
-                best_effort_telegram(
-                    "review message finalization",
-                    edit_message,
-                    args.telegram_token,
-                    chat_id,
-                    int(review_message_id),
-                    f"Ignored. Nothing was stored from this {kind.replace('_', ' ')} capture.",
-                    reply_markup={"inline_keyboard": []},
-                )
-            review_state.setdefault("pending_actions", {}).pop(token, None)
+            finalize_ignored_review(args, review_state, token, pending, callback_id)
             return {
                 "handled": True,
                 "path": "callback",

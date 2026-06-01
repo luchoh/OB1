@@ -306,6 +306,69 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
                 self.assertNotIn(token, payload["pending_actions"])
                 self.assertEqual(payload["resolved_actions"][token]["status"], review_state.DICTATION_RESOLUTION_INGESTED)
 
+    def test_callback_commit_after_denying_every_thought_resolves_as_ignored(self):
+        bridge = load_module("telegram_bridge_commit_denied_test", "integrations/telegram-capture/telegram_bridge.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "review-state.json"
+            token = "abcdef0123456789"
+            session = review_state.build_review_session(
+                origin="telegram_dictation",
+                kind="review",
+                chat_id="123",
+                message_id=456,
+                source_payload={"content": "raw source", "dedupe_key": "dictation:abc"},
+                thought_payloads=[
+                    {"content": "First thought", "metadata": {"summary": "First thought"}},
+                    {"content": "Second thought", "metadata": {"summary": "Second thought"}},
+                ],
+                dictation_sync={"dedupe_key": "dictation:abc", "ref_key": "minio:canonical/item.md"},
+            )
+            session["review_message_id"] = 999
+            with review_state.locked_review_state(state_path) as payload:
+                payload["pending_actions"][token] = session
+
+            bridge.ingest_text_capture = lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("denied review should not ingest")
+            )
+
+            args = SimpleNamespace(
+                review_state_file=state_path,
+                pending_action_ttl_seconds=86400,
+                telegram_token="",
+                dry_run=False,
+                allowed_chat_ids=set(),
+            )
+
+            for index in range(2):
+                result = bridge.process_callback_query(
+                    args,
+                    {},
+                    {
+                        "id": f"deny-callback-{index}",
+                        "data": f"ob1:deny:{token}:{index}",
+                        "from": {"id": 123},
+                        "message": {"chat": {"id": 123}, "message_id": 999},
+                    },
+                )
+                self.assertEqual(result["decision"], "denied")
+
+            result = bridge.process_callback_query(
+                args,
+                {},
+                {
+                    "id": "commit-callback",
+                    "data": f"ob1:commit:{token}",
+                    "from": {"id": 123},
+                    "message": {"chat": {"id": 123}, "message_id": 999},
+                },
+            )
+
+            self.assertEqual(result["decision"], "commit_ignored")
+            self.assertEqual(result["reason"], "all_thoughts_denied")
+            with review_state.locked_review_state(state_path) as payload:
+                self.assertNotIn(token, payload["pending_actions"])
+                self.assertEqual(payload["resolved_actions"][token]["status"], review_state.DICTATION_RESOLUTION_IGNORED)
+
     def test_dictation_reconciliation_updates_review_pending_entries(self):
         install_fake_yaml_module()
         importer = load_module("dictation_import_test", "recipes/dictation-import/import-dictation.py")

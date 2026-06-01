@@ -365,3 +365,125 @@ After `system-config` deploys the new OB1 revision:
 6. The Telegram full-review callback path still commits approved thoughts even when Telegram rejects `editMessageText`.
 7. A dictation artifact sent through the production DeepSeek path still produces `dictation_thought` rows when it contains at least one durable fact, task, or decision.
 8. The stuck May 31 Telegram note lands in OB1 without requiring resend.
+
+## Post-Deploy Review UX Bug (2026-06-01)
+
+After `system-config` deployed managed `OB1` `main` and `m2maxstudio` was rebuilt onto:
+
+- branch: `main`
+- revision: `d93042d36947e914376310447e3835f7ac11a7b4`
+- worker model: `DeepSeek-V4-Flash-nvfp4`
+
+The end-to-end dictation path recovered far enough to create a real Telegram full-review session for a fresh production voice note:
+
+- artifact id: `fffd3f30c16c0a8293d9a9f38f29ae8ca5d6a10d4d84a9c9097f5981a376ae88`
+- object key: `canonical/2026/06/01/fffd3f30c16c0a8293d9a9f38f29ae8ca5d6a10d4d84a9c9097f5981a376ae88.md`
+- source dedupe key: `dictation:3bb9b3d5c381166362e99b24c0c0438fe42fffca1e19067f67bb8680fbd88d43`
+
+That session exposed a new OB1-side review-resolution bug.
+
+### Exact repro
+
+The Telegram review proposed 2 candidate thoughts.
+
+The user then tapped, in order:
+
+1. `Deny 1`
+2. `Deny 2`
+3. `Commit`
+
+Observed bridge callback log in `/var/log/ob1-telegram-bridge/server.log`:
+
+```text
+{"update_id": 261883667, "handled": true, "path": "callback", "decision": "denied", "review_kind": "review", "source_dedupe_key": "dictation:3bb9b3d5c381166362e99b24c0c0438fe42fffca1e19067f67bb8680fbd88d43", "thought_count": 2, "telegram_user_id": 8795344081}
+{"update_id": 261883668, "handled": true, "path": "callback", "decision": "denied", "review_kind": "review", "source_dedupe_key": "dictation:3bb9b3d5c381166362e99b24c0c0438fe42fffca1e19067f67bb8680fbd88d43", "thought_count": 2, "telegram_user_id": 8795344081}
+{"update_id": 261883669, "handled": true, "path": "callback", "decision": "commit_blocked", "reason": "no_approved_thoughts"}
+```
+
+Persisted review state after those taps in `/usr/local/var/ob1-telegram-bridge/telegram-review-state.json`:
+
+- the session is still present under `pending_actions`
+- both candidate thoughts have `status: "denied"`
+- no resolution was recorded
+- the review prompt remains pending instead of resolving cleanly
+
+### Why this is wrong
+
+This is not a Telegram delivery problem and not a `system-config` problem.
+
+The callbacks were handled.
+
+The actual bug is in OB1 review semantics:
+
+- denying every thought individually leaves the session with zero approved thoughts
+- pressing `Commit` after that does not finalize the review
+- instead it returns `commit_blocked` with `reason=no_approved_thoughts`
+- the session stays stranded in `pending_actions`
+
+Current code path in `integrations/telegram-capture/telegram_bridge.py`:
+
+- `action == "commit"` calls `approved_session_payloads(pending)`
+- if that returns empty, it only acknowledges:
+  - `No approved thoughts to commit.`
+- then returns:
+  - `{"decision": "commit_blocked", "reason": "no_approved_thoughts"}`
+- it does **not** record an ignored resolution
+- it does **not** clear the pending review session
+
+### Expected behavior
+
+If all candidate thoughts have been denied individually, the review should resolve the same way as an explicit `Deny All`, or otherwise provide a first-class finalization path that does not strand the session.
+
+At minimum, one of these needs to happen when `Commit` is pressed with zero approved thoughts and all thoughts denied:
+
+1. treat it as `deny_all`
+2. record a terminal ignored resolution and clear the pending session
+3. or present a distinct explicit finalization action for “commit source, keep 0 thoughts” if that is the intended product behavior
+
+What should **not** happen is the current behavior where every per-thought deny is accepted, but the final review never resolves.
+
+### Scope note
+
+This bug is downstream of the original importer/tool-call failure.
+
+The important good news is:
+
+- managed `OB1 main` + DeepSeek recovered the production path far enough to generate and persist a Telegram full-review session
+- the remaining issue here is now specifically the review-resolution semantics after per-thought denies
+
+### Suggested acceptance check for OB1 custodian
+
+For a Telegram full-review session with 2 candidate thoughts:
+
+1. deny thought 1
+2. deny thought 2
+3. press `Commit`
+
+Expected result:
+
+- session reaches a terminal resolved state
+- pending review is removed
+- importer resolution becomes `ignored` or equivalent terminal state
+- Telegram UI reflects the final outcome instead of remaining effectively stuck
+
+### OB1 hotfix resolution
+
+OB1 now handles this exact path in `integrations/telegram-capture/telegram_bridge.py`:
+
+- `Commit` with zero approved thoughts and every candidate thought already `denied` records an `ignored` resolution.
+- The pending review action is removed.
+- The callback result is `decision: "commit_ignored"` with `reason: "all_thoughts_denied"`.
+- The existing `Deny All` path and the new all-denied `Commit` path share the same ignored-finalization helper.
+- `Commit` with zero approved thoughts but still-pending candidates remains blocked as `commit_blocked`; that is still an undecided review, not a terminal ignore.
+
+Regression coverage was added in `tests/test_telegram_review_workflow.py` for the production sequence:
+
+1. `Deny 1`
+2. `Deny 2`
+3. `Commit`
+
+Expected deployment action for `system-config`:
+
+- deploy `origin/main` at or after the OB1 hotfix commit that contains this section
+- restart `ob1-telegram-bridge`
+- retry the same review flow or any fresh two-thought review with both thoughts denied before commit
