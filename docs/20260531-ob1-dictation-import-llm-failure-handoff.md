@@ -484,6 +484,6 @@ Regression coverage was added in `tests/test_telegram_review_workflow.py` for th
 
 Expected deployment action for `system-config`:
 
-- deploy `origin/main` at or after the OB1 hotfix commit that contains this section
+- deploy `origin/main` at or after `6056c65f8d260ee85124b2681e17a3406da2c75e`
 - restart `ob1-telegram-bridge`
 - retry the same review flow or any fresh two-thought review with both thoughts denied before commit
