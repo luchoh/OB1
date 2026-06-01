@@ -41,6 +41,7 @@ from recipes.shared_telegram_review_state import (
     REVIEW_MODE_FULL,
     THOUGHT_STATUS_APPROVED,
     THOUGHT_STATUS_DENIED,
+    THOUGHT_STATUS_PENDING,
     approved_session_payloads,
     apply_edit_reply,
     build_review_reply_markup,
@@ -1200,6 +1201,18 @@ def process_callback_query(args, state: dict, callback_query: dict):
             if thought_index is None or thought_index >= len(thoughts):
                 return {"handled": False, "reason": "invalid_thought_index"}
             thoughts[thought_index]["status"] = THOUGHT_STATUS_DENIED
+            if thoughts and all(thought.get("status") == THOUGHT_STATUS_DENIED for thought in thoughts):
+                finalize_ignored_review(args, review_state, token, pending, callback_id)
+                return {
+                    "handled": True,
+                    "path": "callback",
+                    "decision": "denied_all",
+                    "reason": "all_thoughts_denied",
+                    "review_kind": kind,
+                    "source_dedupe_key": source_payload.get("dedupe_key"),
+                    "thought_count": len(thoughts),
+                    "telegram_user_id": from_user.get("id"),
+                }
             refresh_review_message(args, token, pending)
             acknowledge_callback(args, callback_id, f"Denied thought {thought_index + 1}.")
             return {
@@ -1214,7 +1227,7 @@ def process_callback_query(args, state: dict, callback_query: dict):
 
         if action == "approve_all":
             for thought in thoughts:
-                if thought.get("status") != "edited":
+                if (thought.get("status") or THOUGHT_STATUS_PENDING) == THOUGHT_STATUS_PENDING:
                     thought["status"] = THOUGHT_STATUS_APPROVED
             refresh_review_message(args, token, pending)
             acknowledge_callback(args, callback_id, "Approved all thoughts.")

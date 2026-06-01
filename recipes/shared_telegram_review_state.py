@@ -319,7 +319,12 @@ def build_review_reply_markup(session: dict, token: str) -> dict:
             keyboard.append([{"text": "View Raw", "callback_data": f"ob1:view_raw:{token}"}])
         return {"inline_keyboard": keyboard}
 
-    for thought in thoughts:
+    pending_thoughts = [
+        thought
+        for thought in thoughts
+        if (thought.get("status") or THOUGHT_STATUS_PENDING) == THOUGHT_STATUS_PENDING
+    ]
+    for thought in pending_thoughts:
         index = int(thought.get("index", 0))
         label_index = index + 1
         keyboard.append(
@@ -330,10 +335,8 @@ def build_review_reply_markup(session: dict, token: str) -> dict:
             ]
         )
     keyboard.append(
-        [
-            {"text": "Approve All", "callback_data": f"ob1:approve_all:{token}"},
-            {"text": "Commit", "callback_data": f"ob1:commit:{token}"},
-        ]
+        ([{"text": "Approve All", "callback_data": f"ob1:approve_all:{token}"}] if pending_thoughts else [])
+        + [{"text": "Commit", "callback_data": f"ob1:commit:{token}"}]
     )
     trailing = [{"text": "Deny All", "callback_data": f"ob1:deny_all:{token}"}]
     if session.get("view_raw_enabled", True):

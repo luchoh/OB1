@@ -470,20 +470,26 @@ Expected result:
 
 OB1 now handles this exact path in `integrations/telegram-capture/telegram_bridge.py`:
 
-- `Commit` with zero approved thoughts and every candidate thought already `denied` records an `ignored` resolution.
-- The pending review action is removed.
-- The callback result is `decision: "commit_ignored"` with `reason: "all_thoughts_denied"`.
+- Individual `Approve N` and `Deny N` actions now remove that thought's action-button row from the refreshed Telegram inline keyboard.
+- If the last remaining candidate is denied individually, the review resolves immediately as `ignored`; `Commit` is no longer required after every thought has been denied.
+- The final all-denied UI edit clears the inline keyboard with `{"inline_keyboard": []}`.
+- `Commit` with zero approved thoughts and every candidate thought already `denied` still records an `ignored` resolution for stale review states that predate the immediate-finalization fix.
+- In both ignored paths, the pending review action is removed.
+- The final individual-deny callback result is `decision: "denied_all"` with `reason: "all_thoughts_denied"`.
+- The stale all-denied commit callback result is `decision: "commit_ignored"` with `reason: "all_thoughts_denied"`.
 - The existing `Deny All` path and the new all-denied `Commit` path share the same ignored-finalization helper.
 - `Commit` with zero approved thoughts but still-pending candidates remains blocked as `commit_blocked`; that is still an undecided review, not a terminal ignore.
+- `Approve All` only changes still-pending thoughts; it no longer resurrects thoughts already denied individually.
 
-Regression coverage was added in `tests/test_telegram_review_workflow.py` for the production sequence:
+Regression coverage was added in `tests/test_telegram_review_workflow.py` for:
 
-1. `Deny 1`
-2. `Deny 2`
-3. `Commit`
+- approved thought action rows disappearing from the refreshed keyboard
+- denied thought action rows disappearing from the refreshed keyboard
+- `Deny 1`, then `Deny 2` resolving immediately as ignored and clearing buttons
+- stale all-denied reviews still resolving as ignored if the user presses `Commit`
 
 Expected deployment action for `system-config`:
 
-- deploy `origin/main` at or after `6056c65f8d260ee85124b2681e17a3406da2c75e`
+- deploy `origin/main` at or after the latest OB1 Telegram review UI hotfix commit
 - restart `ob1-telegram-bridge`
 - retry the same review flow or any fresh two-thought review with both thoughts denied before commit
