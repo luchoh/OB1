@@ -25,7 +25,7 @@ This is the runnable local core service for the Open Brain Local design.
 - PostgreSQL reachable with the `ob1` database
 - `pgvector` enabled in that database
 - `ob1-embedding` healthy at `EMBEDDING_BASE_URL`
-- `mlx-server` healthy at `LLM_BASE_URL`
+- oMLX inference healthy at `LLM_BASE_URL`; Consul still exposes it as `mlx-server`
 - optional local `neo4j` / `neo4j-enterprise` graph service
 - `.env.open-brain-local` populated from [`.env.open-brain-local.example`](/Users/luchoh/Dev/OB1/.env.open-brain-local.example)
 
@@ -302,7 +302,7 @@ The graph layer now exposes four read-only inspection surfaces:
 
 - The service loads the repo root `.env.open-brain-local` only.
 - `LLM_ENABLE_THINKING=false` is the intended default for structured local LLM calls.
-- Structured extraction uses Qwen tool calling rather than `response_format`.
+- Structured extraction uses OpenAI-compatible tool calling rather than `response_format`.
 - The canonical embedding contract is `1536` dimensions, owned by `ob1-embedding`.
 - Importers should supply `dedupe_key` for idempotent writes when identical text can appear in different sources.
 - Importers can set `extract_metadata=false` when they already have structured metadata and only need embeddings plus storage.

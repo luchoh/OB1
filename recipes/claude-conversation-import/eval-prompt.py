@@ -32,7 +32,7 @@ CASE_FILE_PATH = Path(__file__).with_name("eval-cases.json")
 PROMPT_FILE_PATH = Path(__file__).with_name("prompt.md")
 IMPORTER_PATH = Path(__file__).with_name("import-claude.py")
 
-LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
+LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "DeepSeek-V4-Flash-nvfp4")
 LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
     "1",
     "true",

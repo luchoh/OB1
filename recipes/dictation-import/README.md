@@ -18,7 +18,7 @@ For `capture_channel=telegram` artifacts, the importer now applies the same mean
 - Working Open Brain local runtime
 - Access key for `POST /ingest/thought`
 - MinIO access to the canonical dictation artifact bucket
-- Local `mlx-server` available for thought distillation
+- Local oMLX inference available for thought distillation; Consul exposes it as `mlx-server`
 
 ## Install
 

@@ -409,7 +409,7 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
             dry_run=False,
             base_url="http://127.0.0.1:8788",
             access_key="test-key",
-            llm_model="mlx-community/Qwen3.5-397B-A17B-nvfp4",
+            llm_model="DeepSeek-V4-Flash-nvfp4",
             telegram_bot_token="telegram-token",
             telegram_review_match_threshold=0.78,
             telegram_review_match_count=3,

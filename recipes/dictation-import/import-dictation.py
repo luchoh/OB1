@@ -57,7 +57,7 @@ SYNC_SCHEMA_VERSION = 1
 
 DEFAULT_BASE_URL = (os.environ.get("OPEN_BRAIN_BASE_URL") or f"http://127.0.0.1:{os.environ.get('OPEN_BRAIN_PORT', '8787')}").rstrip("/")
 DEFAULT_ACCESS_KEY = os.environ.get("MCP_ACCESS_KEY") or os.environ.get("OPEN_BRAIN_ACCESS_KEY") or ""
-DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
+DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "DeepSeek-V4-Flash-nvfp4")
 DEFAULT_BUCKET = os.environ.get("DICTATION_MINIO_BUCKET") or "dictation-artifacts"
 DEFAULT_PREFIX = os.environ.get("DICTATION_MINIO_PREFIX") or "canonical/"
 DEFAULT_MINIO_ENDPOINT = first_env("MINIO_ENDPOINT", "DICTATION_MINIO_ENDPOINT")

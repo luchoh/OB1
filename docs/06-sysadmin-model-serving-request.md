@@ -8,7 +8,8 @@ This file now serves as a historical handoff record. The prompt below is what wa
 
 ## Implemented Outcome
 
-- `mlx-server` remains the canonical inference service, discovered through Consul
+- oMLX is the canonical inference runtime and remains discoverable through the backward-compatible Consul service name `mlx-server`
+- the current default inference model is `DeepSeek-V4-Flash-nvfp4`
 - `ob1-embedding` remains the canonical embedding service, discovered through Consul
 - `ob1-embedding` now serves `1536`-dimensional embeddings by default
 - Accepted request behavior: no `dimensions` field or `dimensions = 1536`
@@ -20,6 +21,7 @@ This file now serves as a historical handoff record. The prompt below is what wa
 ## Historical Prompt
 
 Use the prompt below only as historical context or when recreating the same request on another environment.
+It predates the oMLX / DeepSeek migration, so do not treat the old prefixed Qwen model IDs as current OB1 defaults.
 
 ## Copy/Paste Prompt
 

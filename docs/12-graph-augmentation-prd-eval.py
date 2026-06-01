@@ -28,7 +28,7 @@ CASE_FILE_PATH = Path(__file__).with_name("12-graph-augmentation-prd-eval-cases.
 PRD_FILE_PATH = Path(__file__).with_name("12-graph-augmentation-prd.md")
 EVIDENCE_FILE_PATH = Path(__file__).with_name("12-graph-augmentation-evidence.md")
 
-LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
+LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "DeepSeek-V4-Flash-nvfp4")
 LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
     "1",
     "true",

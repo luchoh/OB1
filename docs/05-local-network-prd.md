@@ -79,8 +79,8 @@ From the local OB1 env contract and Consul:
   - MinIO
   - Neo4j
   - Docling
-- `mlx-server` is registered in Consul and responds to OpenAI-compatible `chat/completions`
-- The currently exposed MLX model is `mlx-community/Qwen3.5-397B-A17B-nvfp4`
+- oMLX is registered in Consul under the compatibility service name `mlx-server` and responds to OpenAI-compatible `chat/completions`
+- The currently exposed default inference model is `DeepSeek-V4-Flash-nvfp4`
 - `ob1-embedding` is registered in Consul and responds to OpenAI-compatible `embeddings`
 - The canonical embedding model now exposed there is `mlx-community/Qwen3-Embedding-8B-mxfp8`
 - The `ob1-embedding` service now returns `1536`-dimensional embeddings server-side by default
@@ -88,7 +88,7 @@ From the local OB1 env contract and Consul:
 - It returns `400` for unsupported dimensions such as `3072`
 - The embedding runtime is now pinned to a local artifact path at `/Volumes/llama-models/mlx-embedding/.cache/huggingface/hub/models--mlx-community--Qwen3-Embedding-8B-mxfp8/snapshots/51c773b7464b630a6c67b4f75dbd796b658d6236`
 - The earlier `llama-cpp-embedding` service remains available as a fallback path and serves the Nomic embedding model
-- The MLX model does not support `/v1/embeddings`, so generation and embedding must remain separate services
+- The inference model service does not provide the canonical `/v1/embeddings` path, so generation and embedding must remain separate services
 - Offline startup semantics are enabled for both inference and embeddings
 - `ob1-embedding` now loads from a local artifact path on disk
 - Consul registration for `ob1-embedding` is now gated on successful readiness and a passing `/health` check
@@ -97,7 +97,7 @@ Implication: the network now has a validated end-to-end local path for PostgreSQ
 
 ### Accepted Serving Decision (March 2026)
 
-- Keep `mlx-server` as the canonical inference service
+- Keep `mlx-server` as the canonical inference discovery name for the oMLX service
 - Keep `ob1-embedding` as the canonical embedding contract
 - Keep `llama-cpp-embedding` only as rollback
 - Do not move embeddings back behind generic `vllm-mlx serve`
@@ -114,9 +114,8 @@ Implication: the network now has a validated end-to-end local path for PostgreSQ
 - That embedding model is now confirmed live locally on the dedicated `ob1-embedding` service discovered through Consul
 - The official model card marks the model as MRL-capable, which means reduced-dimension outputs are a supported part of the model design
 - A strong smaller alternative exists in `jinaai/jina-embeddings-v5-text-small`, but it is not the best absolute model for this hardware budget and uses a non-commercial license
-- For inference, the strongest model that cleanly fits the current deployment direction is `Qwen/Qwen3.5-397B-A17B`, already validated locally as `mlx-community/Qwen3.5-397B-A17B-nvfp4`
-- `Qwen3.5-397B-A17B` is especially attractive for this project because its official evaluation includes strong MCP, tool-use, and search-agent results, which map directly to the "brain" workflow
-- `moonshotai/Kimi-K2.5` is a credible frontier alternative and may exceed Qwen on some agentic tasks, but the standard MLX conversion advertises a larger memory footprint than 512 GB, making it a riskier default for this host
+- For inference, the current production default is `DeepSeek-V4-Flash-nvfp4` served by oMLX.
+- Earlier Qwen3.5 findings remain useful historical context, but the live OB1 worker default is now DeepSeek because it proved compatible with the production tool-calling path.
 
 ## Product Definition
 
@@ -315,10 +314,10 @@ Preferred operating model:
 Validated current endpoints:
 
 - Generation:
-  - Base URL: discovered from the `mlx-server` Consul service
-  - Health: the discovered `mlx-server` `/health` route
+  - Base URL: discovered from the oMLX service registered in Consul as `mlx-server`
+  - Health: the discovered `mlx-server` compatibility service `/health` route
   - Service: `mlx-server`
-  - Model: `mlx-community/Qwen3.5-397B-A17B-nvfp4`
+  - Model: `DeepSeek-V4-Flash-nvfp4`
   - Role: chat, reasoning, metadata extraction
 - Embeddings:
   - Base URL: discovered from the `ob1-embedding` Consul service
@@ -336,9 +335,9 @@ Validated current endpoints:
 Recommended canonical v1 models:
 
 - Inference:
-  - Canonical model: `Qwen/Qwen3.5-397B-A17B`
-  - Local serving format: `mlx-community/Qwen3.5-397B-A17B-nvfp4`
-  - Why: already validated locally, Apache 2.0, 262K native context, and strong official results on MCP-Mark, Tool Decathlon, DeepPlanning, and search-agent benchmarks
+  - Canonical model: `DeepSeek-V4-Flash-nvfp4`
+  - Local serving format: bare oMLX model id `DeepSeek-V4-Flash-nvfp4`
+  - Why: current production default on the oMLX endpoint and verified compatible with OB1 structured extraction
 - Embeddings:
   - Canonical model: `Qwen/Qwen3-Embedding-8B`
   - Local serving format: `mlx-community/Qwen3-Embedding-8B-mxfp8`

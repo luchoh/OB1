@@ -19,7 +19,7 @@ import requests
 
 
 LOCAL_LLM_BASE = os.environ.get("LLM_BASE_URL", "").rstrip("/")
-LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
+LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "DeepSeek-V4-Flash-nvfp4")
 LOCAL_LLM_SERVICE_NAME = os.environ.get("OPEN_BRAIN_LLM_SERVICE_NAME", "mlx-server")
 LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
     "1",

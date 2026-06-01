@@ -32,7 +32,7 @@ The importer is idempotent:
 - each message writes with a stable mailbox/UID-based `dedupe_key`
 - successful runs are also recorded in `imap-sync-log.json`
 
-By default the importer also distills each email into up to 3 durable `email_thought` entries using the local Qwen endpoint.
+By default the importer also distills each email into up to 3 durable `email_thought` entries using the local oMLX endpoint.
 Use `--no-distill` if you want raw email records only.
 
 ## Prerequisites

@@ -1,7 +1,15 @@
 # vllm-mlx No-Thinking Fix
 
 Date: 2026-03-14
-Status: No-thinking fixed in `mlx-server`; structured extraction findings added
+Status: Historical vllm-mlx note; current production inference is oMLX registered as `mlx-server`
+
+Current OB1 default:
+
+- runtime: oMLX
+- Consul compatibility service name: `mlx-server`
+- model: `DeepSeek-V4-Flash-nvfp4`
+
+The Qwen/vllm-mlx details below are retained as historical context for the tool-calling contract. They are not the current model default.
 
 ## What The Official Control Is
 
@@ -77,14 +85,15 @@ So the current conclusion is:
 - `response_format` is still not trustworthy for this extraction workload
 - tool calling is the correct production contract for OB1 extraction tasks on this stack
 
-## Recommended Production Contract
+## Recommended Structured-Extraction Contract
 
-For Qwen3.5 extraction tasks on `mlx-server`:
+For OB1 extraction tasks on the current oMLX endpoint registered as `mlx-server`:
 
-1. Send `chat_template_kwargs: {"enable_thinking": false}`
-2. Use tool calling for structured outputs
-3. Prefer `tool_choice: "required"` when the task must return structured data
+1. Use tool calling for structured outputs
+2. Prefer `tool_choice: "required"` when the task must return structured data
+3. Use `temperature: 0` for deterministic extraction
 4. Parse `message.tool_calls[*].function.arguments` as JSON
+5. Keep fallback parsing for known oMLX compatibility shapes, but do not rely on prompt-only JSON for critical extraction
 
 Do not rely on:
 
@@ -151,7 +160,7 @@ Defined in:
 
 ```json
 {
-  "model": "mlx-community/Qwen3.5-397B-A17B-nvfp4",
+  "model": "DeepSeek-V4-Flash-nvfp4",
   "temperature": 0,
   "max_tokens": 500,
   "chat_template_kwargs": {
@@ -182,7 +191,7 @@ This request shape is the recommended extraction contract:
 
 ```json
 {
-  "model": "mlx-community/Qwen3.5-397B-A17B-nvfp4",
+  "model": "DeepSeek-V4-Flash-nvfp4",
   "temperature": 0,
   "chat_template_kwargs": {
     "enable_thinking": false

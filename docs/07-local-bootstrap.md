@@ -17,8 +17,8 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 ## Canonical Services
 
 - PostgreSQL: `ob1` database with `pgvector`
-- Inference: the `mlx-server` Consul service using `mlx-community/Qwen3.5-397B-A17B-nvfp4`
-- Inference health: the discovered `mlx-server` service `/health` endpoint
+- Inference: the oMLX service registered in Consul as `mlx-server`, using `DeepSeek-V4-Flash-nvfp4`
+- Inference health: the discovered `mlx-server` compatibility service `/health` endpoint
 - Embeddings: the `ob1-embedding` Consul service using `mlx-community/Qwen3-Embedding-8B-mxfp8`
 - Embedding health: the discovered `ob1-embedding` service `/health` endpoint
 - Document parsing: via the `docling` Consul service
@@ -55,7 +55,8 @@ This is the concrete bootstrap path for the current local-only Open Brain design
 - The service now serves the production embedding dimension directly, so clients should not perform their own truncation in steady state.
 - The canonical runtime scaffold now lives in [`local/open-brain-mcp`](/Users/luchoh/Dev/OB1/local/open-brain-mcp) and mirrors the Hono/MCP pattern used by the extension examples.
 - The local runtime now exposes grounded answering through the `ask_brain` MCP tool and the `/ask` HTTP route.
-- The canonical document-ingest path is now the live Docling service plus [recipes/document-import](/Users/luchoh/Dev/OB1/recipes/document-import#L1).
+- The canonical document-ingest path is now the live Docling service plus [recipes/document-import](/Users/luchoh/Dev/OB1/recipes/document-import#L1), with [import-open-brain-documents.sh](/Users/luchoh/Dev/OB1/scripts/import-open-brain-documents.sh) as the recommended repo-level operator entrypoint.
+- Document import writes normalized Markdown and Docling extraction bundles under `local/open-brain-mcp/.runtime/document-import-artifacts`; OB1 ingest uses the extraction bundle, not re-parsed Markdown.
 - Document and attachment import now use an OCR-first Docling pass and automatically retry with the `vlm` pipeline when extraction quality is clearly weak.
 - Run one worker per model service and scale embeddings with batching, not worker duplication.
 - Pre-stage model artifacts locally and prefer offline startup semantics.

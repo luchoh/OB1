@@ -18,7 +18,7 @@ except ImportError as exc:  # pragma: no cover - import guard for CLI use
 
 
 CLAIM_EXTRACTION_VERSION = "claim-typing-v1"
-LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
+LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "DeepSeek-V4-Flash-nvfp4")
 LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
     "1",
     "true",

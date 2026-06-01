@@ -38,7 +38,8 @@ Recommended service-specific values:
 - `OPEN_BRAIN_HOST=localhost` for workstation-only use, or bind all interfaces for managed LAN service
 - `OPEN_BRAIN_PORT=8787`
 - `OPEN_BRAIN_SERVICE_NAME=open-brain-local`
-- `OPEN_BRAIN_LLM_SERVICE_NAME=mlx-server`
+- `OPEN_BRAIN_LLM_SERVICE_NAME=mlx-server` for the oMLX compatibility service
+- `LLM_MODEL=DeepSeek-V4-Flash-nvfp4`
 - `OPEN_BRAIN_EMBEDDING_SERVICE_NAME=ob1-embedding`
 - `DOCLING_SERVICE_NAME=docling`
 - `CONSUL_HTTP_ADDR=https://consul.lincoln.luchoh.net`
@@ -117,7 +118,8 @@ After the sysadmin wires the managed service, verify in this order:
 - canonical embedding dimension: `1536`
 - importer dedupe key: supported and recommended
 - importer metadata bypass: supported via `extract_metadata=false`
-- document ingest path: [recipes/document-import](/Users/luchoh/Dev/OB1/recipes/document-import#L1)
+- document ingest path: [recipes/document-import](/Users/luchoh/Dev/OB1/recipes/document-import#L1) via [import-open-brain-documents.sh](/Users/luchoh/Dev/OB1/scripts/import-open-brain-documents.sh) for normal folder-fed operation
+- document ingest sidecar: normalized Markdown and Docling extraction bundles live under `local/open-brain-mcp/.runtime/document-import-artifacts`; OB1 remains canonical after ingest
 
 ## Sysadmin Prompt
 

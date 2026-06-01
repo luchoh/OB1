@@ -62,7 +62,7 @@ PROMPT_FILE_PATH = Path(__file__).with_name("prompt.md")
 CLAIM_PROMPT_FILE_PATH = REPO_ROOT / "recipes" / "claim-typing" / "prompt.md"
 
 OLLAMA_BASE = "http://localhost:11434"
-LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
+LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "DeepSeek-V4-Flash-nvfp4")
 LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
     "1",
     "true",

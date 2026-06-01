@@ -21,11 +21,11 @@ Import a Claude data export into Open Brain as distilled, searchable thoughts.
 - ingests those thoughts into the local OB1 service
 
 The local-first path uses:
-- local Qwen inference through the `mlx-server` Consul service
+- local oMLX inference through the `mlx-server` Consul compatibility service
 - local OB1 ingest on `localhost:8787`
 - local embeddings through the OB1 service
 - no internet egress in steady state
-- Qwen tool calling for structured extraction
+- OpenAI-compatible tool calling for structured extraction
 
 The prompt is now intentionally externalized in [prompt.md](/Users/luchoh/Dev/OB1/recipes/claude-conversation-import/prompt.md#L1), so it can be tuned without rewriting the importer.
 
@@ -85,7 +85,7 @@ Shared claim-typing artifacts:
 - [claim evaluator](/Users/luchoh/Dev/OB1/recipes/claim-typing/eval-prompt.py#L1)
 - [claim cases](/Users/luchoh/Dev/OB1/recipes/claim-typing/eval-cases.json#L1)
 
-This importer uses Qwen tool calling for thought extraction rather than `response_format`, because that is the reliable structured-output path on the current `mlx-server`. Details are in [docs/08-vllm-mlx-no-thinking.md](/Users/luchoh/Dev/OB1/docs/08-vllm-mlx-no-thinking.md#L1).
+This importer uses tool calling for thought extraction rather than `response_format`, because that is the reliable structured-output path on the current oMLX endpoint. The `mlx-server` service name remains as compatibility discovery wiring.
 
 ## Important Flags
 
@@ -104,7 +104,7 @@ This importer uses Qwen tool calling for thought extraction rather than `respons
 By default the script uses:
 
 - summarizer model: `LLM_MODEL`
-- summarizer endpoint: `LLM_BASE_URL` or Consul discovery of `mlx-server`
+- summarizer endpoint: `LLM_BASE_URL` or Consul discovery of the oMLX service registered as `mlx-server`
 - summarizer thinking mode: `LLM_ENABLE_THINKING=false`
 - ingest endpoint: `http://localhost:8787/ingest/thought`
 - ingest key: `MCP_ACCESS_KEY`

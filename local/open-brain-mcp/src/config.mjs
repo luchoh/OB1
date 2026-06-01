@@ -349,7 +349,7 @@ async function loadConfig() {
     accessKey: envString("MCP_ACCESS_KEY", undefined),
     llmBaseUrl: llm.baseUrl,
     llmHealthUrl: llm.healthUrl,
-    llmModel: envString("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4"),
+    llmModel: envString("LLM_MODEL", "DeepSeek-V4-Flash-nvfp4"),
     llmEnableThinking: envBoolean("LLM_ENABLE_THINKING", false),
     embeddingBaseUrl: embedding.baseUrl,
     embeddingHealthUrl: embedding.healthUrl,
