@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from recipes.shared_docling import extract_tool_arguments
+from recipes.shared_docling import docling_markdown_artifact, extract_tool_arguments
 
 
 class SharedDoclingTests(unittest.TestCase):
@@ -48,6 +48,20 @@ class SharedDoclingTests(unittest.TestCase):
 
         self.assertEqual(payload["thoughts"], ["Thought A"])
         self.assertEqual(payload["reason"], "json fallback")
+
+    def test_docling_markdown_artifact_accepts_direct_convert_document_markdown(self):
+        extraction = {
+            "raw_payload": {
+                "document": {
+                    "md_content": "# Converted\n\nText from Docling direct conversion.",
+                },
+            },
+        }
+
+        self.assertEqual(
+            docling_markdown_artifact("paper.pdf", extraction),
+            "# Converted\n\nText from Docling direct conversion.",
+        )
 
 
 if __name__ == "__main__":

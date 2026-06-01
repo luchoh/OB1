@@ -33,7 +33,7 @@ LOCAL_INGEST_KEY = os.environ.get("OPEN_BRAIN_INGEST_KEY") or os.environ.get("MC
 
 DOCLING_BASE_URL = os.environ.get("DOCLING_BASE_URL", "").rstrip("/")
 DOCLING_SERVICE_NAME = os.environ.get("DOCLING_SERVICE_NAME", "docling")
-DOCLING_FALLBACK_SERVICE_NAME = os.environ.get("DOCLING_FALLBACK_SERVICE_NAME", "docling-markdown")
+DOCLING_FALLBACK_SERVICE_NAME = os.environ.get("DOCLING_FALLBACK_SERVICE_NAME", "").strip()
 CONSUL_HTTP_ADDR = os.environ.get("CONSUL_HTTP_ADDR", "https://consul.lincoln.luchoh.net").rstrip("/")
 CONSUL_HTTP_TOKEN = os.environ.get("CONSUL_HTTP_TOKEN", "")
 CONSUL_FORCE_DISCOVERY = os.environ.get("CONSUL_FORCE_DISCOVERY", "false").strip().lower() in ("1", "true", "yes", "on")
@@ -380,6 +380,11 @@ def docling_markdown_artifact(_path_name, extraction):
     if isinstance(raw_payload, dict):
         for key in ("markdown", "md", "document_markdown"):
             value = raw_payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        document = raw_payload.get("document")
+        if isinstance(document, dict):
+            value = document.get("md_content")
             if isinstance(value, str) and value.strip():
                 return value.strip()
 
