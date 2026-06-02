@@ -41,6 +41,7 @@ from recipes.shared_telegram_review_state import (
     REVIEW_MODE_FULL,
     THOUGHT_STATUS_APPROVED,
     THOUGHT_STATUS_DENIED,
+    THOUGHT_STATUS_EDITED,
     THOUGHT_STATUS_PENDING,
     approved_session_payloads,
     apply_edit_reply,
@@ -469,7 +470,7 @@ def summarize_text_message(text: str, title_hint: str | None, llm_model: str):
     }
 
 
-def lookup_similar_thoughts(base_url: str, access_key: str, queries: list[str], *, match_threshold: float, match_count: int):
+def lookup_similar_thoughts(base_url: str, access_key: str, queries: list[str], *, match_threshold: float, match_count: int) -> dict[str, list[dict]]:
     response = requests.post(
         f"{base_url.rstrip('/')}/admin/thought/similar",
         headers={
@@ -489,7 +490,16 @@ def lookup_similar_thoughts(base_url: str, access_key: str, queries: list[str], 
         raise RuntimeError(f"{response.status_code} {response.reason}: {body_text}")
     payload = response.json()
     results = payload.get("results", [])
-    return {item.get("query"): item.get("matches", []) for item in results if isinstance(item, dict)}
+    out: dict[str, list[dict]] = {}
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        query = item.get("query")
+        if not isinstance(query, str):
+            continue
+        matches = item.get("matches", [])
+        out[query] = matches if isinstance(matches, list) else []
+    return out
 
 
 def review_thought_novelty(candidate_thoughts: list[str], similar_matches: dict[str, list[dict]], llm_model: str):
@@ -737,6 +747,8 @@ def send_review_raw_source(args, session: dict):
         suffix = "\n\n[truncated]"
     label = "Raw voice transcript" if session.get("origin") == "telegram_dictation" else "Raw Telegram message"
     reply_target = session.get("review_message_id") or session.get("message_id")
+    if reply_target is None:
+        return
     send_reply(
         args.telegram_token,
         str(session.get("chat_id")),
@@ -751,6 +763,8 @@ def prompt_for_thought_edit(args, review_state: dict, token: str, session: dict,
     if not args.telegram_token or args.dry_run:
         return False
     reply_target = session.get("review_message_id") or session.get("message_id")
+    if reply_target is None:
+        return False
     prompt_result = send_reply(
         args.telegram_token,
         str(session.get("chat_id")),
@@ -1181,9 +1195,70 @@ def process_callback_query(args, state: dict, callback_query: dict):
                 "telegram_user_id": from_user.get("id"),
             }
 
+        if len(thoughts) == 1 and action in {"record", "ignore"}:
+            if action == "ignore":
+                finalize_ignored_review(args, review_state, token, pending, callback_id)
+                return {
+                    "handled": True,
+                    "path": "callback",
+                    "decision": "ignore",
+                    "review_kind": kind,
+                    "source_dedupe_key": source_payload.get("dedupe_key"),
+                    "thought_count": len(thoughts),
+                    "telegram_user_id": from_user.get("id"),
+                }
+
+            if (thoughts[0].get("status") or THOUGHT_STATUS_PENDING) == THOUGHT_STATUS_PENDING:
+                thoughts[0]["status"] = THOUGHT_STATUS_APPROVED
+            final_thoughts = approved_session_payloads(pending)
+            if not final_thoughts:
+                acknowledge_callback(args, callback_id, "No thought available to record.")
+                return {
+                    "handled": True,
+                    "path": "callback",
+                    "decision": "record_blocked",
+                    "reason": "missing_single_thought",
+                }
+            if not args.dry_run:
+                ingest_text_capture(args, source_payload, final_thoughts)
+                record_resolution(review_state, token, pending, DICTATION_RESOLUTION_INGESTED)
+            acknowledge_callback(args, callback_id, "Recorded.")
+            if args.telegram_token and review_message_id and not args.dry_run:
+                best_effort_telegram(
+                    "review message finalization",
+                    edit_message,
+                    args.telegram_token,
+                    chat_id,
+                    int(review_message_id),
+                    f"Recorded by request. Stored 1 source row and {len(final_thoughts)} thought rows.",
+                    reply_markup={"inline_keyboard": []},
+                )
+            review_state.setdefault("pending_actions", {}).pop(token, None)
+            return {
+                "handled": True,
+                "path": "callback",
+                "decision": "record",
+                "review_kind": kind,
+                "source_dedupe_key": source_payload.get("dedupe_key"),
+                "thought_count": len(final_thoughts),
+                "telegram_user_id": from_user.get("id"),
+            }
+
         if action == "approve":
             if thought_index is None or thought_index >= len(thoughts):
                 return {"handled": False, "reason": "invalid_thought_index"}
+            if thoughts[thought_index].get("status") in {THOUGHT_STATUS_APPROVED, THOUGHT_STATUS_EDITED}:
+                acknowledge_callback(args, callback_id, f"Thought {thought_index + 1} is already approved.")
+                return {
+                    "handled": True,
+                    "path": "callback",
+                    "decision": "approved",
+                    "reason": "already_approved",
+                    "review_kind": kind,
+                    "source_dedupe_key": source_payload.get("dedupe_key"),
+                    "thought_count": len(thoughts),
+                    "telegram_user_id": from_user.get("id"),
+                }
             thoughts[thought_index]["status"] = THOUGHT_STATUS_APPROVED
             refresh_review_message(args, token, pending)
             acknowledge_callback(args, callback_id, f"Approved thought {thought_index + 1}.")
@@ -1200,6 +1275,18 @@ def process_callback_query(args, state: dict, callback_query: dict):
         if action == "deny":
             if thought_index is None or thought_index >= len(thoughts):
                 return {"handled": False, "reason": "invalid_thought_index"}
+            if thoughts[thought_index].get("status") == THOUGHT_STATUS_DENIED:
+                acknowledge_callback(args, callback_id, f"Thought {thought_index + 1} is already denied.")
+                return {
+                    "handled": True,
+                    "path": "callback",
+                    "decision": "denied",
+                    "reason": "already_denied",
+                    "review_kind": kind,
+                    "source_dedupe_key": source_payload.get("dedupe_key"),
+                    "thought_count": len(thoughts),
+                    "telegram_user_id": from_user.get("id"),
+                }
             thoughts[thought_index]["status"] = THOUGHT_STATUS_DENIED
             if thoughts and all(thought.get("status") == THOUGHT_STATUS_DENIED for thought in thoughts):
                 finalize_ignored_review(args, review_state, token, pending, callback_id)

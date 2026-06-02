@@ -20,15 +20,15 @@ from recipes import shared_telegram_review_state as review_state
 def load_module(module_name: str, relative_path: str):
     module_path = REPO_ROOT / relative_path
     spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
 def install_fake_yaml_module():
     fake_yaml = types.ModuleType("yaml")
-    fake_yaml.safe_load = lambda text: json.loads(text)
+    setattr(fake_yaml, "safe_load", lambda text: json.loads(text))
     sys.modules.setdefault("yaml", fake_yaml)
 
 
@@ -224,8 +224,8 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
             with review_state.locked_review_state(state_path) as payload:
                 payload["pending_actions"][token] = session
 
-            bridge.edit_message = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Telegram edit failed"))
-            bridge.answer_callback_query = lambda *args, **kwargs: None
+            setattr(bridge, "edit_message", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("Telegram edit failed")))
+            setattr(bridge, "answer_callback_query", lambda *args, **kwargs: None)
 
             args = SimpleNamespace(
                 review_state_file=state_path,
@@ -275,8 +275,8 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
                 payload["pending_actions"][token] = session
 
             edits = []
-            bridge.answer_callback_query = lambda *args, **kwargs: None
-            bridge.edit_message = lambda *args, **kwargs: edits.append({"args": args, "kwargs": kwargs})
+            setattr(bridge, "answer_callback_query", lambda *args, **kwargs: None)
+            setattr(bridge, "edit_message", lambda *args, **kwargs: edits.append({"args": args, "kwargs": kwargs}))
 
             args = SimpleNamespace(
                 review_state_file=state_path,
@@ -331,15 +331,15 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
                 payload["pending_actions"][token] = session
 
             ingested = []
-            bridge.ingest_text_capture = lambda args, source, thoughts: ingested.append(
+            setattr(bridge, "ingest_text_capture", lambda args, source, thoughts: ingested.append(
                 {"source": source, "thoughts": thoughts}
-            )
-            bridge.answer_callback_query = lambda *args, **kwargs: (_ for _ in ()).throw(
+            ))
+            setattr(bridge, "answer_callback_query", lambda *args, **kwargs: (_ for _ in ()).throw(
                 RuntimeError("Telegram answer failed")
-            )
-            bridge.edit_message = lambda *args, **kwargs: (_ for _ in ()).throw(
+            ))
+            setattr(bridge, "edit_message", lambda *args, **kwargs: (_ for _ in ()).throw(
                 RuntimeError("Telegram edit failed")
-            )
+            ))
 
             args = SimpleNamespace(
                 review_state_file=state_path,
@@ -389,11 +389,11 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
                 payload["pending_actions"][token] = session
 
             edits = []
-            bridge.answer_callback_query = lambda *args, **kwargs: None
-            bridge.edit_message = lambda *args, **kwargs: edits.append({"args": args, "kwargs": kwargs})
-            bridge.ingest_text_capture = lambda *args, **kwargs: (_ for _ in ()).throw(
+            setattr(bridge, "answer_callback_query", lambda *args, **kwargs: None)
+            setattr(bridge, "edit_message", lambda *args, **kwargs: edits.append({"args": args, "kwargs": kwargs}))
+            setattr(bridge, "ingest_text_capture", lambda *args, **kwargs: (_ for _ in ()).throw(
                 AssertionError("denied review should not ingest")
-            )
+            ))
 
             args = SimpleNamespace(
                 review_state_file=state_path,
@@ -461,9 +461,9 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
             with review_state.locked_review_state(state_path) as payload:
                 payload["pending_actions"][token] = session
 
-            bridge.ingest_text_capture = lambda *args, **kwargs: (_ for _ in ()).throw(
+            setattr(bridge, "ingest_text_capture", lambda *args, **kwargs: (_ for _ in ()).throw(
                 AssertionError("denied review should not ingest")
-            )
+            ))
 
             args = SimpleNamespace(
                 review_state_file=state_path,
@@ -489,6 +489,250 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
             with review_state.locked_review_state(state_path) as payload:
                 self.assertNotIn(token, payload["pending_actions"])
                 self.assertEqual(payload["resolved_actions"][token]["status"], review_state.DICTATION_RESOLUTION_IGNORED)
+
+    def test_single_thought_session_renders_record_edit_ignore_keyboard(self):
+        session = review_state.build_review_session(
+            origin="telegram_dictation",
+            kind="review",
+            chat_id="123",
+            message_id=456,
+            source_payload={"content": "raw source", "dedupe_key": "dictation:single"},
+            thought_payloads=[{"content": "Sole thought", "metadata": {"summary": "Sole thought"}}],
+        )
+        token = "0123456789abcdef"
+        callback_data = inline_callback_data(review_state.build_review_reply_markup(session, token))
+        self.assertIn(f"ob1:record:{token}", callback_data)
+        self.assertIn(f"ob1:edit:{token}:0", callback_data)
+        self.assertIn(f"ob1:ignore:{token}", callback_data)
+        self.assertIn(f"ob1:view_raw:{token}", callback_data)
+        self.assertNotIn(f"ob1:approve:{token}:0", callback_data)
+        self.assertNotIn(f"ob1:deny:{token}:0", callback_data)
+        self.assertNotIn(f"ob1:commit:{token}", callback_data)
+        self.assertNotIn(f"ob1:approve_all:{token}", callback_data)
+
+    def test_callback_single_thought_record_ingests_thought(self):
+        bridge = load_module("telegram_bridge_single_record_test", "integrations/telegram-capture/telegram_bridge.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "review-state.json"
+            token = "abcdef0123456789"
+            source_payload = {"content": "raw source", "dedupe_key": "dictation:single-rec"}
+            thought_payload = {
+                "content": "Sole thought",
+                "metadata": {"summary": "Sole thought"},
+                "dedupe_key": "dictation:single-rec:thought:0",
+            }
+            session = review_state.build_review_session(
+                origin="telegram_dictation",
+                kind="review",
+                chat_id="123",
+                message_id=456,
+                source_payload=source_payload,
+                thought_payloads=[thought_payload],
+                dictation_sync={"dedupe_key": "dictation:single-rec", "ref_key": "minio:k"},
+            )
+            session["review_message_id"] = 999
+            with review_state.locked_review_state(state_path) as payload:
+                payload["pending_actions"][token] = session
+
+            ingested = []
+            setattr(bridge, "ingest_text_capture", lambda args, source, thoughts: ingested.append(
+                {"source": source, "thoughts": thoughts}
+            ))
+            setattr(bridge, "answer_callback_query", lambda *args, **kwargs: None)
+            setattr(bridge, "edit_message", lambda *args, **kwargs: None)
+
+            args = SimpleNamespace(
+                review_state_file=state_path,
+                pending_action_ttl_seconds=86400,
+                telegram_token="telegram-token",
+                dry_run=False,
+                allowed_chat_ids=set(),
+            )
+            result = bridge.process_callback_query(
+                args,
+                {},
+                {
+                    "id": "callback-id",
+                    "data": f"ob1:record:{token}",
+                    "from": {"id": 123},
+                    "message": {"chat": {"id": 123}, "message_id": 999},
+                },
+            )
+
+            self.assertEqual(result["decision"], "record")
+            self.assertEqual(result["thought_count"], 1)
+            self.assertEqual(len(ingested), 1)
+            self.assertEqual(ingested[0]["source"], source_payload)
+            self.assertEqual(ingested[0]["thoughts"][0]["dedupe_key"], "dictation:single-rec:thought:0")
+            with review_state.locked_review_state(state_path) as payload:
+                self.assertNotIn(token, payload["pending_actions"])
+                self.assertEqual(
+                    payload["resolved_actions"][token]["status"],
+                    review_state.DICTATION_RESOLUTION_INGESTED,
+                )
+
+    def test_callback_single_thought_ignore_resolves_as_ignored(self):
+        bridge = load_module("telegram_bridge_single_ignore_test", "integrations/telegram-capture/telegram_bridge.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "review-state.json"
+            token = "abcdef0123456789"
+            session = review_state.build_review_session(
+                origin="telegram_dictation",
+                kind="review",
+                chat_id="123",
+                message_id=456,
+                source_payload={"content": "raw source", "dedupe_key": "dictation:single-ign"},
+                thought_payloads=[{"content": "Sole thought", "metadata": {"summary": "Sole thought"}}],
+                dictation_sync={"dedupe_key": "dictation:single-ign", "ref_key": "minio:k"},
+            )
+            session["review_message_id"] = 999
+            with review_state.locked_review_state(state_path) as payload:
+                payload["pending_actions"][token] = session
+
+            setattr(bridge, "answer_callback_query", lambda *args, **kwargs: None)
+            setattr(bridge, "edit_message", lambda *args, **kwargs: None)
+            setattr(bridge, "ingest_text_capture", lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("ignored review should not ingest")
+            ))
+
+            args = SimpleNamespace(
+                review_state_file=state_path,
+                pending_action_ttl_seconds=86400,
+                telegram_token="telegram-token",
+                dry_run=False,
+                allowed_chat_ids=set(),
+            )
+            result = bridge.process_callback_query(
+                args,
+                {},
+                {
+                    "id": "callback-id",
+                    "data": f"ob1:ignore:{token}",
+                    "from": {"id": 123},
+                    "message": {"chat": {"id": 123}, "message_id": 999},
+                },
+            )
+
+            self.assertEqual(result["decision"], "ignore")
+            with review_state.locked_review_state(state_path) as payload:
+                self.assertNotIn(token, payload["pending_actions"])
+                self.assertEqual(
+                    payload["resolved_actions"][token]["status"],
+                    review_state.DICTATION_RESOLUTION_IGNORED,
+                )
+
+    def test_callback_duplicate_approve_is_idempotent(self):
+        bridge = load_module("telegram_bridge_idem_approve_test", "integrations/telegram-capture/telegram_bridge.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "review-state.json"
+            token = "abcdef0123456789"
+            session = review_state.build_review_session(
+                origin="telegram_dictation",
+                kind="review",
+                chat_id="123",
+                message_id=456,
+                source_payload={"content": "raw source", "dedupe_key": "dictation:idem"},
+                thought_payloads=[
+                    {"content": "First thought", "metadata": {"summary": "First thought"}},
+                    {"content": "Second thought", "metadata": {"summary": "Second thought"}},
+                ],
+                dictation_sync={"dedupe_key": "dictation:idem", "ref_key": "minio:k"},
+            )
+            session["thoughts"][0]["status"] = review_state.THOUGHT_STATUS_APPROVED
+            session["review_message_id"] = 999
+            with review_state.locked_review_state(state_path) as payload:
+                payload["pending_actions"][token] = session
+
+            edits = []
+            ack_messages = []
+            setattr(bridge, "answer_callback_query", lambda token_, callback_id, text=None: ack_messages.append(text))
+            setattr(bridge, "edit_message", lambda *args, **kwargs: edits.append({"args": args, "kwargs": kwargs}))
+
+            args = SimpleNamespace(
+                review_state_file=state_path,
+                pending_action_ttl_seconds=86400,
+                telegram_token="telegram-token",
+                dry_run=False,
+                allowed_chat_ids=set(),
+            )
+            result = bridge.process_callback_query(
+                args,
+                {},
+                {
+                    "id": "callback-id",
+                    "data": f"ob1:approve:{token}:0",
+                    "from": {"id": 123},
+                    "message": {"chat": {"id": 123}, "message_id": 999},
+                },
+            )
+
+            self.assertEqual(result["decision"], "approved")
+            self.assertEqual(result["reason"], "already_approved")
+            self.assertEqual(edits, [])
+            self.assertEqual(ack_messages, ["Thought 1 is already approved."])
+            with review_state.locked_review_state(state_path) as payload:
+                statuses = [t["status"] for t in payload["pending_actions"][token]["thoughts"]]
+            self.assertEqual(
+                statuses,
+                [review_state.THOUGHT_STATUS_APPROVED, review_state.THOUGHT_STATUS_PENDING],
+            )
+
+    def test_callback_duplicate_deny_is_idempotent(self):
+        bridge = load_module("telegram_bridge_idem_deny_test", "integrations/telegram-capture/telegram_bridge.py")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "review-state.json"
+            token = "abcdef0123456789"
+            session = review_state.build_review_session(
+                origin="telegram_dictation",
+                kind="review",
+                chat_id="123",
+                message_id=456,
+                source_payload={"content": "raw source", "dedupe_key": "dictation:idem-deny"},
+                thought_payloads=[
+                    {"content": "First thought", "metadata": {"summary": "First thought"}},
+                    {"content": "Second thought", "metadata": {"summary": "Second thought"}},
+                ],
+                dictation_sync={"dedupe_key": "dictation:idem-deny", "ref_key": "minio:k"},
+            )
+            session["thoughts"][0]["status"] = review_state.THOUGHT_STATUS_DENIED
+            session["review_message_id"] = 999
+            with review_state.locked_review_state(state_path) as payload:
+                payload["pending_actions"][token] = session
+
+            edits = []
+            ack_messages = []
+            setattr(bridge, "answer_callback_query", lambda token_, callback_id, text=None: ack_messages.append(text))
+            setattr(bridge, "edit_message", lambda *args, **kwargs: edits.append({"args": args, "kwargs": kwargs}))
+
+            args = SimpleNamespace(
+                review_state_file=state_path,
+                pending_action_ttl_seconds=86400,
+                telegram_token="telegram-token",
+                dry_run=False,
+                allowed_chat_ids=set(),
+            )
+            result = bridge.process_callback_query(
+                args,
+                {},
+                {
+                    "id": "callback-id",
+                    "data": f"ob1:deny:{token}:0",
+                    "from": {"id": 123},
+                    "message": {"chat": {"id": 123}, "message_id": 999},
+                },
+            )
+
+            self.assertEqual(result["decision"], "denied")
+            self.assertEqual(result["reason"], "already_denied")
+            self.assertEqual(edits, [])
+            self.assertEqual(ack_messages, ["Thought 1 is already denied."])
+            with review_state.locked_review_state(state_path) as payload:
+                self.assertIn(token, payload["pending_actions"])
+                statuses = [t["status"] for t in payload["pending_actions"][token]["thoughts"]]
+            self.assertEqual(
+                statuses,
+                [review_state.THOUGHT_STATUS_DENIED, review_state.THOUGHT_STATUS_PENDING],
+            )
 
     def test_dictation_reconciliation_updates_review_pending_entries(self):
         install_fake_yaml_module()
@@ -577,17 +821,17 @@ class TelegramReviewWorkflowTests(unittest.TestCase):
         ingested_payloads = []
         status_messages = []
 
-        importer.summarize_dictation = lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("Model did not return a tool call"))
-        importer.ingest_row = lambda base_url, access_key, payload: ingested_payloads.append(payload)
-        importer.send_reply = lambda token, chat_id, reply_to_message_id, text: status_messages.append(
+        setattr(importer, "summarize_dictation", lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("Model did not return a tool call")))
+        setattr(importer, "ingest_row", lambda base_url, access_key, payload: ingested_payloads.append(payload))
+        setattr(importer, "send_reply", lambda token, chat_id, reply_to_message_id, text: status_messages.append(
             {
                 "token": token,
                 "chat_id": chat_id,
                 "reply_to_message_id": reply_to_message_id,
                 "text": text,
             }
-        )
-        importer.register_telegram_review = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("review should not be requested"))
+        ))
+        setattr(importer, "register_telegram_review", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("review should not be requested")))
 
         args = SimpleNamespace(
             dry_run=False,
