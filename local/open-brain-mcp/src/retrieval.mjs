@@ -140,7 +140,21 @@ function queryEmbeddingVector(queryText) {
   return createEmbedding(normalized);
 }
 
-async function matchThoughtRows({ brainId, embedding, threshold, count, filter }) {
+async function matchThoughtRows({ brainId, embedding, threshold, count, filter, recencyWeight = 0, halfLifeDays = 90 }) {
+  if (recencyWeight > 0) {
+    return query(
+      "select * from match_thoughts_recency($1::uuid, $2::vector, $3, $4, $5::jsonb, $6, $7)",
+      [
+        brainId,
+        formatVector(embedding),
+        threshold,
+        count,
+        JSON.stringify(filter),
+        recencyWeight,
+        halfLifeDays,
+      ],
+    );
+  }
   return query(
     "select * from match_thoughts($1::uuid, $2::vector, $3, $4, $5::jsonb)",
     [
@@ -177,6 +191,8 @@ export async function retrieveThoughts({
   count,
   filter,
   embedding = null,
+  recencyWeight = 0,
+  halfLifeDays = 90,
 }) {
   if (!brainId) {
     throw new Error("brainId is required for retrieval");
@@ -194,6 +210,8 @@ export async function retrieveThoughts({
       threshold,
       count,
       filter,
+      recencyWeight,
+      halfLifeDays,
     });
     results = direct.rows;
   } else {
@@ -205,6 +223,8 @@ export async function retrieveThoughts({
       threshold,
       count,
       filter: { ...filter, retrieval_role: "distilled" },
+      recencyWeight,
+      halfLifeDays,
     });
 
     results = preferred.rows;
@@ -216,6 +236,8 @@ export async function retrieveThoughts({
         threshold,
         count: Math.min(count * 3, 50),
         filter,
+        recencyWeight,
+        halfLifeDays,
       });
 
       results = mergeUniqueThoughtRows(preferred.rows, fallback.rows).slice(0, count);

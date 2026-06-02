@@ -43,6 +43,8 @@ const searchThoughtsSchema = {
   match_threshold: z.number().min(0).max(1).optional().describe("Minimum similarity threshold."),
   match_count: z.number().int().min(1).max(50).optional().describe("Maximum number of matches."),
   filter: z.record(z.any()).optional().describe("Optional JSONB containment filter. If omitted, search prefers distilled thoughts before falling back to raw source records."),
+  recency_weight: z.number().min(0).max(1).optional().describe("Blend with exponential time-decay in [0,1]. 0 (default) = pure similarity (same as match_thoughts). 0.2 = gentle nudge toward recent, 0.5 = even blend, 1.0 = pure recency. Threshold still gates raw cosine similarity before the blend."),
+  half_life_days: z.number().positive().optional().describe("Half-life for recency decay in days. Only consulted when recency_weight > 0. Defaults to 90."),
 };
 
 const listThoughtsSchema = {
@@ -340,6 +342,8 @@ async function handleSearchThoughts(args, accessContext) {
   const threshold = args.match_threshold ?? 0.4;
   const matchCount = args.match_count ?? 10;
   const filter = args.filter ?? {};
+  const recencyWeight = args.recency_weight ?? 0;
+  const halfLifeDays = args.half_life_days ?? 90;
   try {
     const retrieval = await retrieveThoughtRows({
       brainId: accessContext.effectiveBrainId,
@@ -347,6 +351,8 @@ async function handleSearchThoughts(args, accessContext) {
       threshold,
       count: matchCount,
       filter,
+      recencyWeight,
+      halfLifeDays,
     });
 
     const response = {
@@ -354,6 +360,8 @@ async function handleSearchThoughts(args, accessContext) {
       query: args.query,
       retrieval_strategy: retrieval.retrieval_strategy,
       fallback_used: retrieval.fallback_used,
+      recency_weight: recencyWeight,
+      half_life_days: recencyWeight > 0 ? halfLifeDays : null,
       count: retrieval.results.length,
       results: retrieval.results,
     };
@@ -369,6 +377,10 @@ async function handleSearchThoughts(args, accessContext) {
       resultRows: retrieval.results,
       elapsedMs: Date.now() - startedAt,
       success: true,
+      extra: {
+        recency_weight: recencyWeight,
+        half_life_days: recencyWeight > 0 ? halfLifeDays : null,
+      },
     });
 
     return response;
@@ -382,6 +394,10 @@ async function handleSearchThoughts(args, accessContext) {
       elapsedMs: Date.now() - startedAt,
       success: false,
       error,
+      extra: {
+        recency_weight: recencyWeight,
+        half_life_days: recencyWeight > 0 ? halfLifeDays : null,
+      },
     });
     throw error;
   }
