@@ -69,6 +69,8 @@ def _normalize_match_text(value: object, *, limit: int = 160) -> str | None:
 
 
 def _normalize_match_similarity(value: object) -> str | None:
+    if not isinstance(value, (int, float, str)):
+        return None
     try:
         return f"{float(value):.2f}"
     except (TypeError, ValueError):
@@ -312,6 +314,19 @@ def build_review_reply_markup(session: dict, token: str) -> dict:
         keyboard.append(
             [
                 {"text": "Record", "callback_data": f"ob1:record:{token}"},
+                {"text": "Ignore", "callback_data": f"ob1:ignore:{token}"},
+            ]
+        )
+        if session.get("view_raw_enabled", True):
+            keyboard.append([{"text": "View Raw", "callback_data": f"ob1:view_raw:{token}"}])
+        return {"inline_keyboard": keyboard}
+
+    if len(thoughts) == 1:
+        index = int(thoughts[0].get("index", 0))
+        keyboard.append(
+            [
+                {"text": "Record", "callback_data": f"ob1:record:{token}"},
+                {"text": "Edit", "callback_data": f"ob1:edit:{token}:{index}"},
                 {"text": "Ignore", "callback_data": f"ob1:ignore:{token}"},
             ]
         )
