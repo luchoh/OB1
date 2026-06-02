@@ -65,9 +65,29 @@ const askBrainInput = z.object(askBrainSchema);
 
 const updateThoughtMetadataSchema = {
   thought_id: z.string().uuid().describe("Canonical OB1 thought UUID."),
-  metadata_patch: z.record(z.any()).describe("Metadata patch merged into the thought metadata without changing content or embeddings."),
+  metadata_patch: z.record(z.any()).optional().describe("Metadata patch merged into the thought metadata without changing content or embeddings."),
+  type: z.string().min(1).max(64).optional().describe("Structured type column. Free-form; consumers may constrain to a known taxonomy."),
+  source_type: z.string().min(1).max(64).optional().describe("Structured source_type column."),
+  sensitivity_tier: z.enum(["standard", "personal", "restricted"]).optional().describe("Structured sensitivity_tier column."),
+  importance: z.number().int().min(0).max(100).optional().describe("Structured importance column (0-100)."),
+  quality_score: z.number().min(0).max(100).optional().describe("Structured quality_score column (0-100)."),
+  enriched: z.boolean().optional().describe("Mark the thought as enriched (or not)."),
+  status: z.string().min(1).max(64).optional().describe("Structured status column for kanban-style task/idea workflow."),
 };
-const updateThoughtMetadataInput = z.object(updateThoughtMetadataSchema);
+const updateThoughtMetadataInput = z
+  .object(updateThoughtMetadataSchema)
+  .refine(
+    (v) =>
+      v.metadata_patch !== undefined
+      || v.type !== undefined
+      || v.source_type !== undefined
+      || v.sensitivity_tier !== undefined
+      || v.importance !== undefined
+      || v.quality_score !== undefined
+      || v.enriched !== undefined
+      || v.status !== undefined,
+    { message: "at least one of metadata_patch or a structured column is required" },
+  );
 
 const similarThoughtLookupSchema = {
   queries: z.array(z.string().min(1)).min(1).max(10).describe("Candidate strings to compare against the existing brain."),
@@ -543,32 +563,82 @@ async function handleAskBrain(args, accessContext) {
   }
 }
 
-async function updateThoughtMetadata({ brainId, thoughtId, metadataPatch }) {
+async function updateThoughtMetadata({
+  brainId,
+  thoughtId,
+  metadataPatch,
+  type,
+  sourceType,
+  sensitivityTier,
+  importance,
+  qualityScore,
+  enriched,
+  status,
+}) {
+  const setClauses = [];
+  const params = [thoughtId, brainId];
+  let paramIndex = 3;
+
+  if (metadataPatch !== undefined) {
+    params.push(JSON.stringify(metadataPatch));
+    setClauses.push(`metadata = (
+      thoughts.metadata
+      || ($${paramIndex}::jsonb - 'user_metadata')
+      || case
+        when $${paramIndex}::jsonb ? 'user_metadata' then jsonb_build_object(
+          'user_metadata',
+          coalesce(thoughts.metadata->'user_metadata', '{}'::jsonb)
+          || coalesce($${paramIndex}::jsonb->'user_metadata', '{}'::jsonb)
+        )
+        else '{}'::jsonb
+      end
+    )`);
+    paramIndex++;
+  }
+
+  const structured = [
+    ["type", type, "text"],
+    ["source_type", sourceType, "text"],
+    ["sensitivity_tier", sensitivityTier, "text"],
+    ["importance", importance, "smallint"],
+    ["quality_score", qualityScore, "numeric(5,2)"],
+    ["enriched", enriched, "boolean"],
+    ["status", status, "text"],
+  ];
+
+  for (const [column, value, cast] of structured) {
+    if (value === undefined) {
+      continue;
+    }
+    params.push(value);
+    setClauses.push(`${column} = $${paramIndex}::${cast}`);
+    paramIndex++;
+  }
+
+  if (status !== undefined) {
+    setClauses.push("status_updated_at = now()");
+  }
+  setClauses.push("updated_at = now()");
+
   const result = await query(
     `
       update thoughts
-      set
-        metadata = (
-          thoughts.metadata
-          || ($3::jsonb - 'user_metadata')
-          || case
-            when $3::jsonb ? 'user_metadata' then jsonb_build_object(
-              'user_metadata',
-              coalesce(thoughts.metadata->'user_metadata', '{}'::jsonb)
-              || coalesce($3::jsonb->'user_metadata', '{}'::jsonb)
-            )
-            else '{}'::jsonb
-          end
-        ),
-        updated_at = now()
+      set ${setClauses.join(",\n        ")}
       where id = $1::uuid
         and brain_id = $2::uuid
       returning
         id,
         metadata,
+        type,
+        source_type,
+        sensitivity_tier,
+        importance,
+        quality_score,
+        enriched,
+        status,
         updated_at
     `,
-    [thoughtId, brainId, JSON.stringify(metadataPatch)],
+    params,
   );
 
   if (result.rowCount !== 1) {
@@ -579,6 +649,13 @@ async function updateThoughtMetadata({ brainId, thoughtId, metadataPatch }) {
     success: true,
     thought_id: result.rows[0].id,
     metadata: result.rows[0].metadata,
+    type: result.rows[0].type,
+    source_type: result.rows[0].source_type,
+    sensitivity_tier: result.rows[0].sensitivity_tier,
+    importance: result.rows[0].importance,
+    quality_score: result.rows[0].quality_score,
+    enriched: result.rows[0].enriched,
+    status: result.rows[0].status,
     updated_at: result.rows[0].updated_at,
   };
 }
@@ -1013,6 +1090,13 @@ app.post("/admin/thought/metadata", async (c) => {
       brainId: accessContext.effectiveBrainId,
       thoughtId: payload.thought_id,
       metadataPatch: payload.metadata_patch,
+      type: payload.type,
+      sourceType: payload.source_type,
+      sensitivityTier: payload.sensitivity_tier,
+      importance: payload.importance,
+      qualityScore: payload.quality_score,
+      enriched: payload.enriched,
+      status: payload.status,
     });
     return c.json(result);
   } catch (error) {
