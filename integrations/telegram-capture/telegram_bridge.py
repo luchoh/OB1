@@ -659,7 +659,7 @@ def build_text_thought_payload(message: dict, thought: str, source_dedupe_key: s
         "tags": ["telegram"],
         "occurred_at": occurred_at,
         "dedupe_key": f"{source_dedupe_key}:thought:{index}",
-        "extract_metadata": False,
+        "extract_metadata": True,
     }
 
 

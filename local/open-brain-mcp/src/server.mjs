@@ -225,6 +225,9 @@ function hasExplicitSearchRole(filter) {
 }
 
 async function upsertThought({ brainId, content, embedding, metadata, dedupeKey }) {
+  const typeValue = typeof metadata?.type === "string" && metadata.type.trim()
+    ? metadata.type.trim()
+    : null;
   const result = await query(
     `
       insert into thoughts (
@@ -234,7 +237,8 @@ async function upsertThought({ brainId, content, embedding, metadata, dedupeKey 
         embedding_model,
         embedding_dimension,
         dedupe_key,
-        metadata
+        metadata,
+        type
       )
       values (
         $1::uuid,
@@ -243,7 +247,8 @@ async function upsertThought({ brainId, content, embedding, metadata, dedupeKey 
         $4,
         $5,
         coalesce($6, encode(digest($2, 'sha256'), 'hex')),
-        $7::jsonb
+        $7::jsonb,
+        $8
       )
       on conflict (brain_id, dedupe_key)
       do update set
@@ -252,6 +257,7 @@ async function upsertThought({ brainId, content, embedding, metadata, dedupeKey 
         embedding_model = excluded.embedding_model,
         embedding_dimension = excluded.embedding_dimension,
         metadata = thoughts.metadata || excluded.metadata,
+        type = coalesce(excluded.type, thoughts.type),
         updated_at = now()
       returning
         id,
@@ -262,6 +268,7 @@ async function upsertThought({ brainId, content, embedding, metadata, dedupeKey 
         embedding_model,
         embedding_dimension,
         metadata,
+        type,
         created_at,
         updated_at
     `,
@@ -273,6 +280,7 @@ async function upsertThought({ brainId, content, embedding, metadata, dedupeKey 
       embedding.length,
       dedupeKey ?? null,
       JSON.stringify(metadata),
+      typeValue,
     ],
   );
 
