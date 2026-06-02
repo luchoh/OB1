@@ -9,6 +9,8 @@
     python312
     python312Packages.requests
     python312Packages.minio
+    python312Packages.asyncpg
+    python312Packages.httpx
     uv
     jq
     curl
