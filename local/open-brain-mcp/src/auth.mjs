@@ -131,7 +131,7 @@ async function resolveBrainBySlugGlobal(brainSlug) {
   );
 
   if (result.rowCount > 1) {
-    throw new HttpError(400, `Brain slug is ambiguous: ${brainSlug}`);
+    throw new HttpError(409, `Brain slug is ambiguous: ${brainSlug}`);
   }
 
   return result.rows[0] ?? null;
@@ -475,4 +475,53 @@ export async function resolveAccessContext(c, { routeBrainSlug = null } = {}) {
   }
 
   return storedContext;
+}
+
+// v24 D3/D4: resolve a body/tool-arg `brain` (slug or UUID) for an already-
+// authenticated request. Absent -> the L1/default effective brain. Admins
+// (legacy env key or stored is_admin) resolve globally; everyone else resolves
+// through their estate-aware scope, reusing the same 403/404/409 logic as L1.
+export async function resolveRequestBrain(accessContext, brainArg) {
+  const selector = typeof brainArg === "string" ? brainArg.trim() : brainArg;
+  if (selector == null || selector === "") {
+    return {
+      brainId: accessContext.effectiveBrainId,
+      brainSlug: accessContext.effectiveBrainSlug ?? null,
+    };
+  }
+
+  let resolved;
+  if (accessContext.isAdmin) {
+    if (BRAIN_UUID_RE.test(selector)) {
+      const r = await query("select id, slug from brains where id = $1::uuid", [selector]);
+      if (r.rowCount === 0) {
+        throw new HttpError(404, `Brain not found: ${selector}`);
+      }
+      resolved = { brainId: r.rows[0].id, brainSlug: r.rows[0].slug };
+    } else {
+      const r = await query(
+        "select id, slug from brains where slug = $1 order by created_at asc limit 2",
+        [selector],
+      );
+      if (r.rowCount === 0) {
+        throw new HttpError(404, `Brain not found: ${selector}`);
+      }
+      if (r.rowCount > 1) {
+        throw new HttpError(409, `Brain slug is ambiguous: ${selector}`);
+      }
+      resolved = { brainId: r.rows[0].id, brainSlug: r.rows[0].slug };
+    }
+  } else {
+    const scopes = await loadBrainScopes(accessContext.principalId);
+    const brain = await resolveSelectorInScope(selector, scopes);
+    resolved = { brainId: brain.id, brainSlug: brain.slug };
+  }
+
+  // v24 D3: a body/tool-arg brain that disagrees with an explicit L1 selector
+  // (route/query/header) is a conflicting request, not a silent override.
+  if (accessContext.requestedBrainId && resolved.brainId !== accessContext.requestedBrainId) {
+    throw new HttpError(400, "Conflicting brain selectors: explicit selector and body brain differ");
+  }
+
+  return resolved;
 }

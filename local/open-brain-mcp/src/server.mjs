@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
-import { HttpError, resolveAccessContext } from "./auth.mjs";
+import { HttpError, resolveAccessContext, resolveRequestBrain } from "./auth.mjs";
 import { config } from "./config.mjs";
 import { closePool, formatVector, healthcheckDatabase, query } from "./db.mjs";
 import {
@@ -28,6 +28,7 @@ import {
 
 const captureThoughtSchema = {
   content: z.string().min(1).describe("The thought or note to store."),
+  brain: z.string().optional().describe("Optional target brain (slug or UUID). Defaults to the principal's default brain."),
   metadata: z.record(z.any()).optional().describe("Optional caller-provided metadata as JSON."),
   source: z.string().optional().describe("Optional source label for the thought."),
   type: z.string().optional().describe("Optional type override for the thought."),
@@ -40,6 +41,7 @@ const captureThoughtInput = z.object(captureThoughtSchema);
 
 const searchThoughtsSchema = {
   query: z.string().min(1).describe("Natural-language search query."),
+  brain: z.string().optional().describe("Optional brain to scope to (slug or UUID). Defaults to the caller's effective brain."),
   match_threshold: z.number().min(0).max(1).optional().describe("Minimum similarity threshold."),
   match_count: z.number().int().min(1).max(50).optional().describe("Maximum number of matches."),
   filter: z.record(z.any()).optional().describe("Optional JSONB containment filter. If omitted, search prefers distilled thoughts before falling back to raw source records."),
@@ -49,11 +51,13 @@ const searchThoughtsSchema = {
 
 const listThoughtsSchema = {
   limit: z.number().int().min(1).max(100).optional().describe("Number of recent thoughts to return."),
+  brain: z.string().optional().describe("Optional brain to scope to (slug or UUID). Defaults to the caller's effective brain."),
   filter: z.record(z.any()).optional().describe("Optional JSONB containment filter."),
 };
 
 const askBrainSchema = {
   question: z.string().min(1).describe("Natural-language question to answer from the local brain."),
+  brain: z.string().optional().describe("Optional brain to scope to (slug or UUID). Defaults to the caller's effective brain."),
   match_threshold: z.number().min(0).max(1).optional().describe("Minimum similarity threshold for retrieval."),
   match_count: z.number().int().min(1).max(12).optional().describe("Maximum number of evidence items to consider."),
   filter: z.record(z.any()).optional().describe("Optional JSONB containment filter for retrieval."),
@@ -65,6 +69,7 @@ const askBrainInput = z.object(askBrainSchema);
 
 const updateThoughtMetadataSchema = {
   thought_id: z.string().uuid().describe("Canonical OB1 thought UUID."),
+  brain: z.string().optional().describe("Optional brain the thought lives in (slug or UUID). Defaults to the principal's default brain."),
   metadata_patch: z.record(z.any()).optional().describe("Metadata patch merged into the thought metadata without changing content or embeddings."),
   type: z.string().min(1).max(64).optional().describe("Structured type column. Free-form; consumers may constrain to a known taxonomy."),
   source_type: z.string().min(1).max(64).optional().describe("Structured source_type column."),
@@ -91,6 +96,7 @@ const updateThoughtMetadataInput = z
 
 const similarThoughtLookupSchema = {
   queries: z.array(z.string().min(1)).min(1).max(10).describe("Candidate strings to compare against the existing brain."),
+  brain: z.string().optional().describe("Optional brain to scope to (slug or UUID). Defaults to the caller's effective brain."),
   match_threshold: z.number().min(0).max(1).optional().describe("Minimum similarity threshold."),
   match_count: z.number().int().min(1).max(10).optional().describe("Maximum number of similar matches per query."),
   filter: z.record(z.any()).optional().describe("Optional JSONB containment filter."),
@@ -310,6 +316,7 @@ async function upsertThought({ brainId, content, embedding, metadata, dedupeKey 
 }
 
 async function handleCaptureThought(args, accessContext) {
+  const { brainId } = await resolveRequestBrain(accessContext, args.brain);
   const content = args.content.trim();
   const metadata = args.metadata ?? {};
   const shouldExtractMetadata = args.extract_metadata ?? true;
@@ -342,7 +349,7 @@ async function handleCaptureThought(args, accessContext) {
   });
 
   const thought = await upsertThought({
-    brainId: accessContext.effectiveBrainId,
+    brainId,
     content,
     embedding: embeddingResult.value,
     metadata: normalizedMetadata,
@@ -358,6 +365,7 @@ async function handleCaptureThought(args, accessContext) {
 }
 
 async function handleSearchThoughts(args, accessContext) {
+  const { brainId } = await resolveRequestBrain(accessContext, args.brain);
   const startedAt = Date.now();
   const threshold = args.match_threshold ?? 0.4;
   const matchCount = args.match_count ?? 10;
@@ -366,7 +374,7 @@ async function handleSearchThoughts(args, accessContext) {
   const halfLifeDays = args.half_life_days ?? 90;
   try {
     const retrieval = await retrieveThoughtRows({
-      brainId: accessContext.effectiveBrainId,
+      brainId,
       queryText: args.query,
       threshold,
       count: matchCount,
@@ -424,6 +432,7 @@ async function handleSearchThoughts(args, accessContext) {
 }
 
 async function handleAskBrain(args, accessContext) {
+  const { brainId } = await resolveRequestBrain(accessContext, args.brain);
   if ((args.graph_assisted ?? false) && !accessContext.isAdmin) {
     throw new HttpError(400, "graph_assisted is disabled for non-admin multitenant requests");
   }
@@ -447,7 +456,7 @@ async function handleAskBrain(args, accessContext) {
       evidenceRows,
       questionIntent,
     } = await retrieveEvidenceRows({
-      brainId: accessContext.effectiveBrainId,
+      brainId,
       queryText: args.question,
       threshold,
       count: matchCount,
@@ -642,7 +651,9 @@ async function updateThoughtMetadata({
   );
 
   if (result.rowCount !== 1) {
-    throw new Error(`Thought not found: ${thoughtId}`);
+    // v24 D2: a thought absent from the chosen brain is a not-found (404),
+    // not an unhandled 500. errorStatus only preserves HttpError statuses.
+    throw new HttpError(404, `Thought not found: ${thoughtId}`);
   }
 
   return {
@@ -661,6 +672,7 @@ async function updateThoughtMetadata({
 }
 
 async function handleSimilarThoughtLookup(args, accessContext) {
+  const { brainId } = await resolveRequestBrain(accessContext, args.brain);
   const matchThreshold = args.match_threshold ?? 0.78;
   const matchCount = args.match_count ?? 3;
   const filter = args.filter ?? {};
@@ -669,7 +681,7 @@ async function handleSimilarThoughtLookup(args, accessContext) {
   const results = [];
   for (const queryText of queries) {
     const retrieval = await retrieveThoughtRows({
-      brainId: accessContext.effectiveBrainId,
+      brainId,
       queryText,
       threshold: matchThreshold,
       count: matchCount,
@@ -692,9 +704,10 @@ async function handleSimilarThoughtLookup(args, accessContext) {
 }
 
 async function handleListThoughts(args, accessContext) {
+  const { brainId } = await resolveRequestBrain(accessContext, args.brain);
   const result = await query(
     "select * from list_recent_thoughts($1::uuid, $2, $3::jsonb)",
-    [accessContext.effectiveBrainId, args.limit ?? 20, JSON.stringify(args.filter ?? {})],
+    [brainId, args.limit ?? 20, JSON.stringify(args.filter ?? {})],
   );
 
   return {
@@ -1086,8 +1099,9 @@ app.post("/admin/thought/metadata", async (c) => {
   try {
     const accessContext = await resolveAccessContext(c);
     const payload = updateThoughtMetadataInput.parse(await c.req.json());
+    const { brainId } = await resolveRequestBrain(accessContext, payload.brain);
     const result = await updateThoughtMetadata({
-      brainId: accessContext.effectiveBrainId,
+      brainId,
       thoughtId: payload.thought_id,
       metadataPatch: payload.metadata_patch,
       type: payload.type,

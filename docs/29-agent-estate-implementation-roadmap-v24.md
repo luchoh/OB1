@@ -118,17 +118,31 @@ state which surface they target.
 ### D3. Brain selector — uniform across auth sources (ADR point 9)
 
 `brain` (slug or UUID) may be supplied by route `:brainSlug`, query `?brain=`,
-header `x-brain-slug`, or body/tool-arg `brain`. It is resolved the same way for
-every auth source via `resolveRequestBrain(accessContext, brain, {mode})`:
+header `x-brain-slug` (the **L1** selectors, resolved in `resolveAccessContext`),
+or **body/tool-arg** `brain` (resolved per-call in `resolveRequestBrain`).
+Resolution, for any auth source:
 
-1. If multiple L1 sources are present and disagree → **400**.
-2. Resolve slug/UUID across the principal's **lookup set** (D5) → not found
-   **404**, ambiguous **409**.
-3. Run D1 access check → DENY **403**, else the resolved brain is effective.
+1. **L1 selector** (if present) resolves and authorizes in `resolveAccessContext`,
+   becoming the request's effective brain.
+2. **Body/tool-arg `brain`** (if present) resolves and authorizes in
+   `resolveRequestBrain`: blank/whitespace is treated as omitted; admins (env
+   legacy key **or** stored `is_admin`) resolve **globally**; everyone else
+   resolves across their **lookup set** (D5). Not found → **404**, ambiguous →
+   **409**, resolves-but-denied (D1) → **403**.
+3. **L1-vs-body agreement:** if both an L1 selector and a body `brain` are given
+   and resolve to **different** brains → **400** (conflicting selectors). Equal
+   is fine; body-only sets the brain; the deny/not-found checks run *before* the
+   conflict check so they are never masked.
 
 No per-auth-source admissibility rules, no "MCP can't switch per call" rule
 (ADR point 9 explicitly allows per-call brain). Human tokens may pass a selector
-like anyone; Phase 2 teaches `resolveHumanAccessContext` to read it.
+like anyone.
+
+**Known deferral:** a brain-bound stored key is restricted to its own brain at
+the L1 layer but **not yet** at the body layer (`resolveRequestBrain` authorizes
+by principal scope, not `key_brain_id`). No brain-bound key exists yet; tighten
+this when one is provisioned. Stored `is_admin` keys resolving globally (like the
+env key) is intentional and matches the only live key's shape.
 
 ### D4. Defaults when `brain` omitted (ADR points 10–11)
 
