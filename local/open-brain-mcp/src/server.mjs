@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
-import { HttpError, resolveAccessContext, resolveRequestBrain } from "./auth.mjs";
+import { HttpError, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
 import { config } from "./config.mjs";
 import { closePool, formatVector, healthcheckDatabase, query } from "./db.mjs";
 import {
@@ -364,8 +364,8 @@ async function handleCaptureThought(args, accessContext) {
   };
 }
 
-async function handleSearchThoughts(args, accessContext) {
-  const { brainId } = await resolveRequestBrain(accessContext, args.brain);
+export async function handleSearchThoughts(args, accessContext) {
+  const brains = await resolveReadBrains(accessContext, args.brain);
   const startedAt = Date.now();
   const threshold = args.match_threshold ?? 0.4;
   const matchCount = args.match_count ?? 10;
@@ -373,25 +373,41 @@ async function handleSearchThoughts(args, accessContext) {
   const recencyWeight = args.recency_weight ?? 0;
   const halfLifeDays = args.half_life_days ?? 90;
   try {
-    const retrieval = await retrieveThoughtRows({
-      brainId,
-      queryText: args.query,
-      threshold,
-      count: matchCount,
-      filter,
-      recencyWeight,
-      halfLifeDays,
-    });
+    // v24 D4/D6: fan out across every brain in scope, tag each row with its
+    // origin, then merge and re-rank by similarity (single-brain stays identical
+    // plus the two new origin fields).
+    const perBrain = await Promise.all(
+      brains.map(async (b) => ({
+        brain: b,
+        retrieval: await retrieveThoughtRows({
+          brainId: b.brainId,
+          queryText: args.query,
+          threshold,
+          count: matchCount,
+          filter,
+          recencyWeight,
+          halfLifeDays,
+        }),
+      })),
+    );
 
+    const results = perBrain
+      .flatMap(({ brain, retrieval }) =>
+        retrieval.results.map((row) => ({ ...row, brain_id: brain.brainId, brain_slug: brain.brainSlug })))
+      .sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0))
+      .slice(0, matchCount);
+
+    const multi = brains.length > 1;
     const response = {
       success: true,
       query: args.query,
-      retrieval_strategy: retrieval.retrieval_strategy,
-      fallback_used: retrieval.fallback_used,
+      brains_searched: brains.length,
+      retrieval_strategy: multi ? "multi-brain-merge" : perBrain[0].retrieval.retrieval_strategy,
+      fallback_used: perBrain.some((p) => p.retrieval.fallback_used),
       recency_weight: recencyWeight,
       half_life_days: recencyWeight > 0 ? halfLifeDays : null,
-      count: retrieval.results.length,
-      results: retrieval.results,
+      count: results.length,
+      results,
     };
 
     appendRetrievalTelemetry({
@@ -400,14 +416,16 @@ async function handleSearchThoughts(args, accessContext) {
       queryText: args.query,
       threshold,
       requestedCount: matchCount,
-      retrievalStrategy: retrieval.retrieval_strategy,
-      fallbackUsed: retrieval.fallback_used,
-      resultRows: retrieval.results,
+      retrievalStrategy: response.retrieval_strategy,
+      fallbackUsed: response.fallback_used,
+      resultRows: results,
       elapsedMs: Date.now() - startedAt,
       success: true,
       extra: {
         recency_weight: recencyWeight,
         half_life_days: recencyWeight > 0 ? halfLifeDays : null,
+        accessible_brain_count: accessContext.accessibleBrains?.length ?? null,
+        searched_brain_count: brains.length,
       },
     });
 
@@ -703,17 +721,36 @@ async function handleSimilarThoughtLookup(args, accessContext) {
   };
 }
 
-async function handleListThoughts(args, accessContext) {
-  const { brainId } = await resolveRequestBrain(accessContext, args.brain);
-  const result = await query(
-    "select * from list_recent_thoughts($1::uuid, $2, $3::jsonb)",
-    [brainId, args.limit ?? 20, JSON.stringify(args.filter ?? {})],
+export async function handleListThoughts(args, accessContext) {
+  const brains = await resolveReadBrains(accessContext, args.brain);
+  const limit = args.limit ?? 20;
+  const filter = JSON.stringify(args.filter ?? {});
+
+  // v24 D4/D6: fan out, tag rows with origin, merge newest-first, truncate.
+  const perBrain = await Promise.all(
+    brains.map(async (b) => {
+      const result = await query(
+        "select * from list_recent_thoughts($1::uuid, $2, $3::jsonb)",
+        [b.brainId, limit, filter],
+      );
+      return result.rows.map((row) => ({ ...row, brain_id: b.brainId, brain_slug: b.brainSlug }));
+    }),
   );
+
+  const thoughts = perBrain
+    .flat()
+    .sort((a, b) => {
+      const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
+      const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
+      return tb - ta;
+    })
+    .slice(0, limit);
 
   return {
     success: true,
-    count: result.rows.length,
-    thoughts: result.rows,
+    brains_listed: brains.length,
+    count: thoughts.length,
+    thoughts,
   };
 }
 

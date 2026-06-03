@@ -525,3 +525,33 @@ export async function resolveRequestBrain(accessContext, brainArg) {
 
   return resolved;
 }
+
+// v24 D4/D6: the set of brains a READ spans. An explicit body/tool-arg selector
+// or an L1 selector narrows to exactly one brain; an omitted selector fans out
+// across every accessible brain. Falls back to the single effective brain for
+// legacy-admin (and any principal whose accessible set is empty).
+// Ensure a {brainId, brainSlug} pair has a slug (D6 requires per-row brain_slug).
+// The legacy-admin / no-membership effective brain carries a null slug, so look
+// it up rather than emit null on every read row.
+async function brainRef(brainId, brainSlug) {
+  if (brainSlug || !brainId) {
+    return { brainId, brainSlug: brainSlug ?? null };
+  }
+  const r = await query("select slug from brains where id = $1::uuid", [brainId]);
+  return { brainId, brainSlug: r.rows[0]?.slug ?? null };
+}
+
+export async function resolveReadBrains(accessContext, brainArg) {
+  const selector = typeof brainArg === "string" ? brainArg.trim() : brainArg;
+  if (selector) {
+    return [await resolveRequestBrain(accessContext, selector)];
+  }
+  if (accessContext.requestedBrainId) {
+    return [await brainRef(accessContext.effectiveBrainId, accessContext.effectiveBrainSlug)];
+  }
+  const accessible = accessContext.accessibleBrains;
+  if (Array.isArray(accessible) && accessible.length > 0) {
+    return accessible;
+  }
+  return [await brainRef(accessContext.effectiveBrainId, accessContext.effectiveBrainSlug)];
+}
