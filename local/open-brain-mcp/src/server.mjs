@@ -690,7 +690,7 @@ async function updateThoughtMetadata({
 }
 
 async function handleSimilarThoughtLookup(args, accessContext) {
-  const { brainId } = await resolveRequestBrain(accessContext, args.brain);
+  const brains = await resolveReadBrains(accessContext, args.brain);
   const matchThreshold = args.match_threshold ?? 0.78;
   const matchCount = args.match_count ?? 3;
   const filter = args.filter ?? {};
@@ -698,19 +698,31 @@ async function handleSimilarThoughtLookup(args, accessContext) {
 
   const results = [];
   for (const queryText of queries) {
-    const retrieval = await retrieveThoughtRows({
-      brainId,
-      queryText,
-      threshold: matchThreshold,
-      count: matchCount,
-      filter,
-    });
-
+    // v24 D4/D6: fan out per query, tag matches with origin, merge by similarity.
+    const perBrain = await Promise.all(
+      brains.map(async (b) => {
+        const retrieval = await retrieveThoughtRows({
+          brainId: b.brainId,
+          queryText,
+          threshold: matchThreshold,
+          count: matchCount,
+          filter,
+        });
+        return retrieval.results.map((row) => ({
+          ...evidenceCitation(row),
+          brain_id: b.brainId,
+          brain_slug: b.brainSlug,
+        }));
+      }),
+    );
+    const matches = perBrain
+      .flat()
+      .sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0))
+      .slice(0, matchCount);
     results.push({
       query: queryText,
-      retrieval_strategy: retrieval.retrieval_strategy,
-      fallback_used: retrieval.fallback_used,
-      matches: retrieval.results.map((row) => evidenceCitation(row)),
+      brains_searched: brains.length,
+      matches,
     });
   }
 
@@ -754,9 +766,9 @@ export async function handleListThoughts(args, accessContext) {
   };
 }
 
-async function handleStats(accessContext) {
+async function brainStats(brainId) {
   const [overviewResult, sourceCounts, typeCounts, peopleCounts] = await Promise.all([
-    query("select * from thoughts_stats($1::uuid)", [accessContext.effectiveBrainId]),
+    query("select * from thoughts_stats($1::uuid)", [brainId]),
     query(`
       select
         coalesce(metadata->>'source', 'unknown') as source,
@@ -766,7 +778,7 @@ async function handleStats(accessContext) {
       group by 1
       order by count desc, source asc
       limit 10
-    `, [accessContext.effectiveBrainId]),
+    `, [brainId]),
     query(`
       select
         coalesce(metadata->>'type', 'unknown') as type,
@@ -776,7 +788,7 @@ async function handleStats(accessContext) {
       group by 1
       order by count desc, type asc
       limit 10
-    `, [accessContext.effectiveBrainId]),
+    `, [brainId]),
     query(`
       select
         person,
@@ -789,15 +801,58 @@ async function handleStats(accessContext) {
       group by person
       order by count desc, person asc
       limit 10
-    `, [accessContext.effectiveBrainId]),
+    `, [brainId]),
   ]);
 
-  const stats = {
-    success: true,
+  return {
     overview: overviewResult.rows[0] ?? null,
     top_sources: sourceCounts.rows,
     top_types: typeCounts.rows,
     top_people: peopleCounts.rows,
+  };
+}
+
+// v24 D6: aggregate the per-brain thoughts_stats overviews — sum the counts,
+// min/max the capture timestamps.
+function aggregateOverview(perBrain) {
+  let total = 0;
+  let embedded = 0;
+  let first = null;
+  let last = null;
+  for (const pb of perBrain) {
+    const ov = pb.overview;
+    if (!ov) continue;
+    total += Number(ov.total_thoughts ?? 0);
+    embedded += Number(ov.embedded_thoughts ?? 0);
+    // Compare via epoch so it is robust whether pg returns ISO strings or Dates.
+    if (ov.first_capture && (first === null || new Date(ov.first_capture).getTime() < new Date(first).getTime())) {
+      first = ov.first_capture;
+    }
+    if (ov.last_capture && (last === null || new Date(ov.last_capture).getTime() > new Date(last).getTime())) {
+      last = ov.last_capture;
+    }
+  }
+  return { total_thoughts: total, embedded_thoughts: embedded, first_capture: first, last_capture: last };
+}
+
+export async function handleStats(args, accessContext) {
+  // v24 D6: always per_brain[] (even for one brain, so the shape never flips
+  // when memberships change) plus an aggregate overview. An explicit/L1
+  // selector narrows to a single brain.
+  const brains = await resolveReadBrains(accessContext, args?.brain);
+  const perBrain = await Promise.all(
+    brains.map(async (b) => ({
+      brain_id: b.brainId,
+      brain_slug: b.brainSlug,
+      ...(await brainStats(b.brainId)),
+    })),
+  );
+
+  const stats = {
+    success: true,
+    brains: brains.length,
+    overview: aggregateOverview(perBrain),
+    per_brain: perBrain,
   };
 
   const graphStats = accessContext.isAdmin
@@ -984,10 +1039,10 @@ function buildMcpServer(accessContext) {
   server.tool(
     "stats",
     "Summarize the local Open Brain database.",
-    {},
-    async () => {
+    { brain: z.string().optional().describe("Optional brain to scope to (slug or UUID). Defaults to all accessible brains.") },
+    async (args) => {
       try {
-        return jsonToolResult(await handleStats(accessContext));
+        return jsonToolResult(await handleStats(args, accessContext));
       } catch (error) {
         return errorToolResult(error);
       }
