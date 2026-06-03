@@ -17,3 +17,6 @@ recipes/chatgpt-conversation-import/adaptive-import-*.log
 recipes/chatgpt-conversation-import/chatgpt-sync-log.pre-adaptive-*.json
 local/open-brain-mcp/.runtime/*
 !local/open-brain-mcp/.runtime/.gitignore
+
+# Provisioned agent access keys (plaintext, local only)
+.agent-estate-keys/
