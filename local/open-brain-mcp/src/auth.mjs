@@ -137,6 +137,89 @@ async function resolveBrainBySlugGlobal(brainSlug) {
   return result.rows[0] ?? null;
 }
 
+const BRAIN_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// v24 D1/D5: compute the brains a principal can USE (accessible) and the brains
+// a principal may NAME (lookup = accessible plus estate brains, including estate
+// brains overridden by a brain-level deny so they resolve-then-403 rather than 404).
+async function loadBrainScopes(principalId) {
+  const accessible = await query(
+    `
+      select b.id, b.slug
+      from brains b
+      where case
+        when exists (
+          select 1 from brain_memberships bm
+          where bm.principal_id = $1::uuid and bm.brain_id = b.id
+        )
+        then exists (
+          select 1 from brain_memberships bm
+          where bm.principal_id = $1::uuid and bm.brain_id = b.id and bm.is_deny = false
+        )
+        else exists (
+          select 1 from estate_memberships em
+          where em.principal_id = $1::uuid and em.estate_id = b.household_id and em.is_deny = false
+        )
+      end
+    `,
+    [principalId],
+  );
+
+  const lookup = await query(
+    `
+      select b.id, b.slug
+      from brains b
+      where exists (
+          select 1 from brain_memberships bm
+          where bm.principal_id = $1::uuid and bm.brain_id = b.id and bm.is_deny = false
+        )
+        or exists (
+          select 1 from estate_memberships em
+          where em.principal_id = $1::uuid and em.estate_id = b.household_id and em.is_deny = false
+        )
+    `,
+    [principalId],
+  );
+
+  return {
+    accessible: accessible.rows.map((r) => ({ brainId: r.id, brainSlug: r.slug })),
+    accessibleIds: new Set(accessible.rows.map((r) => r.id)),
+    lookup: lookup.rows.map((r) => ({ id: r.id, slug: r.slug })),
+  };
+}
+
+// v24 D2/D3/D5: resolve an explicit slug-or-UUID selector for a non-admin,
+// non-brain-bound principal. 404 = not nameable (or nonexistent UUID), 403 =
+// nameable/exists but denied, 409 = ambiguous slug. No existence-hiding beyond
+// the lookup scope; an inaccessible-but-existing UUID is 403, not downgraded to 404.
+async function resolveSelectorInScope(selector, scopes) {
+  if (BRAIN_UUID_RE.test(selector)) {
+    if (scopes.accessibleIds.has(selector)) {
+      const hit = scopes.accessible.find((b) => b.brainId === selector);
+      return { id: hit.brainId, slug: hit.brainSlug };
+    }
+    const existing = await query("select id from brains where id = $1::uuid", [selector]);
+    if (existing.rowCount === 0) {
+      throw new HttpError(404, `Brain not found: ${selector}`);
+    }
+    throw new HttpError(403, `Not authorized for brain: ${selector}`);
+  }
+
+  const matches = scopes.lookup.filter((b) => b.slug === selector);
+  if (matches.length === 0) {
+    throw new HttpError(404, `Brain not found: ${selector}`);
+  }
+  if (matches.length > 1) {
+    throw new HttpError(409, `Brain slug is ambiguous: ${selector}`);
+  }
+  const brain = matches[0];
+  if (!scopes.accessibleIds.has(brain.id)) {
+    throw new HttpError(403, `Not authorized for brain: ${selector}`);
+  }
+  return brain;
+}
+
 async function resolveDefaultAdminBrain() {
   const result = await query(
     `
@@ -198,17 +281,12 @@ async function resolveHumanAccessContext(c, requestedBrainSlug) {
   }
 
   const memberships = await loadPrincipalMemberships(bindingResult.rows[0].principal_id);
+  const scopes = await loadBrainScopes(memberships.principalId);
+  // v24 D3: human tokens resolve a selector (route/query/header) uniformly, via
+  // the same estate-aware scope logic as service keys.
   const requestedBrain = requestedBrainSlug
-    ? await resolveBrainBySlugForHousehold(memberships.householdId, requestedBrainSlug)
+    ? await resolveSelectorInScope(requestedBrainSlug, scopes)
     : null;
-
-  if (requestedBrainSlug && !requestedBrain) {
-    throw new HttpError(404, `Brain not found: ${requestedBrainSlug}`);
-  }
-
-  if (requestedBrain && !memberships.memberships.some((entry) => entry.brainId === requestedBrain.id)) {
-    throw new HttpError(403, `Not authorized for brain: ${requestedBrainSlug}`);
-  }
 
   return {
     authSource: "human_token",
@@ -216,8 +294,12 @@ async function resolveHumanAccessContext(c, requestedBrainSlug) {
     householdId: memberships.householdId,
     defaultBrainId: memberships.defaultBrainId,
     allowedBrainIds: memberships.memberships.map((entry) => entry.brainId),
+    accessibleBrains: scopes.accessible,
     effectiveBrainId: requestedBrain?.id ?? memberships.defaultBrainId,
-    effectiveBrainSlug: requestedBrain?.slug ?? memberships.memberships.find((entry) => entry.brainId === memberships.defaultBrainId)?.brainSlug ?? null,
+    effectiveBrainSlug: requestedBrain?.slug
+      ?? scopes.accessible.find((entry) => entry.brainId === memberships.defaultBrainId)?.brainSlug
+      ?? memberships.memberships.find((entry) => entry.brainId === memberships.defaultBrainId)?.brainSlug
+      ?? null,
     requestedBrainId: requestedBrain?.id ?? null,
     requestedBrainSlug: requestedBrain?.slug ?? null,
     isAdmin: false,
@@ -288,25 +370,29 @@ async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
       role: row.role,
     }));
 
+  const scopes = await loadBrainScopes(first.principal_id);
+
   let requestedBrain = null;
   if (requestedBrainSlug) {
-    requestedBrain = await resolveBrainBySlugForHousehold(first.household_id, requestedBrainSlug);
-    if (!requestedBrain) {
-      throw new HttpError(404, `Brain not found: ${requestedBrainSlug}`);
+    if (first.is_admin) {
+      // Admin stored keys keep their pre-v24 household-wide slug resolution.
+      requestedBrain = await resolveBrainBySlugForHousehold(first.household_id, requestedBrainSlug);
+      if (!requestedBrain) {
+        throw new HttpError(404, `Brain not found: ${requestedBrainSlug}`);
+      }
+    } else if (first.key_brain_id) {
+      // Brain-bound keys may only name their own brain.
+      requestedBrain = await resolveBrainBySlugForHousehold(first.household_id, requestedBrainSlug);
+      if (!requestedBrain) {
+        throw new HttpError(404, `Brain not found: ${requestedBrainSlug}`);
+      }
+      if (requestedBrain.id !== first.key_brain_id) {
+        throw new HttpError(403, `Access key is bound to a different brain: ${requestedBrainSlug}`);
+      }
+    } else {
+      // v24 estate-aware resolution for non-admin, non-brain-bound principals.
+      requestedBrain = await resolveSelectorInScope(requestedBrainSlug, scopes);
     }
-  }
-
-  if (
-    requestedBrain
-    && first.key_brain_id
-    && !first.is_admin
-    && requestedBrain.id !== first.key_brain_id
-  ) {
-    throw new HttpError(403, `Access key is bound to a different brain: ${requestedBrainSlug}`);
-  }
-
-  if (requestedBrain && !first.is_admin && !memberships.some((entry) => entry.brainId === requestedBrain.id)) {
-    throw new HttpError(403, `Not authorized for brain: ${requestedBrainSlug}`);
   }
 
   const effectiveBrainId = requestedBrain?.id
@@ -323,8 +409,10 @@ async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
     householdId: first.household_id,
     defaultBrainId: first.default_brain_id,
     allowedBrainIds: memberships.map((entry) => entry.brainId),
+    accessibleBrains: scopes.accessible,
     effectiveBrainId,
     effectiveBrainSlug: requestedBrain?.slug
+      ?? scopes.accessible.find((entry) => entry.brainId === effectiveBrainId)?.brainSlug
       ?? memberships.find((entry) => entry.brainId === effectiveBrainId)?.brainSlug
       ?? null,
     requestedBrainId: requestedBrain?.id ?? null,
@@ -365,7 +453,9 @@ async function resolveLegacyAdminContext(requestedBrainSlug) {
 }
 
 export async function resolveAccessContext(c, { routeBrainSlug = null } = {}) {
-  const humanContext = await resolveHumanAccessContext(c, routeBrainSlug);
+  const requestedBrainSlug = routeBrainSlug ?? explicitServiceBrainSlug(c);
+
+  const humanContext = await resolveHumanAccessContext(c, requestedBrainSlug);
   if (humanContext) {
     return humanContext;
   }
@@ -374,8 +464,6 @@ export async function resolveAccessContext(c, { routeBrainSlug = null } = {}) {
   if (!key) {
     throw new HttpError(401, "Unauthorized");
   }
-
-  const requestedBrainSlug = routeBrainSlug ?? explicitServiceBrainSlug(c);
 
   if (key === config.accessKey) {
     return resolveLegacyAdminContext(requestedBrainSlug);
