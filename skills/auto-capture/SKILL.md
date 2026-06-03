@@ -62,3 +62,15 @@ When this skill runs correctly, the session ends with:
 - If the capture tool fails, do not invent success. Tell the user the local wrap-up succeeded but the Open Brain capture did not.
 - Tool names vary by client and connector. Use the Open Brain search/capture tools available in the current environment rather than assuming a fixed prefix.
 - This skill is intentionally reusable. For the OB1-specific workflow and composition guidance, see [the Auto-Capture recipe](../../recipes/auto-capture/).
+
+## Open Brain brain routing (OB1 agent-estate deployments only)
+
+If the Open Brain capture tool accepts a `brain` argument (OB1 agent-estate
+deployments), route each capture:
+
+- An ACT NOW item or summary about a **tool, technique, or cross-project operator
+  preference** not specific to this codebase → pass `brain="agent-common"`.
+- Anything specific to the current repository/workspace → **omit `brain`** (it
+  defaults to the repo brain). When in doubt: omit (repo); the common brain is curated.
+
+This is a no-op on deployments whose capture tool has no `brain` argument.

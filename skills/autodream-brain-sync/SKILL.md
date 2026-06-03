@@ -28,9 +28,19 @@ Claude Code's auto-memory system (dreaming/autodream) saves memories to local fi
 
 1. Write the memory to its local file as normal (following the standard memory system format with frontmatter)
 2. Update `MEMORY.md` index as normal
-3. **Immediately after each memory file write**, call `mcp__open-brain__capture_thought` with the memory content
+3. **Choose the destination brain** (Open Brain agent-estate routing). The
+   capture tool accepts an optional `brain` argument (slug or UUID); the memory
+   type is the routing signal:
+   - `[project]` memories (specific to one codebase/repo) → **omit `brain`**; it
+     defaults to the repo brain.
+   - `[user]`, `[feedback]`, `[reference]` memories about tools, techniques, or
+     cross-project operator preferences → pass **`brain="agent-common"`** so
+     every repo agent can recall them.
+   - When unsure, omit `brain` (repo brain). The common brain is curated.
+4. **Immediately after each memory file write**, call `mcp__open-brain__capture_thought` with the memory content
    - Use the memory content (not the frontmatter) as the thought
    - Prefix with the memory type in brackets for context, e.g. `[feedback] Don't mock the database in integration tests`
+   - Set `brain` per step 3 (omit for `[project]`; `agent-common` for cross-cutting)
    - If the memory references a specific project, include the project name
 
 ## Output
