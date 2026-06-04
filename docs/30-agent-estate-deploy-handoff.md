@@ -17,7 +17,7 @@ routing, and tests are done and verified against `ob1_dev`.
 | 3 | per-call `brain` param + cross-brain metadata `404` (was `500`) | `6bf6223` |
 | 4 | multi-brain read fan-out + per-row `brain_id`/`brain_slug` | `e2ab348`, `b1020ab` |
 | 5 | `scripts/agent_estate/provision.sh` | `f674ed5` |
-| 7 | brain routing in `auto-capture` / `autodream-brain-sync` skills | `efa7125` |
+| 7 | brain routing in `auto-capture` / `ob1-autodream-brain-sync` skills | `efa7125` |
 | — | `tests/test_agent_estate.py` (8/8 green vs live service) | `f72d3d0` |
 
 Applied to **`ob1_dev` only**. PROD migration is deferred (same DB server,

@@ -276,7 +276,7 @@ a cross-project operator preference, or an environment/infra fact any agent
 might need; otherwise omit `brain` (→ repo default brain). When in doubt: repo.
 Reads: default (no `brain`) spans all accessible brains; pass `brain` only to scope.
 
-- **`skills/autodream-brain-sync`** (already OB1-coupled — hardcodes
+- **`skills/ob1-autodream-brain-sync`** (already OB1-coupled — hardcodes
   `mcp__open-brain__capture_thought`): fold the rule in directly. Its existing
   memory-type prefix is the signal — `[project]` → repo (omit `brain`);
   `[user]`/`[feedback]`/`[reference]` about tooling/operator → `brain="agent-common"`.
@@ -293,7 +293,7 @@ memory about tooling lands in `agent-common` (verified by `thoughts.brain_id`).
 
 ### Phase 8 — Migrate writers (incremental, restored from base)
 
-Telegram bridge, FastAPI ingest, autodream-brain-sync keep working unchanged
+Telegram bridge, FastAPI ingest, ob1-autodream-brain-sync keep working unchanged
 (default-brain shim). Each may opt into explicit `brain` when useful. No forced
 change.
 

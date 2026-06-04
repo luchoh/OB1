@@ -1,5 +1,5 @@
 ---
-name: autodream-brain-sync
+name: ob1-autodream-brain-sync
 description: |
   Syncs Claude Code's local memory system to Open Brain. Triggers whenever memories are
   saved via dreaming, autodream, or explicit "remember this" requests. After every local
