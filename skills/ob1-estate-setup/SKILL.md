@@ -28,12 +28,15 @@ Gather context before changing anything:
 
 - Repo slug: derive from the git remote (`git remote -v`) or the directory name.
   Must be `[a-z0-9-]`, short and human (e.g. `system-config`, `dotfiles`).
-- Is this the **OB1 repo itself**? If the repo root has
-  `local/open-brain-mcp/` and `scripts/agent_estate/provision.sh`, STOP and tell
-  the user: the OB1 repo intentionally keeps the legacy-admin key so its agents
-  have global/debug access — do not scope it. Nothing to do here.
-- OB1 server reachability: `curl -sf http://127.0.0.1:8787/health`. If down, tell
-  the user the OB1 runtime appears down and ask them to start it before continuing.
+- Is this the **OB1 repo itself**? Detect cleanly — do NOT `ls` paths that may not
+  exist (it spews `cannot access` errors). Use a guarded test:
+  `test -f scripts/agent_estate/provision.sh && echo "OB1 repo" || echo "not OB1"`.
+  If it IS the OB1 repo, STOP and tell the user: OB1 intentionally keeps the
+  legacy-admin key so its agents have global/debug access — do not scope it.
+- OB1 runtime reachability: probe the runtime this repo will TARGET (see Section C),
+  not a fixed port — prod is `http://10.10.10.100:8788`, local dev is
+  `http://127.0.0.1:8787`. `curl -sf <chosen-url>/health`. If it is down, tell the
+  user and ask them to start it before continuing.
 - Existing config: is there already an `MCP_ACCESS_KEY` in this repo's `.envrc` /
   `.env.local`? If so, this repo may already be initialized — confirm before overwriting.
 
