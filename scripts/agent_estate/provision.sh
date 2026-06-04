@@ -15,7 +15,7 @@
 #   OPERATOR_PRINCIPAL_TYPE (default person)
 set -euo pipefail
 
-SLUG="${1:?usage: provision.sh <repo-slug> [--key-hash <sha256-hex>]}"
+SLUG="${1:?usage: provision.sh <repo-slug> [--key-hash <sha256-hex>] [--database <name>]}"
 shift
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && cd .. && pwd)"
 cd "$ROOT_DIR"
@@ -23,9 +23,11 @@ cd "$ROOT_DIR"
 # Optional: register a key generated elsewhere (the repo-init skill flow) by its
 # sha256 hash, so the plaintext key never leaves the repo it belongs to.
 SUPPLIED_HASH=""
+DB_OVERRIDE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --key-hash) SUPPLIED_HASH="${2:?--key-hash needs a value}"; shift 2 ;;
+    --database) DB_OVERRIDE="${2:?--database needs a value}"; shift 2 ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -62,7 +64,8 @@ fi
 : "${PGPASSWORD:?PGPASSWORD is not set}"
 export PGHOST PGPORT PGPASSWORD
 
-CONN="host=$PGHOST port=$PGPORT dbname=${PGDATABASE:-ob1} user=${PGUSER:-postgres}"
+# --database wins over the env file's PGDATABASE (the env file pins dev).
+CONN="host=$PGHOST port=$PGPORT dbname=${DB_OVERRIDE:-${PGDATABASE:-ob1}} user=${PGUSER:-postgres}"
 psql_run() { nix shell nixpkgs#postgresql_16 --command psql "$CONN" -v ON_ERROR_STOP=1 "$@"; }
 
 # --- idempotent estate / brains / principal / memberships -------------------
