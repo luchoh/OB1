@@ -15,9 +15,23 @@
 #   OPERATOR_PRINCIPAL_TYPE (default person)
 set -euo pipefail
 
-SLUG="${1:?usage: provision.sh <repo-slug>}"
+SLUG="${1:?usage: provision.sh <repo-slug> [--key-hash <sha256-hex>]}"
+shift
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && cd .. && pwd)"
 cd "$ROOT_DIR"
+
+# Optional: register a key generated elsewhere (the repo-init skill flow) by its
+# sha256 hash, so the plaintext key never leaves the repo it belongs to.
+SUPPLIED_HASH=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --key-hash) SUPPLIED_HASH="${2:?--key-hash needs a value}"; shift 2 ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+if [[ -n "$SUPPLIED_HASH" && ! "$SUPPLIED_HASH" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "--key-hash must be 64 lowercase hex chars (a sha256 digest)" >&2; exit 2
+fi
 
 # Slugs are interpolated into a couple of -c queries; keep them strictly safe.
 valid_slug() { [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]]; }
@@ -107,27 +121,44 @@ insert into estate_memberships (principal_id, estate_id, role)
 commit;
 SQL
 
-# --- mint an access key only if the principal has none ----------------------
+# --- access key --------------------------------------------------------------
 # Slugs/hash are validated/hex, so direct interpolation here is safe (and avoids
 # psql's -c variable-interpolation quirk).
-HAS_KEY="$(psql_run -Atq -c \
-  "select count(*) from brain_access_keys k
-     join brain_principals p on p.id = k.principal_id
-     join households h on h.id = p.household_id
-    where h.slug = '${ESTATE_SLUG}' and p.slug = '${SLUG}' and k.is_active = true")"
-
-if [[ "$HAS_KEY" == "0" ]]; then
-  KEY="ob1_$(node -e 'console.log(require("crypto").randomBytes(24).toString("base64url"))')"
-  HASH="$(node -e 'console.log(require("crypto").createHash("sha256").update(process.argv[1]).digest("hex"))' "$KEY")"
-  psql_run -q -c \
-    "insert into brain_access_keys (principal_id, brain_id, is_admin, key_hash, is_active, label, credential_type)
-       select p.id, null, false, '${HASH}', true, '${SLUG} repo key', 'service_key'
-       from brain_principals p join households h on h.id = p.household_id
-       where h.slug = '${ESTATE_SLUG}' and p.slug = '${SLUG}'"
-  mkdir -p "$ROOT_DIR/.agent-estate-keys"
-  umask 077
-  printf '%s\n' "$KEY" > "$ROOT_DIR/.agent-estate-keys/${SLUG}.key"
-  echo "Provisioned '${SLUG}' in estate '${ESTATE_SLUG}': NEW access key -> .agent-estate-keys/${SLUG}.key (gitignored)."
+if [[ -n "$SUPPLIED_HASH" ]]; then
+  # Register an externally-generated key by hash (repo-init skill flow); the
+  # plaintext key stays in the repo it belongs to. Idempotent on the hash.
+  EXISTS="$(psql_run -Atq -c \
+    "select count(*) from brain_access_keys where key_hash = '${SUPPLIED_HASH}' and is_active = true")"
+  if [[ "$EXISTS" == "0" ]]; then
+    psql_run -q -c \
+      "insert into brain_access_keys (principal_id, brain_id, is_admin, key_hash, is_active, label, credential_type)
+         select p.id, null, false, '${SUPPLIED_HASH}', true, '${SLUG} repo key', 'service_key'
+         from brain_principals p join households h on h.id = p.household_id
+         where h.slug = '${ESTATE_SLUG}' and p.slug = '${SLUG}'"
+    echo "Provisioned '${SLUG}' in estate '${ESTATE_SLUG}': registered supplied key hash."
+  else
+    echo "Provisioned '${SLUG}' in estate '${ESTATE_SLUG}': supplied key hash already registered."
+  fi
 else
-  echo "Provisioned '${SLUG}' in estate '${ESTATE_SLUG}': principal/brains/memberships ensured; existing active key kept."
+  # Mint a fresh key only if the principal has none.
+  HAS_KEY="$(psql_run -Atq -c \
+    "select count(*) from brain_access_keys k
+       join brain_principals p on p.id = k.principal_id
+       join households h on h.id = p.household_id
+      where h.slug = '${ESTATE_SLUG}' and p.slug = '${SLUG}' and k.is_active = true")"
+  if [[ "$HAS_KEY" == "0" ]]; then
+    KEY="ob1_$(node -e 'console.log(require("crypto").randomBytes(24).toString("base64url"))')"
+    HASH="$(node -e 'console.log(require("crypto").createHash("sha256").update(process.argv[1]).digest("hex"))' "$KEY")"
+    psql_run -q -c \
+      "insert into brain_access_keys (principal_id, brain_id, is_admin, key_hash, is_active, label, credential_type)
+         select p.id, null, false, '${HASH}', true, '${SLUG} repo key', 'service_key'
+         from brain_principals p join households h on h.id = p.household_id
+         where h.slug = '${ESTATE_SLUG}' and p.slug = '${SLUG}'"
+    mkdir -p "$ROOT_DIR/.agent-estate-keys"
+    umask 077
+    printf '%s\n' "$KEY" > "$ROOT_DIR/.agent-estate-keys/${SLUG}.key"
+    echo "Provisioned '${SLUG}' in estate '${ESTATE_SLUG}': NEW access key -> .agent-estate-keys/${SLUG}.key (gitignored)."
+  else
+    echo "Provisioned '${SLUG}' in estate '${ESTATE_SLUG}': principal/brains/memberships ensured; existing active key kept."
+  fi
 fi
