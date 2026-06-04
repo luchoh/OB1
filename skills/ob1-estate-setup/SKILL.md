@@ -59,7 +59,21 @@ Explain: agents authenticate with a key tied to this repo's principal. Two ways:
   `provision.sh` run); the skill writes it to the local env and gives you the same
   register command for its hash.
 
-#### Section C — local env layout
+#### Section C — which OB1 runtime, and local env layout
+
+Explain: the key authenticates against **one** OB1 runtime, and a key only works
+against the runtime whose database holds it. A repo principal provisioned into
+**production** must point at the **production** runtime — pointing at the local
+dev runtime (a different database) will fail auth. Confirm the target:
+
+- **Production (default for real use):** `http://10.10.10.100:8788`
+  (the `ob1-stable` service on m2maxstudio; also reachable as
+  `http://m2maxstudio.lincoln.luchoh.net:8788`).
+- **Local dev:** `http://127.0.0.1:8787` — only if the principal was provisioned
+  into `ob1_dev` and you are testing against the laptop runtime.
+
+Pick the one matching where the principal was (or will be) provisioned, and use
+it as `OPEN_BRAIN_BASE_URL` below.
 
 Explain: the key lives in a **gitignored** file that `direnv` loads on shell entry.
 Default layout (adapt to what the repo already uses):
@@ -69,7 +83,7 @@ Default layout (adapt to what the repo already uses):
 [ -f .env.local ] && source_env .env.local
 # .env.local (gitignored)
 export MCP_ACCESS_KEY=<this repo's key>
-export OPEN_BRAIN_BASE_URL=http://127.0.0.1:8787
+export OPEN_BRAIN_BASE_URL=http://10.10.10.100:8788   # prod; use 127.0.0.1:8787 only for dev
 ```
 
 ### 3. Write the local env
@@ -87,11 +101,14 @@ export OPEN_BRAIN_BASE_URL=http://127.0.0.1:8787
 ### 4. Register the principal in OB1
 
 Hand the user this exact command to run **in the OB1 repo** (only the hash crosses;
-OB1 holds DB credentials, this repo does not):
+OB1 holds DB credentials, this repo does not). **`--database` MUST match the
+runtime chosen in Section C** — `ob1` for production, `ob1_dev` for local dev —
+or the key gets registered in the wrong database and auth fails:
 
 ```bash
 # run inside ~/Dev/OB1
-./scripts/agent_estate/provision.sh <slug> --key-hash <HASH>
+./scripts/agent_estate/provision.sh <slug> --key-hash <HASH> --database ob1   # prod
+# (use --database ob1_dev only if you pointed at the local dev runtime)
 ```
 
 This idempotently creates the agent estate (first time), the common brain, the
