@@ -18,6 +18,7 @@ import json
 import os
 import secrets
 import subprocess
+import sys
 import unittest
 import urllib.error
 import urllib.request
@@ -134,15 +135,23 @@ class AgentEstateAcceptance(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # thoughts first (brain_id is ON DELETE RESTRICT), then the household
+        # cascade removes brains / principal / memberships / key. `b.id` MUST be
+        # qualified — `id` is ambiguous across the brains/households join.
         try:
             _psql(
-                f"delete from thoughts where brain_id in (select id from brains b join households h "
-                f"on h.id=b.household_id where h.slug='{ESTATE}'); "
-                f"delete from brain_access_keys where key_hash='{KEY_HASH}'; "
+                f"delete from thoughts where brain_id in (select b.id from brains b "
+                f"join households h on h.id=b.household_id where h.slug='{ESTATE}'); "
                 f"delete from households where slug='{ESTATE}'"
             )
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # A failed cleanup must be LOUD — leftover fixtures in a shared/prod
+            # DB are worse than a noisy teardown.
+            print(
+                f"\nWARNING: agent-estate test cleanup FAILED; '{ESTATE}' "
+                f"fixtures may remain in the DB: {exc}",
+                file=sys.stderr,
+            )
 
     def _brain_of(self, thought_id: str) -> str:
         return _psql(
