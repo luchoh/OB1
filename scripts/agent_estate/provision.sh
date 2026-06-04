@@ -15,19 +15,25 @@
 #   OPERATOR_PRINCIPAL_TYPE (default person)
 set -euo pipefail
 
-SLUG="${1:?usage: provision.sh <repo-slug> [--key-hash <sha256-hex>] [--database <name>]}"
+SLUG="${1:?usage: provision.sh <repo-slug> [--key-hash <sha256-hex>] [--revoke-keys] [--database <name>]}"
 shift
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && cd .. && pwd)"
 cd "$ROOT_DIR"
 
-# Optional: register a key generated elsewhere (the repo-init skill flow) by its
-# sha256 hash, so the plaintext key never leaves the repo it belongs to.
+# Optional flags:
+#   --key-hash <hex>  register a key generated elsewhere (skill flow) by its hash,
+#                     so the plaintext key never leaves the repo it belongs to.
+#   --revoke-keys     deactivate ALL active keys for this principal first (rotate /
+#                     reset). Combine with --key-hash to revoke-then-register.
+#   --database <name> target a non-default DB (the env file pins dev).
 SUPPLIED_HASH=""
 DB_OVERRIDE=""
+REVOKE_KEYS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --key-hash) SUPPLIED_HASH="${2:?--key-hash needs a value}"; shift 2 ;;
     --database) DB_OVERRIDE="${2:?--database needs a value}"; shift 2 ;;
+    --revoke-keys) REVOKE_KEYS=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -124,6 +130,17 @@ insert into estate_memberships (principal_id, estate_id, role)
 commit;
 SQL
 
+# --- revoke (rotate / reset) -------------------------------------------------
+if [[ -n "$REVOKE_KEYS" ]]; then
+  N="$(psql_run -Atq -c \
+    "update brain_access_keys set is_active=false, updated_at=now()
+       where is_active=true and principal_id = (
+         select p.id from brain_principals p join households h on h.id = p.household_id
+         where h.slug = '${ESTATE_SLUG}' and p.slug = '${SLUG}')
+       returning 1")"
+  echo "Revoked $(printf '%s' "$N" | grep -c .) active key(s) for '${SLUG}'."
+fi
+
 # --- access key --------------------------------------------------------------
 # Slugs/hash are validated/hex, so direct interpolation here is safe (and avoids
 # psql's -c variable-interpolation quirk).
@@ -142,6 +159,9 @@ if [[ -n "$SUPPLIED_HASH" ]]; then
   else
     echo "Provisioned '${SLUG}' in estate '${ESTATE_SLUG}': supplied key hash already registered."
   fi
+elif [[ -n "$REVOKE_KEYS" ]]; then
+  # Pure revoke/reset (no new key supplied) — do not mint a replacement.
+  echo "Provisioned '${SLUG}' in estate '${ESTATE_SLUG}': keys revoked; no new key minted."
 else
   # Mint a fresh key only if the principal has none.
   HAS_KEY="$(psql_run -Atq -c \

@@ -1,133 +1,100 @@
 ---
 name: ob1-estate-setup
-description: Initialize the CURRENT repo for the OB1 agent estate — give it a scoped agent principal + access key and wire the repo's local shell env so agents working here capture to this repo's brain by default and can also reach the shared common brain. Run once per repo. Asks before creating anything.
+description: Initialize OR update the CURRENT repo's OB1 agent identity — scope this repo's agents to a per-repo OB1 principal by setting OB1_MCP_ACCESS_KEY in the repo's gitignored env. Re-runnable: detects prior setup and asks whether to migrate, rotate, reset, or leave it. Asks before changing anything.
 disable-model-invocation: true
 ---
 
-# Initialize This Repo for the OB1 Agent Estate
+# OB1 Agent Estate — Per-Repo Setup
 
-OB1 gives each repository its own agent identity: an agent working in repo X
-authenticates as the `X` principal, captures to the `X` brain by default, and can
-also read/write the shared `agent-common` brain. This skill sets that up for the
-**current** repo — it provisions (or registers) a scoped key and wires the repo's
-gitignored shell env so `cd` into this repo silently becomes the right identity.
+## What this does, and why it works this way
 
-The plaintext key is generated **here** and never leaves this repo. OB1 only ever
-stores its sha256 hash. Companion: OB1 `docs/30-agent-estate-deploy-handoff.md`.
+Every Claude Code instance has a **global** `ob1` MCP server (managed by
+system-config's claude-code module) that sends `x-access-key: ${OB1_MCP_ACCESS_KEY}`
+to OB1 at a fixed URL. By default `OB1_MCP_ACCESS_KEY` is the **global
+legacy-admin** key, so agents talk to OB1 as admin (every brain).
 
-## When to use
+To scope THIS repo, we override **`OB1_MCP_ACCESS_KEY`** in the repo's gitignored
+env (loaded by `direnv` on shell entry). A `claude` launched in this repo then
+sends the **repo's** key and authenticates as the repo's principal — captures
+default to the repo brain, and `brain="agent-common"` for cross-cutting notes.
 
-Run once in a repo where you want OB1 agents scoped to that repo. Re-run only to
-rotate the key or repair the local env.
+Facts that make this correct (the previous version of this skill got these wrong):
+- The lever is **`OB1_MCP_ACCESS_KEY`** — the var the MCP header actually reads.
+  Setting `MCP_ACCESS_KEY` does **nothing** for Claude's MCP connection.
+- The MCP **URL is fixed** (prod) in the global config, so no per-repo URL is
+  needed. `OPEN_BRAIN_BASE_URL` only matters for direct `curl`/scripts.
+- The key authenticates against **prod** (`ob1`), where the estate lives.
+- The **OB1 repo itself is NOT scoped** — it keeps legacy-admin for debug. Skip it.
+- The plaintext key is born HERE and never leaves; only its sha256 hash goes to OB1.
 
 ## Process
 
-### 1. Explore (read-only)
+### 1. Explore (read-only; do not `ls` paths that may not exist — it spews errors)
 
-Gather context before changing anything:
+- **Slug:** from `git remote -v` or the directory name; must be `[a-z0-9-]`.
+- **Is this the OB1 repo?** `test -f scripts/agent_estate/provision.sh && echo "OB1"`.
+  If it is, STOP — OB1 keeps the legacy-admin key for global/debug access.
+- **Prior state** — inspect this repo's gitignored env (`.env.local`, `.envrc`):
+  - **SCOPED** — `OB1_MCP_ACCESS_KEY` is set → already wired correctly.
+  - **LEGACY-VAR** — `MCP_ACCESS_KEY` is set but `OB1_MCP_ACCESS_KEY` is not → wired
+    by the older skill with the WRONG var name (the key itself is fine, just unused
+    by Claude). Needs a one-line migration.
+  - **FRESH** — neither is present.
 
-- Repo slug: derive from the git remote (`git remote -v`) or the directory name.
-  Must be `[a-z0-9-]`, short and human (e.g. `system-config`, `dotfiles`).
-- Is this the **OB1 repo itself**? Detect cleanly — do NOT `ls` paths that may not
-  exist (it spews `cannot access` errors). Use a guarded test:
-  `test -f scripts/agent_estate/provision.sh && echo "OB1 repo" || echo "not OB1"`.
-  If it IS the OB1 repo, STOP and tell the user: OB1 intentionally keeps the
-  legacy-admin key so its agents have global/debug access — do not scope it.
-- OB1 runtime reachability: probe the runtime this repo will TARGET (see Section C),
-  not a fixed port — prod is `http://10.10.10.100:8788`, local dev is
-  `http://127.0.0.1:8787`. `curl -sf <chosen-url>/health`. If it is down, tell the
-  user and ask them to start it before continuing.
-- Existing config: is there already an `MCP_ACCESS_KEY` in this repo's `.envrc` /
-  `.env.local`? If so, this repo may already be initialized — confirm before overwriting.
+### 2. Present findings and pick an action (ask; one at a time, with plain explainers)
 
-### 2. Present findings and ask (one decision at a time)
+State the slug and detected state, then offer the matching action:
 
-Summarize what's present/missing, then walk the user through each decision. Assume
-they may not know the terms; start each with a one-line explainer, then the choices
-and the default.
+- **FRESH → Set up.** Generate a key here, register its hash in OB1, write the env.
+- **LEGACY-VAR → Migrate (recommended).** The existing key is already registered in
+  OB1, so just **rename** `MCP_ACCESS_KEY` → `OB1_MCP_ACCESS_KEY` in the env (same
+  value). No OB1-side change. (Alternatives: Rotate, or Leave.)
+- **SCOPED →** offer:
+  - **Leave** — already correct.
+  - **Rotate** — replace the key (new key here; register new + revoke old in OB1).
+  - **Reset** — revoke all this repo's keys in OB1 and set up fresh.
+  - **Repair** — rewrite the env from the existing key (fix a typo, missing
+    `direnv` source, etc.) without touching OB1.
 
-#### Section A — repo slug
+### 3. Apply locally
 
-Explain: the slug is this repo's agent identity and brain name in OB1. Default to
-the derived slug. Confirm or let the user override.
+End state for every path: **`OB1_MCP_ACCESS_KEY=<this repo's key>`** in the
+gitignored env, loaded by `direnv`.
 
-#### Section B — key strategy
-
-Explain: agents authenticate with a key tied to this repo's principal. Two ways:
-
-- **Generate here, register in OB1 (default).** This skill mints a key, stores the
-  plaintext in this repo's gitignored env, and gives you a one-line command to run
-  in the OB1 repo that registers only the *hash*. The plaintext never leaves here.
-- **Supply an existing key.** You paste a key you already hold (e.g. from a prior
-  `provision.sh` run); the skill writes it to the local env and gives you the same
-  register command for its hash.
-
-#### Section C — which OB1 runtime, and local env layout
-
-Explain: the key authenticates against **one** OB1 runtime, and a key only works
-against the runtime whose database holds it. A repo principal provisioned into
-**production** must point at the **production** runtime — pointing at the local
-dev runtime (a different database) will fail auth. Confirm the target:
-
-- **Production (default for real use):** `http://10.10.10.100:8788`
-  (the `ob1-stable` service on m2maxstudio; also reachable as
-  `http://m2maxstudio.lincoln.luchoh.net:8788`).
-- **Local dev:** `http://127.0.0.1:8787` — only if the principal was provisioned
-  into `ob1_dev` and you are testing against the laptop runtime.
-
-Pick the one matching where the principal was (or will be) provisioned, and use
-it as `OPEN_BRAIN_BASE_URL` below.
-
-Explain: the key lives in a **gitignored** file that `direnv` loads on shell entry.
-Default layout (adapt to what the repo already uses):
-
-```bash
-# .envrc (tracked)
-[ -f .env.local ] && source_env .env.local
-# .env.local (gitignored)
-export MCP_ACCESS_KEY=<this repo's key>
-export OPEN_BRAIN_BASE_URL=http://10.10.10.100:8788   # prod; use 127.0.0.1:8787 only for dev
-```
-
-### 3. Write the local env
-
-- If generating: create the key as `ob1_<random>`. Compute its hash:
+- **Generate a key** (set-up / rotate / reset):
   ```bash
   KEY="ob1_$(node -e 'console.log(require("crypto").randomBytes(24).toString("base64url"))')"
   HASH="$(node -e 'console.log(require("crypto").createHash("sha256").update(process.argv[1]).digest("hex"))' "$KEY")"
   ```
-- Write `MCP_ACCESS_KEY` + `OPEN_BRAIN_BASE_URL` into the gitignored env file
-  (create `.env.local` and the `.envrc` source line if absent).
-- Ensure `.gitignore` covers the env file. **Never commit the key.** Never print
-  the plaintext key into a chat transcript — keep it in the file.
+  Write to the gitignored env (create `.env.local` + the `.envrc` source line if absent):
+  ```bash
+  # .env.local (gitignored)
+  export OB1_MCP_ACCESS_KEY=<KEY>
+  # optional — only for direct curl/scripts, NOT Claude's MCP (which uses the global URL):
+  # export OPEN_BRAIN_BASE_URL=http://10.10.10.100:8788
+  ```
+  Ensure `.gitignore` covers the env file. **Never** print the key into a chat
+  transcript or commit it — keep it in the file.
+- **Migrate** (LEGACY-VAR): rename the var in place — `MCP_ACCESS_KEY` →
+  `OB1_MCP_ACCESS_KEY`, same value. Nothing else changes.
 
-### 4. Register the principal in OB1
+### 4. Apply in OB1 — only when the key actually changed
 
-Hand the user this exact command to run **in the OB1 repo** (only the hash crosses;
-OB1 holds DB credentials, this repo does not). **`--database` MUST match the
-runtime chosen in Section C** — `ob1` for production, `ob1_dev` for local dev —
-or the key gets registered in the wrong database and auth fails:
+Hand the user the command to run **in the OB1 repo** (only the hash crosses;
+`--database` MUST match the runtime, `ob1` = prod; idempotent):
 
-```bash
-# run inside ~/Dev/OB1
-./scripts/agent_estate/provision.sh <slug> --key-hash <HASH> --database ob1   # prod
-# (use --database ob1_dev only if you pointed at the local dev runtime)
-```
+- **Set up:**  `./scripts/agent_estate/provision.sh <slug> --key-hash <HASH> --database ob1`
+- **Rotate / Reset:**  `./scripts/agent_estate/provision.sh <slug> --revoke-keys --key-hash <HASH> --database ob1`
+  (revokes the old key(s), then registers the new one)
+- **Migrate / Repair / Leave:** nothing — the key is already registered.
 
-This idempotently creates the agent estate (first time), the common brain, the
-`<slug>` principal + brain, the two memberships (repo=owner, common=editor), and
-registers the supplied hash as the principal's active key.
+### 5. Verify — the only check that actually proves scoping
 
-### 5. Verify and done
+- `direnv allow`; `echo $OB1_MCP_ACCESS_KEY` shows THIS repo's key (not the global one).
+- **Launch `claude` in this repo, capture a thought, and confirm it landed in the
+  `<slug>` brain** — not the legacy-admin default brain. This is the real proof:
+  the env var name, `direnv`, and Claude Code's per-launch `${VAR}` substitution all
+  have to line up, and only a live capture confirms they do.
+- GUI MCP clients read env at process start — restart them after a change.
 
-After the user has run the register command:
-
-- `direnv allow` in this repo.
-- `echo $MCP_ACCESS_KEY` shows this repo's key (not the legacy admin key).
-- A no-`brain` capture lands in the `<slug>` brain; a `brain="agent-common"`
-  capture lands in the common brain. (The capture skills route cross-cutting notes
-  to `agent-common` automatically.)
-- GUI MCP clients read env at process start — restart them after the first setup.
-
-Tell the user which files were written and that this repo's agents are now scoped
-to the `<slug>` principal.
+Finish by telling the user the final state and which files changed.
