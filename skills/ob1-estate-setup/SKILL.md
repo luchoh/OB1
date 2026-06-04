@@ -1,5 +1,5 @@
 ---
-name: agent-estate-repo-init
+name: ob1-estate-setup
 description: Initialize the CURRENT repo for the OB1 agent estate — give it a scoped agent principal + access key and wire the repo's local shell env so agents working here capture to this repo's brain by default and can also reach the shared common brain. Run once per repo. Asks before creating anything.
 disable-model-invocation: true
 ---
