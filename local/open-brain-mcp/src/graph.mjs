@@ -1628,6 +1628,12 @@ export async function graphProjectionStats(database = config.graph.database) {
           on gps.thought_id = t.id
          and gps.brain_id = t.brain_id
          and gps.graph_database = $1
+        -- M2/D3: soft-deleted thoughts are operationally hidden and are removed
+        -- from Neo4j by the projector delete path. They are NOT live rows, so
+        -- they must not inflate total_thought_rows / pending_rows here — a
+        -- tombstone awaiting graph removal is not "pending projection" in the
+        -- backlog sense this stat reports. Exclude them from the candidate set.
+        where t.deleted_at is null
       )
       select
         count(*)::bigint as total_thought_rows,

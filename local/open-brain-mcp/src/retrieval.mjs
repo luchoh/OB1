@@ -325,6 +325,7 @@ export async function fetchThoughtRowsByIds({ brainId, ids, filter, embedding })
         from thoughts t
         where t.id = any($1::uuid[])
           and t.brain_id = $2::uuid
+          and t.deleted_at is null
           and ($4::jsonb = '{}'::jsonb or t.metadata @> $4::jsonb)
       `,
       [ids, brainId, formatVector(embedding), filterJson],
@@ -344,6 +345,7 @@ export async function fetchThoughtRowsByIds({ brainId, ids, filter, embedding })
         from thoughts t
         where t.id = any($1::uuid[])
           and t.brain_id = $2::uuid
+          and t.deleted_at is null
           and ($3::jsonb = '{}'::jsonb or t.metadata @> $3::jsonb)
       `,
       [ids, brainId, filterJson],

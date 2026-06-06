@@ -653,6 +653,7 @@ async function updateThoughtMetadata({
       set ${setClauses.join(",\n        ")}
       where id = $1::uuid
         and brain_id = $2::uuid
+        and deleted_at is null
       returning
         id,
         metadata,
@@ -775,6 +776,7 @@ async function brainStats(brainId) {
         count(*)::bigint as count
       from thoughts
       where brain_id = $1::uuid
+        and deleted_at is null
       group by 1
       order by count desc, source asc
       limit 10
@@ -785,6 +787,7 @@ async function brainStats(brainId) {
         count(*)::bigint as count
       from thoughts
       where brain_id = $1::uuid
+        and deleted_at is null
       group by 1
       order by count desc, type asc
       limit 10
@@ -797,6 +800,7 @@ async function brainStats(brainId) {
         select jsonb_array_elements_text(coalesce(metadata->'people', '[]'::jsonb)) as person
         from thoughts
         where brain_id = $1::uuid
+          and deleted_at is null
       ) people
       group by person
       order by count desc, person asc
