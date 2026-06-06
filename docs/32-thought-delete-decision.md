@@ -96,6 +96,37 @@ graph entirely — a `WHERE` filter runs *after* the ANN traversal and costs rec
 Acceptance must assert absence per-surface (search, recency-search, list, stats
 **counts**, ask_brain graph-assisted, expand_context), not "one predicate covers all."
 
+### D3b. Neo4j-DIRECT read surfaces (missed in the original D3 — content lives on the node).
+The projector writes truncated content onto every Thought node: `summary` and
+`content_preview` (graph.mjs buildProjectionPlan:1476-1477). The graph read tools
+return node properties **straight from Neo4j**, with no `deleted_at` awareness:
+- `graph_neighbors` returns `center { .* }` and `node: neighbor { .* }` (graph.mjs:1782-1810)
+- `source_lineage` and `why_connected` similarly return node data
+- `expand_context` traverses the graph but re-hydrates content via the now-filtered
+  `fetchThoughtRowsByIds`, so its **content** is already safe (D3) — only the node's
+  existence/edges remain visible.
+
+So a soft-deleted thought's content (preview/summary) is exposed via the admin
+graph tools until the node is removed — Postgres-side `deleted_at` does NOT cover
+this. These tools are admin-only (bounded) but it is still a content leak / GDPR gap.
+
+**"Soft delete" is a Postgres concept; Neo4j has no native equivalent.** Pick a model:
+- **A** — projector hard-`DETACH DELETE`s the node on soft-delete (current D2);
+  restore re-projects. Convergence-window leak remains until the projector runs.
+- **B** — projector sets `n.deleted_at` on the node; graph Cypher reads filter
+  `WHERE n.deleted_at IS NULL`; restore clears it (cheap, no re-project); purge
+  `DETACH DELETE`s. First-class in both stores; still a projection-lag window.
+- **C (recommended, layered on A or B)** — the graph tools do NOT trust the Neo4j
+  content cache for the deleted? decision: they return structure and **re-validate
+  the returned thought ids against Postgres `deleted_at`** (post-filter, like
+  `fetchThoughtRowsByIds`) before returning node data. Closes the window fully,
+  Postgres stays source of truth.
+
+Add a graph-tool leak test to acceptance: capture A, make A a graph neighbour of B,
+soft-delete A, then `graph_neighbors(B)` (and `source_lineage`/`why_connected`)
+must not return A's node or its content. This is M4 work (it pairs with the
+projector delete path) + a D3 addition; it is NOT covered by M2.
+
 ### D4. Authorization is NET-NEW (the draft's "mirror metadata" was unsafe).
 `/admin/thought/metadata` does NO role/admin check (server.mjs:1190-1211) — the
 `/admin/` prefix is cosmetic; any valid key passes. `role` is free-text with no
