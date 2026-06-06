@@ -278,7 +278,7 @@ async function upsertThought({ brainId, content, embedding, metadata, dedupeKey 
         $7::jsonb,
         $8
       )
-      on conflict (brain_id, dedupe_key)
+      on conflict (brain_id, dedupe_key) where deleted_at is null
       do update set
         content = excluded.content,
         embedding = excluded.embedding,
