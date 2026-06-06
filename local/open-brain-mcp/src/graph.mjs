@@ -1686,6 +1686,204 @@ function dedupeGraphItems(items) {
   return deduped;
 }
 
+const THOUGHT_CANONICAL_PREFIX = "thought:";
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// D3b model C: the projector caches truncated Thought content (summary,
+// content_preview, title) onto Neo4j nodes, and the graph read tools return that
+// cache straight from Neo4j with no deleted_at awareness. So a soft-deleted
+// thought keeps leaking via graph_neighbors / source_lineage / why_connected
+// until the projector removes the node (eventual). These helpers re-validate the
+// returned Thought ids against Postgres (the source of truth) and drop the
+// soft-deleted ones, closing the convergence-window leak. Only Thought nodes are
+// scrubbed; shared entity nodes (Concept/Person/Project/...) have no deleted_at.
+function thoughtUuidFromCanonicalId(canonicalId) {
+  if (typeof canonicalId !== "string" || !canonicalId.startsWith(THOUGHT_CANONICAL_PREFIX)) {
+    return null;
+  }
+  const uuid = canonicalId.slice(THOUGHT_CANONICAL_PREFIX.length);
+  return UUID_PATTERN.test(uuid) ? uuid.toLowerCase() : null;
+}
+
+function nodeIsThought(labels, canonicalId) {
+  if (Array.isArray(labels) && labels.includes("Thought")) {
+    return true;
+  }
+  // Fall back to the canonical_id shape: relationship endpoints and path nodes
+  // do not always carry labels, but a 'thought:<uuid>' id is unambiguous.
+  return thoughtUuidFromCanonicalId(canonicalId) !== null;
+}
+
+// Collect every Thought uuid appearing ANYWHERE in a graph result so we can
+// resolve the live set in a single Postgres round-trip.
+function collectThoughtUuids(result, uuids) {
+  const consider = (canonicalId, labels) => {
+    if (!nodeIsThought(labels, canonicalId)) {
+      return;
+    }
+    const uuid = thoughtUuidFromCanonicalId(canonicalId);
+    if (uuid) {
+      uuids.add(uuid);
+    }
+  };
+
+  // center / from / to anchor nodes
+  consider(result?.center?.canonical_id, result?.center_labels);
+  consider(result?.from?.canonical_id, result?.from_labels);
+  consider(result?.to?.canonical_id, result?.to_labels);
+
+  // neighbors[] / lineage[] items
+  for (const key of ["neighbors", "lineage"]) {
+    for (const item of result?.[key] ?? []) {
+      consider(item?.node?.canonical_id, item?.labels);
+      for (const anchor of item?.anchors ?? []) {
+        consider(anchor?.canonical_id, anchor?.labels);
+      }
+      for (const rel of item?.relationships ?? []) {
+        consider(rel?.from, null);
+        consider(rel?.to, null);
+      }
+    }
+  }
+
+  // why_connected paths[]
+  for (const path of result?.paths ?? []) {
+    for (const node of path?.nodes ?? []) {
+      consider(node?.canonical_id, node?.labels);
+    }
+    for (const rel of path?.relationships ?? []) {
+      consider(rel?.from, null);
+      consider(rel?.to, null);
+    }
+  }
+}
+
+async function fetchLiveThoughtUuids(uuids) {
+  if (uuids.size === 0) {
+    return new Set();
+  }
+  const { rows } = await query(
+    "select id from thoughts where id = any($1::uuid[]) and deleted_at is null",
+    [[...uuids]],
+  );
+  return new Set(rows.map((row) => String(row.id).toLowerCase()));
+}
+
+// Returns true when the given canonical_id is a Thought that is NOT live (i.e.
+// soft-deleted or absent from Postgres). Non-Thought nodes are always kept.
+function thoughtIsDead(canonicalId, labels, liveUuids) {
+  if (!nodeIsThought(labels, canonicalId)) {
+    return false;
+  }
+  const uuid = thoughtUuidFromCanonicalId(canonicalId);
+  if (!uuid) {
+    // A Thought-labeled node without a parseable uuid cannot be validated against
+    // Postgres; fail closed and treat it as dead so unparseable ids cannot leak.
+    return true;
+  }
+  return !liveUuids.has(uuid);
+}
+
+function relationshipRoutesThroughDeadThought(relationships, liveUuids) {
+  for (const rel of relationships ?? []) {
+    if (
+      thoughtIsDead(rel?.from, null, liveUuids) ||
+      thoughtIsDead(rel?.to, null, liveUuids)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Re-validate Thought nodes in a graph result against Postgres deleted_at and
+// remove the dead ones. Mutates and returns a (new) sanitized result object.
+async function scrubSoftDeletedThoughts(result) {
+  if (!result || typeof result !== "object") {
+    return result;
+  }
+
+  const uuids = new Set();
+  collectThoughtUuids(result, uuids);
+  if (uuids.size === 0) {
+    return result;
+  }
+
+  const liveUuids = await fetchLiveThoughtUuids(uuids);
+
+  // 1. If the queried/center thought itself is soft-deleted, the whole result is
+  //    not-found. Covers graph_neighbors / source_lineage (center) and
+  //    why_connected (from or to endpoint).
+  if (thoughtIsDead(result.center?.canonical_id, result.center_labels, liveUuids)) {
+    return { success: true, center: null, neighbors: [], lineage: [] };
+  }
+  if (
+    thoughtIsDead(result.from?.canonical_id, result.from_labels, liveUuids) ||
+    thoughtIsDead(result.to?.canonical_id, result.to_labels, liveUuids)
+  ) {
+    return {
+      success: true,
+      connected: false,
+      from: thoughtIsDead(result.from?.canonical_id, result.from_labels, liveUuids)
+        ? null
+        : result.from,
+      from_labels: result.from_labels,
+      to: thoughtIsDead(result.to?.canonical_id, result.to_labels, liveUuids)
+        ? null
+        : result.to,
+      to_labels: result.to_labels,
+      paths: [],
+    };
+  }
+
+  // 2. neighbors[] / lineage[]: drop items whose node is a dead Thought, or that
+  //    route THROUGH a dead Thought (anchor or relationship endpoint), and trim
+  //    dead-Thought anchors off the items we keep.
+  for (const key of ["neighbors", "lineage"]) {
+    if (!Array.isArray(result[key])) {
+      continue;
+    }
+    result[key] = result[key].filter((item) => {
+      if (thoughtIsDead(item?.node?.canonical_id, item?.labels, liveUuids)) {
+        return false;
+      }
+      if (relationshipRoutesThroughDeadThought(item?.relationships, liveUuids)) {
+        return false;
+      }
+      if (
+        (item?.anchors ?? []).some((anchor) =>
+          thoughtIsDead(anchor?.canonical_id, anchor?.labels, liveUuids),
+        )
+      ) {
+        return false;
+      }
+      return true;
+    });
+  }
+
+  // 3. why_connected paths[]: drop any path containing a dead Thought node or a
+  //    relationship routed through one.
+  if (Array.isArray(result.paths)) {
+    result.paths = result.paths.filter((path) => {
+      for (const node of path?.nodes ?? []) {
+        if (thoughtIsDead(node?.canonical_id, node?.labels, liveUuids)) {
+          return false;
+        }
+      }
+      if (relationshipRoutesThroughDeadThought(path?.relationships, liveUuids)) {
+        return false;
+      }
+      return true;
+    });
+    if (typeof result.connected === "boolean") {
+      result.connected = result.paths.length > 0;
+    }
+  }
+
+  return result;
+}
+
 async function fetchGraphNode(canonicalId, database = config.graph.database) {
   const result = await runGraph(
     `
@@ -1824,12 +2022,12 @@ export async function graphNeighbors({
   }
 
   const row = serializeRecord(result.records[0]);
-  return {
+  return scrubSoftDeletedThoughts({
     success: true,
     center: row.center,
     center_labels: row.center_labels,
     neighbors: dedupeGraphItems((row.neighbors ?? []).filter(Boolean)),
-  };
+  });
 }
 
 export async function graphThoughtNeighbors({
@@ -1921,12 +2119,12 @@ export async function graphThoughtNeighbors({
   }
 
   const row = serializeRecord(result.records[0]);
-  return {
+  return scrubSoftDeletedThoughts({
     success: true,
     center: row.center,
     center_labels: row.center_labels,
     neighbors: dedupeGraphItems((row.neighbors ?? []).filter(Boolean)),
-  };
+  });
 }
 
 export async function whyConnected({
@@ -1953,7 +2151,7 @@ export async function whyConnected({
   ]);
 
   if (!fromNode.node || !toNode.node) {
-    return {
+    return scrubSoftDeletedThoughts({
       success: true,
       connected: false,
       from: fromNode.node,
@@ -1961,11 +2159,11 @@ export async function whyConnected({
       to: toNode.node,
       to_labels: toNode.labels,
       paths: [],
-    };
+    });
   }
 
   if (fromId === toId) {
-    return {
+    return scrubSoftDeletedThoughts({
       success: true,
       connected: true,
       from: fromNode.node,
@@ -1985,7 +2183,7 @@ export async function whyConnected({
           relationships: [],
         },
       ],
-    };
+    });
   }
 
   const result = await runGraph(
@@ -2029,7 +2227,7 @@ export async function whyConnected({
   );
 
   if (result.records.length === 0) {
-    return {
+    return scrubSoftDeletedThoughts({
       success: true,
       connected: false,
       from: fromNode.node,
@@ -2037,12 +2235,12 @@ export async function whyConnected({
       to: toNode.node,
       to_labels: toNode.labels,
       paths: [],
-    };
+    });
   }
 
   const row = serializeRecord(result.records[0]);
   const paths = (row.paths ?? []).filter(Boolean);
-  return {
+  return scrubSoftDeletedThoughts({
     success: true,
     connected: paths.length > 0,
     from: row.from_node,
@@ -2050,7 +2248,7 @@ export async function whyConnected({
     to: row.to_node,
     to_labels: row.to_labels,
     paths,
-  };
+  });
 }
 
 export async function sourceLineage({
@@ -2111,12 +2309,12 @@ export async function sourceLineage({
   }
 
   const row = serializeRecord(result.records[0]);
-  return {
+  return scrubSoftDeletedThoughts({
     success: true,
     center: row.center,
     center_labels: row.center_labels,
     lineage: dedupeGraphItems((row.lineage ?? []).filter(Boolean)),
-  };
+  });
 }
 
 export function startGraphProjectorLoop() {
