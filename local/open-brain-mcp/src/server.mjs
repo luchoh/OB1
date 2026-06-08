@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
-import { HttpError, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
+import { HttpError, authorizeDestructive, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
 import { config } from "./config.mjs";
 import { closePool, formatVector, healthcheckDatabase, query } from "./db.mjs";
 import {
@@ -93,6 +93,20 @@ const updateThoughtMetadataInput = z
       || v.status !== undefined,
     { message: "at least one of metadata_patch or a structured column is required" },
   );
+
+// M3 D7: soft-delete / restore are HTTP-only (never MCP tools — see D9). A single
+// thought_id + optional brain; no bulk / delete-by-query.
+const deleteThoughtSchema = {
+  thought_id: z.string().uuid().describe("Canonical OB1 thought UUID to soft-delete."),
+  brain: z.string().optional().describe("Optional brain the thought lives in (slug or UUID). Defaults to the principal's default brain."),
+};
+const deleteThoughtInput = z.object(deleteThoughtSchema);
+
+const restoreThoughtSchema = {
+  thought_id: z.string().uuid().describe("Canonical OB1 thought UUID to restore."),
+  brain: z.string().optional().describe("Optional brain the thought lives in (slug or UUID). Defaults to the principal's default brain."),
+};
+const restoreThoughtInput = z.object(restoreThoughtSchema);
 
 const similarThoughtLookupSchema = {
   queries: z.array(z.string().min(1)).min(1).max(10).describe("Candidate strings to compare against the existing brain."),
@@ -690,6 +704,91 @@ async function updateThoughtMetadata({
   };
 }
 
+// M3 D6/D7: soft-delete is ATOMIC in a single-statement CTE (db.mjs exposes no
+// transaction helper). Keyed on (thought_id, brain_id) — NEVER dedupe_key (D6:
+// tombstone + live row may share a key). Idempotent: a second delete is a 200 with
+// already_deleted and NO new audit row.
+async function softDeleteThought({ brainId, thoughtId, actor }) {
+  const result = await query(
+    `
+      with target as (
+        select id, deleted_at from thoughts
+        where id = $1::uuid and brain_id = $2::uuid
+      ),
+      upd as (
+        update thoughts set deleted_at = now(), updated_at = now()
+        where id = $1::uuid and brain_id = $2::uuid and deleted_at is null
+        returning id
+      ),
+      aud as (
+        insert into thought_audit (thought_id, brain_id, actor, action, old_state)
+        select $1::uuid, $2::uuid, $3::jsonb, 'delete', jsonb_build_object('deleted_at', null)
+        from upd
+        returning thought_id
+      )
+      select
+        (select count(*) from target) as existed,
+        (select count(*) from upd) as changed,
+        (select count(*) from aud) as audited
+    `,
+    [thoughtId, brainId, JSON.stringify(actor)],
+  );
+
+  const { existed, changed, audited } = result.rows[0];
+  if (Number(existed) === 0) {
+    throw new HttpError(404, `Thought not found: ${thoughtId}`);
+  }
+  if (Number(audited) !== Number(changed)) {
+    throw new Error(`Audit invariant violated: audited=${audited} changed=${changed}`);
+  }
+  if (Number(changed) === 0) {
+    return { success: true, thought_id: thoughtId, already_deleted: true };
+  }
+  return { success: true, thought_id: thoughtId, deleted: true };
+}
+
+// M3 D7: restore is the symmetric atomic CTE — clears deleted_at, snapshots the
+// prior tombstone time in old_state, writes an action='restore' audit row.
+async function restoreThought({ brainId, thoughtId, actor }) {
+  const result = await query(
+    `
+      with target as (
+        select id, deleted_at from thoughts
+        where id = $1::uuid and brain_id = $2::uuid
+      ),
+      upd as (
+        update thoughts set deleted_at = null, updated_at = now()
+        where id = $1::uuid and brain_id = $2::uuid and deleted_at is not null
+        returning id
+      ),
+      aud as (
+        insert into thought_audit (thought_id, brain_id, actor, action, old_state)
+        select $1::uuid, $2::uuid, $3::jsonb, 'restore',
+          jsonb_build_object('deleted_at', (select deleted_at from target))
+        from upd
+        returning thought_id
+      )
+      select
+        (select count(*) from target) as existed,
+        (select count(*) from upd) as changed,
+        (select count(*) from aud) as audited
+    `,
+    [thoughtId, brainId, JSON.stringify(actor)],
+  );
+
+  const { existed, changed, audited } = result.rows[0];
+  if (Number(existed) === 0) {
+    throw new HttpError(404, `Thought not found: ${thoughtId}`);
+  }
+  if (Number(audited) !== Number(changed)) {
+    throw new Error(`Audit invariant violated: audited=${audited} changed=${changed}`);
+  }
+  if (Number(changed) === 0) {
+    return { success: true, thought_id: thoughtId, already_live: true };
+  }
+  return { success: true, thought_id: thoughtId, restored: true };
+}
+
 async function handleSimilarThoughtLookup(args, accessContext) {
   const brains = await resolveReadBrains(accessContext, args.brain);
   const matchThreshold = args.match_threshold ?? 0.78;
@@ -1207,6 +1306,44 @@ app.post("/admin/thought/metadata", async (c) => {
       qualityScore: payload.quality_score,
       enriched: payload.enriched,
       status: payload.status,
+    });
+    return c.json(result);
+  } catch (error) {
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
+  }
+});
+
+// M3 D9: delete/restore are HTTP-only and NOT registered as MCP tools (agents
+// must not receive destructive tools). authorizeDestructive runs AFTER brain
+// resolution so 404-vs-403 ordering follows the resolved brain, and the actor it
+// returns is recorded in the audit row.
+app.post("/admin/thought/delete", async (c) => {
+  try {
+    const accessContext = await resolveAccessContext(c);
+    const payload = deleteThoughtInput.parse(await c.req.json());
+    const { brainId } = await resolveRequestBrain(accessContext, payload.brain);
+    const actor = await authorizeDestructive(accessContext, brainId, { action: "delete" });
+    const result = await softDeleteThought({
+      brainId,
+      thoughtId: payload.thought_id,
+      actor,
+    });
+    return c.json(result);
+  } catch (error) {
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
+  }
+});
+
+app.post("/admin/thought/restore", async (c) => {
+  try {
+    const accessContext = await resolveAccessContext(c);
+    const payload = restoreThoughtInput.parse(await c.req.json());
+    const { brainId } = await resolveRequestBrain(accessContext, payload.brain);
+    const actor = await authorizeDestructive(accessContext, brainId, { action: "restore" });
+    const result = await restoreThought({
+      brainId,
+      thoughtId: payload.thought_id,
+      actor,
     });
     return c.json(result);
   } catch (error) {

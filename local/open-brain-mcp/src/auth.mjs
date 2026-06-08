@@ -541,6 +541,60 @@ async function brainRef(brainId, brainSlug) {
   return { brainId, brainSlug: r.rows[0]?.slug ?? null };
 }
 
+// M3 D4/D9: authorize a destructive op (delete/restore) on a resolved brain.
+// Returns a non-null actor descriptor on allow; throws HttpError(403) on deny.
+//
+// Allow if EITHER:
+//   - accessContext.isAdmin (covers the bare legacy_admin_key AND stored is_admin
+//     keys). D9: legacy-admin destructive (delete/restore) is allowed in M3 and
+//     documented as blast radius; purge is M5 and out of scope here.
+//   - the principal is a brain OWNER of brainId, OR an estate ADMIN of the brain's
+//     estate (household). Editors/viewers/non-members are denied.
+//
+// D4.3 is resolved OWNER-ONLY for M3: there is no `created_by` column on thoughts,
+// so a creator-or-owner policy is unbuildable without one and is deferred. Add a
+// `created_by` column and widen this predicate when that decision lands.
+export async function authorizeDestructive(accessContext, brainId, { action }) {
+  const actor = {
+    auth_source: accessContext.authSource,
+    principal_id: accessContext.principalId ?? null,
+    is_admin: Boolean(accessContext.isAdmin),
+  };
+
+  if (accessContext.isAdmin === true) {
+    return actor;
+  }
+
+  if (!accessContext.principalId) {
+    throw new HttpError(403, `Not authorized to ${action} in this brain`);
+  }
+
+  const result = await query(
+    `
+      select exists (
+        select 1 from brain_memberships bm
+        where bm.principal_id = $1::uuid
+          and bm.brain_id = $2::uuid
+          and bm.role = 'owner'
+          and bm.is_deny = false
+      ) or exists (
+        select 1 from estate_memberships em
+        where em.principal_id = $1::uuid
+          and em.estate_id = (select household_id from brains where id = $2::uuid)
+          and em.role = 'admin'
+          and em.is_deny = false
+      ) as allowed
+    `,
+    [accessContext.principalId, brainId],
+  );
+
+  if (!result.rows[0]?.allowed) {
+    throw new HttpError(403, `Not authorized to ${action} in this brain`);
+  }
+
+  return actor;
+}
+
 export async function resolveReadBrains(accessContext, brainArg) {
   const selector = typeof brainArg === "string" ? brainArg.trim() : brainArg;
   if (selector) {
