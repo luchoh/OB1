@@ -302,6 +302,10 @@ export async function ensureGraphSchema(database = config.graph.database) {
   ensuredSchemas.add(database);
 }
 
+// D2.1: deleted_at is part of the revision digest so soft-delete AND restore are
+// detected deterministically (not via the fragile updated_at trigger path). Adding
+// this segment changes every existing thought's revision hash once -> a one-time,
+// benign full re-MERGE of live nodes on the next pass. The re-MERGE is idempotent.
 function projectionRevisionSql() {
   return `
     encode(
@@ -311,6 +315,7 @@ function projectionRevisionSql() {
         coalesce(t.content_hash, '') || '|' ||
         coalesce(t.metadata::text, '') || '|' ||
         coalesce(t.updated_at::text, '') || '|' ||
+        coalesce(t.deleted_at::text, '') || '|' ||
         $6::text || '|' ||
         $7::text,
         'sha256'
@@ -341,6 +346,7 @@ async function fetchProjectionCandidates({
           t.metadata,
           t.created_at,
           t.updated_at,
+          t.deleted_at,
           ${revisionSql} as projection_revision_hash,
           gps.projection_revision_hash as projected_revision_hash,
           gps.last_projection_status
@@ -1525,6 +1531,42 @@ async function upsertEdge(tx, edge) {
   );
 }
 
+// D2.2 + D2.4: remove a soft-deleted thought's node from the graph and drop its
+// projection_state row. Returns { action: 'deleted' | 'skipped' }.
+async function deleteThoughtProjection(row, database) {
+  // D2.4 restore-vs-projector race: re-check deleted_at immediately before the
+  // write. If the row was restored mid-flight (deleted_at is now NULL), do NOT
+  // delete anything — the live branch will (re-)project it on a later pass.
+  const recheck = await query(
+    `select deleted_at from thoughts where id = $1`,
+    [row.id],
+  );
+  if (!recheck.rows[0] || recheck.rows[0].deleted_at === null) {
+    return { action: "skipped" };
+  }
+
+  // DETACH DELETE removes the Thought node + ITS edges but leaves shared neighbour
+  // nodes (Concept/Person) intact — they are shared, so that is correct.
+  await writeGraph(
+    (tx) =>
+      tx.run("MATCH (n:Thought {canonical_id: $cid}) DETACH DELETE n", {
+        cid: canonicalThoughtId(row),
+      }),
+    database,
+  );
+
+  // DELETE the state row (not a status flag): a lingering row keeps the
+  // FROM-thoughts candidate join alive and would never re-enter the candidate set
+  // after a restore. Removing it makes a restored thought re-appear (gps null).
+  await query(
+    `delete from thought_graph_projection_state
+       where thought_id = $1 and graph_database = $2`,
+    [row.id, database],
+  );
+
+  return { action: "deleted" };
+}
+
 async function projectThoughtRow(row, database, schemaVariant) {
   const plan = buildProjectionPlan(row, schemaVariant);
   await writeGraph(async (tx) => {
@@ -1567,12 +1609,35 @@ export async function projectThoughts({
     schema_variant: normalizeGraphSchemaVariant(schemaVariant),
     fetched: rows.length,
     projected: 0,
+    deleted: 0,
+    skipped: 0,
     failed: 0,
     failures: [],
   };
 
   for (const row of rows) {
     try {
+      // D2: a tombstone (deleted_at set) is still a candidate; remove its node and
+      // state row here. recordProjectionState is intentionally skipped — re-inserting
+      // a state row would pin a deleted thought out of the candidate set.
+      if (row.deleted_at) {
+        const outcome = await deleteThoughtProjection(row, database);
+        if (outcome.action === "deleted") {
+          summary.deleted += 1;
+          if (verbose) {
+            console.log(`deleted thought projection ${row.id} (${row.dedupe_key})`);
+          }
+        } else {
+          // skipped: restored mid-flight (D2.4). The now-live row already matches
+          // its prior projected state, or re-enters candidates if content changed.
+          summary.skipped += 1;
+          if (verbose) {
+            console.log(`skipped delete (restored mid-flight) ${row.id}`);
+          }
+        }
+        continue;
+      }
+
       await projectThoughtRow(row, database, schemaVariant);
       await recordProjectionState({
         thoughtId: row.id,
