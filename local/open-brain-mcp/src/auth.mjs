@@ -595,6 +595,31 @@ export async function authorizeDestructive(accessContext, brainId, { action }) {
   return actor;
 }
 
+// M5 D7/D9: authorize a PURGE (hard erasure) on a resolved brain. Purge is
+// STRICTER than delete/restore: it is admin-only AND forbids the bare legacy key.
+//
+// D9 distinguishes the two admin shapes: the bare MCP_ACCESS_KEY resolves to
+// authSource='legacy_admin_key' with principalId=null (global, cross-household,
+// unattributable) — FORBIDDEN for purge. A named stored is_admin key resolves to
+// authSource='service_key', isAdmin=true, with a non-null principalId — the only
+// caller allowed to purge. Owners can soft-delete but NOT purge; editors/viewers
+// are denied. Returns the same actor descriptor shape as authorizeDestructive.
+export function authorizePurge(accessContext, brainId) {
+  if (
+    accessContext.isAdmin === true
+    && accessContext.authSource === "service_key"
+    && accessContext.principalId
+  ) {
+    return {
+      auth_source: accessContext.authSource,
+      principal_id: accessContext.principalId,
+      is_admin: true,
+    };
+  }
+
+  throw new HttpError(403, "Not authorized to purge in this brain");
+}
+
 export async function resolveReadBrains(accessContext, brainArg) {
   const selector = typeof brainArg === "string" ? brainArg.trim() : brainArg;
   if (selector) {

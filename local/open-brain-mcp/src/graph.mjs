@@ -2382,6 +2382,88 @@ export async function sourceLineage({
   });
 }
 
+// M5 D7: DETACH DELETE a single Thought node by canonical_id. Used by the purge
+// handler BEFORE the Postgres hard-delete: if Neo4j is unreachable this REJECTS
+// (writeGraph propagates), the caller aborts, and the PG pointer survives. Leaves
+// shared neighbour nodes (Concept/Person/...) intact — DETACH only drops the
+// Thought's own edges. The targeted `database` lets a test force an outage by
+// pointing at a non-existent graph database.
+export async function purgeThoughtNode(canonicalId, database = config.graph.database) {
+  await writeGraph(
+    (tx) => tx.run("MATCH (n:Thought {canonical_id: $cid}) DETACH DELETE n", { cid: canonicalId }),
+    database,
+  );
+}
+
+// M5 D8: orphan reconcile. The projection_state FK cascade destroys the PG
+// pointer when a thought is hard-deleted, so the worst orphans (Neo4j Thought
+// node, no live PG row) can ONLY be found by scanning Neo4j. Enumerate Thought
+// nodes, extract each uuid from 'thought:<uuid>', resolve the LIVE set in one PG
+// round-trip (deleted_at is null), and DETACH DELETE every node whose uuid is
+// absent from live (no row OR soft-deleted). Shared Concept/Person nodes are not
+// Thought-labeled and are never touched.
+//
+// The scan paginates with SKIP/LIMIT (batchSize per round) and reads the ENTIRE
+// graph by default — a no-arg call performs a COMPLETE one-time sweep rather than
+// silently truncating at the first batch. The read phase deletes nothing, so SKIP
+// stays stable; orphans are removed only after the full set is resolved against PG.
+export async function reconcileGraphOrphans({
+  database = config.graph.database,
+  batchSize = 1000,
+} = {}) {
+  if (!graphEnabled()) {
+    throw new Error("Graph integration is disabled");
+  }
+
+  await ensureGraphDatabaseExists(database);
+
+  const scanned = [];
+  const uuidByCid = new Map();
+  for (let skip = 0; ; skip += batchSize) {
+    const scanResult = await runGraph(
+      "MATCH (n:Thought) RETURN n.canonical_id AS cid ORDER BY n.canonical_id SKIP $skip LIMIT $limit",
+      { skip: neo4j.int(skip), limit: neo4j.int(batchSize) },
+      { database, mode: "READ" },
+    );
+    for (const record of scanResult.records) {
+      const cid = record.get("cid");
+      if (typeof cid !== "string") {
+        continue;
+      }
+      scanned.push(cid);
+      const uuid = thoughtUuidFromCanonicalId(cid);
+      if (uuid) {
+        uuidByCid.set(cid, uuid);
+      }
+    }
+    if (scanResult.records.length < batchSize) {
+      break;
+    }
+  }
+
+  // Resolve the live set: a thought is live iff it has a PG row with deleted_at
+  // null. Absent rows and soft-deleted rows are both orphans in the graph.
+  const liveUuids = await fetchLiveThoughtUuids(new Set(uuidByCid.values()));
+
+  const removed = [];
+  for (const cid of scanned) {
+    const uuid = uuidByCid.get(cid);
+    // A node whose canonical_id has no parseable uuid cannot be a live thought;
+    // fail closed and remove it (graph residue from a malformed projection).
+    if (uuid && liveUuids.has(uuid)) {
+      continue;
+    }
+    await purgeThoughtNode(cid, database);
+    removed.push(cid);
+  }
+
+  return {
+    scanned: scanned.length,
+    orphansRemoved: removed.length,
+    removed,
+  };
+}
+
 export function startGraphProjectorLoop() {
   if (!graphEnabled() || config.graph.projectorIntervalSeconds <= 0 || projectorTimer) {
     return;

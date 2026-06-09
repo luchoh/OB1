@@ -2,13 +2,15 @@ import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
-import { HttpError, authorizeDestructive, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
+import { HttpError, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
 import { config } from "./config.mjs";
 import { closePool, formatVector, healthcheckDatabase, query } from "./db.mjs";
 import {
   graphNeighbors,
   graphProjectionStats,
   healthcheckGraph,
+  purgeThoughtNode,
+  reconcileGraphOrphans,
   sourceLineage,
   whyConnected,
 } from "./graph.mjs";
@@ -107,6 +109,26 @@ const restoreThoughtSchema = {
   brain: z.string().optional().describe("Optional brain the thought lives in (slug or UUID). Defaults to the principal's default brain."),
 };
 const restoreThoughtInput = z.object(restoreThoughtSchema);
+
+// M5 D7/D9: purge (hard erasure) is HTTP-only, admin-only, single thought_id, and
+// requires a confirmation arg (expected content_hash and/or dedupe_key) so a wrong
+// id fails closed. The refine enforces "at least one confirmation present".
+const purgeThoughtSchema = {
+  thought_id: z.string().uuid().describe("Canonical OB1 thought UUID to purge (hard erase)."),
+  brain: z.string().optional().describe("Optional brain the thought lives in (slug or UUID). Defaults to the principal's default brain."),
+  expected_content_hash: z.string().optional().describe("D9 confirmation: the thought's current content_hash. Must match or the purge aborts. At least one of expected_content_hash / expected_dedupe_key is required."),
+  expected_dedupe_key: z.string().optional().describe("D9 confirmation: the thought's current dedupe_key. Must match or the purge aborts. At least one of expected_content_hash / expected_dedupe_key is required."),
+};
+const purgeThoughtInput = z
+  .object(purgeThoughtSchema)
+  .refine(
+    (v) => v.expected_content_hash !== undefined || v.expected_dedupe_key !== undefined,
+    { message: "at least one of expected_content_hash or expected_dedupe_key is required" },
+  );
+
+const reconcileOrphansInput = z.object({
+  batch_size: z.number().int().min(1).max(10000).optional().describe("Per-round page size for the Neo4j scan. The sweep always covers the WHOLE graph (paginated); this only tunes the batch size, it does not cap coverage."),
+});
 
 const similarThoughtLookupSchema = {
   queries: z.array(z.string().min(1)).min(1).max(10).describe("Candidate strings to compare against the existing brain."),
@@ -789,6 +811,106 @@ async function restoreThought({ brainId, thoughtId, actor }) {
   return { success: true, thought_id: thoughtId, restored: true };
 }
 
+// M5 D7: purge is the deliberate hard erasure. Ordering is Neo4j-FIRST so a graph
+// outage aborts BEFORE the PG row (the only pointer to the node) is destroyed.
+//   a. Load the row (id AND brain_id scoped).
+//   b. If found: fail-closed confirmation check, then DETACH DELETE the node, then
+//      ONLY on success hard-delete PG + write the 'purge' audit in one atomic CTE
+//      (the projection_state FK cascade clears the state row in the same txn).
+//   c. If NOT found (PG row already gone — re-run / past raw-delete orphan): do NOT
+//      404. DETACH DELETE the node unconditionally and write an orphan 'purge'
+//      audit row. Confirmation cannot be matched (no row) so it is not required to
+//      have matched; the destructive scope is exactly the one node id.
+async function purgeThought({ brainId, thoughtId, expectedContentHash, expectedDedupeKey, actor }) {
+  const canonicalId = `thought:${thoughtId}`;
+  const graphDb = config.graph.database;
+
+  const loaded = await query(
+    `select id, brain_id, content_hash, dedupe_key, content, metadata, deleted_at
+       from thoughts where id = $1::uuid and brain_id = $2::uuid`,
+    [thoughtId, brainId],
+  );
+  const row = loaded.rows[0];
+
+  // c. Orphan path: no live PG pointer. Clean graph residue + record the purge.
+  if (!row) {
+    // The brain-scoped load missed. canonical_id is GLOBAL (not brain-scoped), so
+    // the unconditional node delete below would nuke a live thought's node — and
+    // bypass the confirmation guard — if the caller simply passed the wrong brain
+    // for a thought that is live elsewhere. Distinguish a TRUE orphan (no PG row in
+    // ANY brain) from a wrong-brain call: re-check globally and fail closed (404,
+    // matching delete/restore brain-scoped semantics) if the thought exists in
+    // another brain. Only a genuinely PG-gone id reaches the graph residue cleanup.
+    const anyBrain = await query(
+      `select 1 from thoughts where id = $1::uuid limit 1`,
+      [thoughtId],
+    );
+    if (anyBrain.rows[0]) {
+      throw new HttpError(404, `Thought not found: ${thoughtId}`);
+    }
+    await purgeThoughtNode(canonicalId, graphDb);
+    const orphanState = JSON.stringify({
+      orphan: true,
+      note: "no postgres row; graph residue purged",
+    });
+    await query(
+      `insert into thought_audit (thought_id, brain_id, actor, action, old_state)
+         values ($1::uuid, $2::uuid, $3::jsonb, 'purge', $4::jsonb)`,
+      [thoughtId, brainId, JSON.stringify(actor), orphanState],
+    );
+    return { success: true, thought_id: thoughtId, purged: true, graph_only: true };
+  }
+
+  // b. Confirmation — fail closed. A provided confirmation that does not match
+  // aborts BEFORE any delete (zod guarantees at least one is provided).
+  if (expectedContentHash !== undefined && expectedContentHash !== row.content_hash) {
+    throw new HttpError(409, "Confirmation mismatch");
+  }
+  if (expectedDedupeKey !== undefined && expectedDedupeKey !== row.dedupe_key) {
+    throw new HttpError(409, "Confirmation mismatch");
+  }
+
+  // Neo4j FIRST. If unreachable this REJECTS and propagates — the PG row is NOT
+  // yet touched, so the pointer survives (D7). Do NOT catch-and-continue.
+  await purgeThoughtNode(canonicalId, graphDb);
+
+  // old_state snapshots enough to support recovery (D5): content + metadata +
+  // hashes + tombstone time.
+  const oldState = JSON.stringify({
+    content: row.content,
+    metadata: row.metadata,
+    content_hash: row.content_hash,
+    dedupe_key: row.dedupe_key,
+    deleted_at: row.deleted_at,
+  });
+
+  const result = await query(
+    `
+      with del as (
+        delete from thoughts where id = $1::uuid and brain_id = $2::uuid
+        returning id
+      ),
+      aud as (
+        insert into thought_audit (thought_id, brain_id, actor, action, old_state)
+        select $1::uuid, $2::uuid, $3::jsonb, 'purge', $4::jsonb
+        from del
+        returning thought_id
+      )
+      select
+        (select count(*) from del) as deleted,
+        (select count(*) from aud) as audited
+    `,
+    [thoughtId, brainId, JSON.stringify(actor), oldState],
+  );
+
+  const { deleted, audited } = result.rows[0];
+  if (Number(audited) !== Number(deleted)) {
+    throw new Error(`Audit invariant violated: audited=${audited} deleted=${deleted}`);
+  }
+
+  return { success: true, thought_id: thoughtId, purged: true, graph_purged: true };
+}
+
 async function handleSimilarThoughtLookup(args, accessContext) {
   const brains = await resolveReadBrains(accessContext, args.brain);
   const matchThreshold = args.match_threshold ?? 0.78;
@@ -1346,6 +1468,42 @@ app.post("/admin/thought/restore", async (c) => {
       actor,
     });
     return c.json(result);
+  } catch (error) {
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
+  }
+});
+
+// M5 D7/D9: purge is HTTP-only and NOT an MCP tool. authorizePurge is STRICTER
+// than authorizeDestructive — admin-only AND forbids the bare legacy key — and
+// runs AFTER brain resolution so the actor it returns matches the resolved brain.
+app.post("/admin/thought/purge", async (c) => {
+  try {
+    const accessContext = await resolveAccessContext(c);
+    const payload = purgeThoughtInput.parse(await c.req.json());
+    const { brainId } = await resolveRequestBrain(accessContext, payload.brain);
+    const actor = authorizePurge(accessContext, brainId);
+    const result = await purgeThought({
+      brainId,
+      thoughtId: payload.thought_id,
+      expectedContentHash: payload.expected_content_hash,
+      expectedDedupeKey: payload.expected_dedupe_key,
+      actor,
+    });
+    return c.json(result);
+  } catch (error) {
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
+  }
+});
+
+// M5 D8: graph orphan reconcile. Admin-only, non-legacy (authorizePurge-level).
+// The recurring drift sweep AND the one-time past-debris cleanup. Not an MCP tool.
+app.post("/admin/graph/reconcile-orphans", async (c) => {
+  try {
+    const accessContext = await resolveAccessContext(c);
+    const payload = reconcileOrphansInput.parse(await c.req.json());
+    authorizePurge(accessContext, accessContext.effectiveBrainId);
+    const result = await reconcileGraphOrphans({ batchSize: payload.batch_size });
+    return c.json({ success: true, ...result });
   } catch (error) {
     return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
