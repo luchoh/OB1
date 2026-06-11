@@ -4,7 +4,16 @@ import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
 import { HttpError, authorizeWrite, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
 import { config } from "./config.mjs";
-import { closePool, formatVector, healthcheckDatabase, query } from "./db.mjs";
+import { closePool, healthcheckDatabase, query } from "./db.mjs";
+import {
+  captureThought,
+  patchThoughtMetadata,
+  softDeleteThought,
+  restoreThought,
+  purgeThought,
+  brainStats,
+  ThoughtStoreError,
+} from "./thought-store.mjs";
 import {
   graphNeighbors,
   graphProjectionStats,
@@ -210,9 +219,19 @@ function routeBrainSlug(c) {
   }
 }
 
+// Thought-store refusals are data with a `kind`; the transport owns the mapping.
+const STORE_ERROR_STATUS = {
+  not_found: 404,
+  confirmation_mismatch: 409,
+  audit_invariant: 500,
+};
+
 function errorStatus(error) {
   if (error instanceof HttpError) {
     return error.status;
+  }
+  if (error instanceof ThoughtStoreError) {
+    return STORE_ERROR_STATUS[error.kind] ?? 500;
   }
   if (error instanceof z.ZodError) {
     return 400;
@@ -288,69 +307,6 @@ function hasExplicitSearchRole(filter) {
       || Object.prototype.hasOwnProperty.call(filter, "retrieval_role"));
 }
 
-async function upsertThought({ brainId, content, embedding, metadata, dedupeKey }) {
-  const typeValue = typeof metadata?.type === "string" && metadata.type.trim()
-    ? metadata.type.trim()
-    : null;
-  const result = await query(
-    `
-      insert into thoughts (
-        brain_id,
-        content,
-        embedding,
-        embedding_model,
-        embedding_dimension,
-        dedupe_key,
-        metadata,
-        type
-      )
-      values (
-        $1::uuid,
-        $2,
-        $3::vector,
-        $4,
-        $5,
-        coalesce($6, encode(digest($2, 'sha256'), 'hex')),
-        $7::jsonb,
-        $8
-      )
-      on conflict (brain_id, dedupe_key) where deleted_at is null
-      do update set
-        content = excluded.content,
-        embedding = excluded.embedding,
-        embedding_model = excluded.embedding_model,
-        embedding_dimension = excluded.embedding_dimension,
-        metadata = thoughts.metadata || excluded.metadata,
-        type = coalesce(excluded.type, thoughts.type),
-        updated_at = now()
-      returning
-        id,
-        brain_id,
-        content,
-        dedupe_key,
-        content_hash,
-        embedding_model,
-        embedding_dimension,
-        metadata,
-        type,
-        created_at,
-        updated_at
-    `,
-    [
-      brainId,
-      content,
-      formatVector(embedding),
-      config.embeddingModel,
-      embedding.length,
-      dedupeKey ?? null,
-      JSON.stringify(metadata),
-      typeValue,
-    ],
-  );
-
-  return result.rows[0];
-}
-
 async function handleCaptureThought(args, accessContext) {
   const { brainId } = await resolveRequestBrain(accessContext, args.brain);
   // ADR-0002 write ladder: capture is a WRITE. Authorize before doing any work.
@@ -388,10 +344,11 @@ async function handleCaptureThought(args, accessContext) {
       : null,
   });
 
-  const thought = await upsertThought({
+  const thought = await captureThought({
     brainId,
     content,
     embedding: embeddingResult.value,
+    embeddingModel: config.embeddingModel,
     metadata: normalizedMetadata,
     dedupeKey: args.dedupe_key,
   });
@@ -630,291 +587,6 @@ async function handleAskBrain(args, accessContext) {
   }
 }
 
-async function updateThoughtMetadata({
-  brainId,
-  thoughtId,
-  metadataPatch,
-  type,
-  sourceType,
-  sensitivityTier,
-  importance,
-  qualityScore,
-  enriched,
-  status,
-}) {
-  const setClauses = [];
-  const params = [thoughtId, brainId];
-  let paramIndex = 3;
-
-  if (metadataPatch !== undefined) {
-    params.push(JSON.stringify(metadataPatch));
-    setClauses.push(`metadata = (
-      thoughts.metadata
-      || ($${paramIndex}::jsonb - 'user_metadata')
-      || case
-        when $${paramIndex}::jsonb ? 'user_metadata' then jsonb_build_object(
-          'user_metadata',
-          coalesce(thoughts.metadata->'user_metadata', '{}'::jsonb)
-          || coalesce($${paramIndex}::jsonb->'user_metadata', '{}'::jsonb)
-        )
-        else '{}'::jsonb
-      end
-    )`);
-    paramIndex++;
-  }
-
-  const structured = [
-    ["type", type, "text"],
-    ["source_type", sourceType, "text"],
-    ["sensitivity_tier", sensitivityTier, "text"],
-    ["importance", importance, "smallint"],
-    ["quality_score", qualityScore, "numeric(5,2)"],
-    ["enriched", enriched, "boolean"],
-    ["status", status, "text"],
-  ];
-
-  for (const [column, value, cast] of structured) {
-    if (value === undefined) {
-      continue;
-    }
-    params.push(value);
-    setClauses.push(`${column} = $${paramIndex}::${cast}`);
-    paramIndex++;
-  }
-
-  if (status !== undefined) {
-    setClauses.push("status_updated_at = now()");
-  }
-  setClauses.push("updated_at = now()");
-
-  const result = await query(
-    `
-      update thoughts
-      set ${setClauses.join(",\n        ")}
-      where id = $1::uuid
-        and brain_id = $2::uuid
-        and deleted_at is null
-      returning
-        id,
-        metadata,
-        type,
-        source_type,
-        sensitivity_tier,
-        importance,
-        quality_score,
-        enriched,
-        status,
-        updated_at
-    `,
-    params,
-  );
-
-  if (result.rowCount !== 1) {
-    // v24 D2: a thought absent from the chosen brain is a not-found (404),
-    // not an unhandled 500. errorStatus only preserves HttpError statuses.
-    throw new HttpError(404, `Thought not found: ${thoughtId}`);
-  }
-
-  return {
-    success: true,
-    thought_id: result.rows[0].id,
-    metadata: result.rows[0].metadata,
-    type: result.rows[0].type,
-    source_type: result.rows[0].source_type,
-    sensitivity_tier: result.rows[0].sensitivity_tier,
-    importance: result.rows[0].importance,
-    quality_score: result.rows[0].quality_score,
-    enriched: result.rows[0].enriched,
-    status: result.rows[0].status,
-    updated_at: result.rows[0].updated_at,
-  };
-}
-
-// M3 D6/D7: soft-delete is ATOMIC in a single-statement CTE (db.mjs exposes no
-// transaction helper). Keyed on (thought_id, brain_id) — NEVER dedupe_key (D6:
-// tombstone + live row may share a key). Idempotent: a second delete is a 200 with
-// already_deleted and NO new audit row.
-async function softDeleteThought({ brainId, thoughtId, actor }) {
-  const result = await query(
-    `
-      with target as (
-        select id, deleted_at from thoughts
-        where id = $1::uuid and brain_id = $2::uuid
-      ),
-      upd as (
-        update thoughts set deleted_at = now(), updated_at = now()
-        where id = $1::uuid and brain_id = $2::uuid and deleted_at is null
-        returning id
-      ),
-      aud as (
-        insert into thought_audit (thought_id, brain_id, actor, action, old_state)
-        select $1::uuid, $2::uuid, $3::jsonb, 'delete', jsonb_build_object('deleted_at', null)
-        from upd
-        returning thought_id
-      )
-      select
-        (select count(*) from target) as existed,
-        (select count(*) from upd) as changed,
-        (select count(*) from aud) as audited
-    `,
-    [thoughtId, brainId, JSON.stringify(actor)],
-  );
-
-  const { existed, changed, audited } = result.rows[0];
-  if (Number(existed) === 0) {
-    throw new HttpError(404, `Thought not found: ${thoughtId}`);
-  }
-  if (Number(audited) !== Number(changed)) {
-    throw new Error(`Audit invariant violated: audited=${audited} changed=${changed}`);
-  }
-  if (Number(changed) === 0) {
-    return { success: true, thought_id: thoughtId, already_deleted: true };
-  }
-  return { success: true, thought_id: thoughtId, deleted: true };
-}
-
-// M3 D7: restore is the symmetric atomic CTE — clears deleted_at, snapshots the
-// prior tombstone time in old_state, writes an action='restore' audit row.
-async function restoreThought({ brainId, thoughtId, actor }) {
-  const result = await query(
-    `
-      with target as (
-        select id, deleted_at from thoughts
-        where id = $1::uuid and brain_id = $2::uuid
-      ),
-      upd as (
-        update thoughts set deleted_at = null, updated_at = now()
-        where id = $1::uuid and brain_id = $2::uuid and deleted_at is not null
-        returning id
-      ),
-      aud as (
-        insert into thought_audit (thought_id, brain_id, actor, action, old_state)
-        select $1::uuid, $2::uuid, $3::jsonb, 'restore',
-          jsonb_build_object('deleted_at', (select deleted_at from target))
-        from upd
-        returning thought_id
-      )
-      select
-        (select count(*) from target) as existed,
-        (select count(*) from upd) as changed,
-        (select count(*) from aud) as audited
-    `,
-    [thoughtId, brainId, JSON.stringify(actor)],
-  );
-
-  const { existed, changed, audited } = result.rows[0];
-  if (Number(existed) === 0) {
-    throw new HttpError(404, `Thought not found: ${thoughtId}`);
-  }
-  if (Number(audited) !== Number(changed)) {
-    throw new Error(`Audit invariant violated: audited=${audited} changed=${changed}`);
-  }
-  if (Number(changed) === 0) {
-    return { success: true, thought_id: thoughtId, already_live: true };
-  }
-  return { success: true, thought_id: thoughtId, restored: true };
-}
-
-// M5 D7: purge is the deliberate hard erasure. Ordering is Neo4j-FIRST so a graph
-// outage aborts BEFORE the PG row (the only pointer to the node) is destroyed.
-//   a. Load the row (id AND brain_id scoped).
-//   b. If found: fail-closed confirmation check, then DETACH DELETE the node, then
-//      ONLY on success hard-delete PG + write the 'purge' audit in one atomic CTE
-//      (the projection_state FK cascade clears the state row in the same txn).
-//   c. If NOT found (PG row already gone — re-run / past raw-delete orphan): do NOT
-//      404. DETACH DELETE the node unconditionally and write an orphan 'purge'
-//      audit row. Confirmation cannot be matched (no row) so it is not required to
-//      have matched; the destructive scope is exactly the one node id.
-async function purgeThought({ brainId, thoughtId, expectedContentHash, expectedDedupeKey, actor }) {
-  const canonicalId = `thought:${thoughtId}`;
-  const graphDb = config.graph.database;
-
-  const loaded = await query(
-    `select id, brain_id, content_hash, dedupe_key, content, metadata, deleted_at
-       from thoughts where id = $1::uuid and brain_id = $2::uuid`,
-    [thoughtId, brainId],
-  );
-  const row = loaded.rows[0];
-
-  // c. Orphan path: no live PG pointer. Clean graph residue + record the purge.
-  if (!row) {
-    // The brain-scoped load missed. canonical_id is GLOBAL (not brain-scoped), so
-    // the unconditional node delete below would nuke a live thought's node — and
-    // bypass the confirmation guard — if the caller simply passed the wrong brain
-    // for a thought that is live elsewhere. Distinguish a TRUE orphan (no PG row in
-    // ANY brain) from a wrong-brain call: re-check globally and fail closed (404,
-    // matching delete/restore brain-scoped semantics) if the thought exists in
-    // another brain. Only a genuinely PG-gone id reaches the graph residue cleanup.
-    const anyBrain = await query(
-      `select 1 from thoughts where id = $1::uuid limit 1`,
-      [thoughtId],
-    );
-    if (anyBrain.rows[0]) {
-      throw new HttpError(404, `Thought not found: ${thoughtId}`);
-    }
-    await purgeThoughtNode(canonicalId, graphDb);
-    const orphanState = JSON.stringify({
-      orphan: true,
-      note: "no postgres row; graph residue purged",
-    });
-    await query(
-      `insert into thought_audit (thought_id, brain_id, actor, action, old_state)
-         values ($1::uuid, $2::uuid, $3::jsonb, 'purge', $4::jsonb)`,
-      [thoughtId, brainId, JSON.stringify(actor), orphanState],
-    );
-    return { success: true, thought_id: thoughtId, purged: true, graph_only: true };
-  }
-
-  // b. Confirmation — fail closed. A provided confirmation that does not match
-  // aborts BEFORE any delete (zod guarantees at least one is provided).
-  if (expectedContentHash !== undefined && expectedContentHash !== row.content_hash) {
-    throw new HttpError(409, "Confirmation mismatch");
-  }
-  if (expectedDedupeKey !== undefined && expectedDedupeKey !== row.dedupe_key) {
-    throw new HttpError(409, "Confirmation mismatch");
-  }
-
-  // Neo4j FIRST. If unreachable this REJECTS and propagates — the PG row is NOT
-  // yet touched, so the pointer survives (D7). Do NOT catch-and-continue.
-  await purgeThoughtNode(canonicalId, graphDb);
-
-  // old_state snapshots enough to support recovery (D5): content + metadata +
-  // hashes + tombstone time.
-  const oldState = JSON.stringify({
-    content: row.content,
-    metadata: row.metadata,
-    content_hash: row.content_hash,
-    dedupe_key: row.dedupe_key,
-    deleted_at: row.deleted_at,
-  });
-
-  const result = await query(
-    `
-      with del as (
-        delete from thoughts where id = $1::uuid and brain_id = $2::uuid
-        returning id
-      ),
-      aud as (
-        insert into thought_audit (thought_id, brain_id, actor, action, old_state)
-        select $1::uuid, $2::uuid, $3::jsonb, 'purge', $4::jsonb
-        from del
-        returning thought_id
-      )
-      select
-        (select count(*) from del) as deleted,
-        (select count(*) from aud) as audited
-    `,
-    [thoughtId, brainId, JSON.stringify(actor), oldState],
-  );
-
-  const { deleted, audited } = result.rows[0];
-  if (Number(audited) !== Number(deleted)) {
-    throw new Error(`Audit invariant violated: audited=${audited} deleted=${deleted}`);
-  }
-
-  return { success: true, thought_id: thoughtId, purged: true, graph_purged: true };
-}
-
 async function handleSimilarThoughtLookup(args, accessContext) {
   const brains = await resolveReadBrains(accessContext, args.brain);
   const matchThreshold = args.match_threshold ?? 0.78;
@@ -989,55 +661,6 @@ export async function handleListThoughts(args, accessContext) {
     brains_listed: brains.length,
     count: thoughts.length,
     thoughts,
-  };
-}
-
-async function brainStats(brainId) {
-  const [overviewResult, sourceCounts, typeCounts, peopleCounts] = await Promise.all([
-    query("select * from thoughts_stats($1::uuid)", [brainId]),
-    query(`
-      select
-        coalesce(metadata->>'source', 'unknown') as source,
-        count(*)::bigint as count
-      from thoughts
-      where brain_id = $1::uuid
-        and deleted_at is null
-      group by 1
-      order by count desc, source asc
-      limit 10
-    `, [brainId]),
-    query(`
-      select
-        coalesce(metadata->>'type', 'unknown') as type,
-        count(*)::bigint as count
-      from thoughts
-      where brain_id = $1::uuid
-        and deleted_at is null
-      group by 1
-      order by count desc, type asc
-      limit 10
-    `, [brainId]),
-    query(`
-      select
-        person,
-        count(*)::bigint as count
-      from (
-        select jsonb_array_elements_text(coalesce(metadata->'people', '[]'::jsonb)) as person
-        from thoughts
-        where brain_id = $1::uuid
-          and deleted_at is null
-      ) people
-      group by person
-      order by count desc, person asc
-      limit 10
-    `, [brainId]),
-  ]);
-
-  return {
-    overview: overviewResult.rows[0] ?? null,
-    top_sources: sourceCounts.rows,
-    top_types: typeCounts.rows,
-    top_people: peopleCounts.rows,
   };
 }
 
@@ -1416,6 +1039,24 @@ app.post("/ask", async (c) => {
   }
 });
 
+// Map a Thought-store lifecycle outcome to the wire response shape (docs/32 D9:
+// wire shapes are law; the store returns transport-agnostic { thoughtId, outcome }).
+function deleteResponse({ thoughtId, outcome }) {
+  return outcome === "deleted"
+    ? { success: true, thought_id: thoughtId, deleted: true }
+    : { success: true, thought_id: thoughtId, already_deleted: true };
+}
+function restoreResponse({ thoughtId, outcome }) {
+  return outcome === "restored"
+    ? { success: true, thought_id: thoughtId, restored: true }
+    : { success: true, thought_id: thoughtId, already_live: true };
+}
+function purgeResponse({ thoughtId, outcome }) {
+  return outcome === "purged"
+    ? { success: true, thought_id: thoughtId, purged: true, graph_purged: true }
+    : { success: true, thought_id: thoughtId, purged: true, graph_only: true };
+}
+
 app.post("/admin/thought/metadata", async (c) => {
   try {
     const accessContext = await resolveAccessContext(c);
@@ -1426,7 +1067,7 @@ app.post("/admin/thought/metadata", async (c) => {
     // mutate via the metadata path). Runs before the thought lookup, so an
     // unauthorized caller gets 403, not a 404 leak.
     await authorizeWrite(accessContext, brainId);
-    const result = await updateThoughtMetadata({
+    const row = await patchThoughtMetadata({
       brainId,
       thoughtId: payload.thought_id,
       metadataPatch: payload.metadata_patch,
@@ -1438,7 +1079,19 @@ app.post("/admin/thought/metadata", async (c) => {
       enriched: payload.enriched,
       status: payload.status,
     });
-    return c.json(result);
+    return c.json({
+      success: true,
+      thought_id: row.id,
+      metadata: row.metadata,
+      type: row.type,
+      source_type: row.source_type,
+      sensitivity_tier: row.sensitivity_tier,
+      importance: row.importance,
+      quality_score: row.quality_score,
+      enriched: row.enriched,
+      status: row.status,
+      updated_at: row.updated_at,
+    });
   } catch (error) {
     return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
@@ -1459,7 +1112,7 @@ app.post("/admin/thought/delete", async (c) => {
       thoughtId: payload.thought_id,
       actor,
     });
-    return c.json(result);
+    return c.json(deleteResponse(result));
   } catch (error) {
     return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
@@ -1476,7 +1129,7 @@ app.post("/admin/thought/restore", async (c) => {
       thoughtId: payload.thought_id,
       actor,
     });
-    return c.json(result);
+    return c.json(restoreResponse(result));
   } catch (error) {
     return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
@@ -1497,8 +1150,11 @@ app.post("/admin/thought/purge", async (c) => {
       expectedContentHash: payload.expected_content_hash,
       expectedDedupeKey: payload.expected_dedupe_key,
       actor,
+      // docs/32 D7: the store owns the Neo4j-first ordering; the handler supplies
+      // the graph DETACH-DELETE (driver + graph database name live here).
+      purgeGraphNode: (canonicalId) => purgeThoughtNode(canonicalId, config.graph.database),
     });
-    return c.json(result);
+    return c.json(purgeResponse(result));
   } catch (error) {
     return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }

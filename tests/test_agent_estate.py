@@ -378,6 +378,63 @@ class AgentEstateAcceptance(unittest.TestCase):
         )
         self.assertEqual(status, 403)
 
+    # --- module-2 Stage-2: pin the Thought-store rewire's wire shapes end-to-end.
+    # The store returns {thoughtId, outcome}; the handlers must reproduce the exact
+    # legacy responses. These endpoints were previously uncovered by acceptance.
+
+    def test_delete_restore_wire_shapes_and_idempotency(self):
+        _, body = _post("/ingest/thought", {"content": "del-restore target", "extract_metadata": False, "brain": B_DEF})
+        tid = body["thought"]["id"]
+
+        s, b = _post("/admin/thought/delete", {"thought_id": tid, "brain": B_DEF})
+        self.assertEqual(s, 200)
+        self.assertEqual(b.get("deleted"), True)
+
+        s, b = _post("/admin/thought/delete", {"thought_id": tid, "brain": B_DEF})
+        self.assertEqual(s, 200)
+        self.assertEqual(b.get("already_deleted"), True, "idempotent second delete")
+
+        s, b = _post("/admin/thought/restore", {"thought_id": tid, "brain": B_DEF})
+        self.assertEqual(s, 200)
+        self.assertEqual(b.get("restored"), True)
+
+        s, b = _post("/admin/thought/restore", {"thought_id": tid, "brain": B_DEF})
+        self.assertEqual(s, 200)
+        self.assertEqual(b.get("already_live"), True, "idempotent second restore")
+
+    def test_purge_wire_shape(self):
+        # Purge needs a named admin service key (KEY_ADMIN) + a confirmation arg.
+        # Capture via the admin (home-estate write reach), then purge it.
+        _, body = _post(
+            "/ingest/thought",
+            {"content": "purge target zzt", "extract_metadata": False, "brain": B_DEF},
+            key=KEY_ADMIN,
+        )
+        tid = body["thought"]["id"]
+        chash = body["thought"]["content_hash"]
+        s, b = _post(
+            "/admin/thought/purge",
+            {"thought_id": tid, "brain": B_DEF, "expected_content_hash": chash},
+            key=KEY_ADMIN,
+        )
+        self.assertEqual(s, 200)
+        self.assertEqual(b.get("purged"), True)
+        self.assertEqual(b.get("graph_purged"), True)
+
+    def test_purge_confirmation_mismatch_409(self):
+        _, body = _post(
+            "/ingest/thought",
+            {"content": "purge mismatch zzt", "extract_metadata": False, "brain": B_DEF},
+            key=KEY_ADMIN,
+        )
+        tid = body["thought"]["id"]
+        s, _ = _post(
+            "/admin/thought/purge",
+            {"thought_id": tid, "brain": B_DEF, "expected_content_hash": "definitely-wrong"},
+            key=KEY_ADMIN,
+        )
+        self.assertEqual(s, 409, "ThoughtStoreError.confirmation_mismatch -> 409")
+
 
 if __name__ == "__main__":
     unittest.main()

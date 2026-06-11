@@ -1,5 +1,6 @@
 import { config } from "./config.mjs";
 import { query, formatVector } from "./db.mjs";
+import { readThoughtRowsByIds } from "./thought-store.mjs";
 import { graphThoughtNeighbors } from "./graph.mjs";
 import { loadGraphRetrievalPolicyState } from "./graph-retrieval-policy.mjs";
 import { createEmbedding } from "./models.mjs";
@@ -300,61 +301,11 @@ function canonicalKind(canonicalId) {
   return "unknown";
 }
 
-export async function fetchThoughtRowsByIds({ brainId, ids, filter, embedding }) {
-  if (!brainId) {
-    throw new Error("brainId is required for fetchThoughtRowsByIds");
-  }
-  if (!Array.isArray(ids) || ids.length === 0) {
-    return [];
-  }
-
-  const filterJson = JSON.stringify(filter ?? {});
-  let result;
-  if (Array.isArray(embedding) && embedding.length > 0) {
-    result = await query(
-      `
-        select
-          t.id,
-          t.content,
-          t.embedding_model,
-          t.embedding_dimension,
-          t.metadata,
-          (1 - (t.embedding <=> $3::vector))::float as similarity,
-          t.created_at,
-          t.updated_at
-        from thoughts t
-        where t.id = any($1::uuid[])
-          and t.brain_id = $2::uuid
-          and t.deleted_at is null
-          and ($4::jsonb = '{}'::jsonb or t.metadata @> $4::jsonb)
-      `,
-      [ids, brainId, formatVector(embedding), filterJson],
-    );
-  } else {
-    result = await query(
-      `
-        select
-          t.id,
-          t.content,
-          t.embedding_model,
-          t.embedding_dimension,
-          t.metadata,
-          null::float as similarity,
-          t.created_at,
-          t.updated_at
-        from thoughts t
-        where t.id = any($1::uuid[])
-          and t.brain_id = $2::uuid
-          and t.deleted_at is null
-          and ($3::jsonb = '{}'::jsonb or t.metadata @> $3::jsonb)
-      `,
-      [ids, brainId, filterJson],
-    );
-  }
-
-  const byId = new Map(result.rows.map((row) => [row.id, row]));
-  return ids.map((id) => byId.get(id)).filter(Boolean);
-}
+// Live-row re-hydration by id now belongs to the Thought store (module 2): it is
+// a plain `thoughts` read whose load-bearing logic is the `deleted_at is null`
+// tombstone guard (docs/32 D3 "#1 must-not-miss"). The export name is preserved
+// so callers here and elsewhere stay unchanged.
+export const fetchThoughtRowsByIds = readThoughtRowsByIds;
 
 function seedContext(seedRows) {
   return {
