@@ -12,7 +12,9 @@ brains, principals, and memberships.
 A top-level container that groups principals and brains. Models
 either a human grouping (a household, a family) or a non-human
 grouping (a fleet of repo-scoped agents). Ownership / governance
-boundary.
+boundary — and an enforced one: cross-estate reach is membership-
+granted, never ambient (ADR-0003). No key shape except the legacy
+admin env key sees past an estate without an explicit membership row.
 _Avoid_: Household (legacy term, schema column is still `household_id`
 until rename), workspace, tenant, account.
 
@@ -46,13 +48,23 @@ _Avoid_: Bot, service account, automation, workflow.
 **Brain membership**:
 A row granting one principal access to one brain (`brain_memberships`
 table). Specific access. With ADR-0001, brain memberships also support
-DENY rows that override estate memberships.
+DENY rows that override estate memberships. Roles form a monotone
+ladder: `viewer` (read) ⊂ `editor` (read + write) ⊂ `owner` (read +
+write + delete/restore). Purge is outside the ladder entirely — it
+requires a named admin service key, never a role.
 _Avoid_: Permission, ACL, grant.
 
-**Estate membership** (forthcoming, ADR-0001):
+**Estate membership** (ADR-0001, migration 009):
 A row granting one principal access to **all brains in an estate**
-(`estate_memberships`, new table). Broad access. Subject to brain-
-level DENY override.
+(`estate_memberships` table). Broad access. Subject to brain-level
+DENY override. A row with `is_deny=true` is treated as **absent
+membership** (fail-closed): estate-level DENY is not a granted
+semantic — per ADR-0001, absence is denial — and the column exists
+only for schema parity. (Migration 009's comment says the flag is
+"not consulted"; the resolver does consult it, with exactly this
+absent-membership meaning.) Roles: `member` (read all estate brains)
+⊂ `admin` (read + write + delete/restore on all estate brains),
+always subject to brain-level DENY override.
 
 **Common brain** (forthcoming, ADR-0001):
 A specific brain in the agent estate, with brain memberships granted
@@ -60,6 +72,26 @@ to every repo principal. The "shared knowledge" destination for
 cross-cutting agent observations.
 _Avoid_: Global brain (suggests no estate ownership; common brain
 does live in an estate), shared brain (overlaps with `kind='shared_household'`).
+
+**Access policy**:
+The pure rules deciding what a principal may do: which brains are in
+scope, which are nameable (and whether a failed naming reads as
+not-found, denied, or ambiguous), and which actions — read, write,
+delete, restore, purge — are allowed. Inputs: brain memberships,
+estate memberships, the role ladder (ADR-0002), estate reach
+(ADR-0003), and caller shape. Pure decision; fetching facts and
+speaking HTTP are adapters' jobs.
+_Avoid_: Authz (vague), ACL, permissions (the rows are memberships;
+the rules are the policy).
+
+**Access key**:
+A credential identifying a principal (`brain_access_keys`, hashed).
+A key is identity plus a default-brain hint — never a permission
+clamp: capability comes from membership roles (ADR-0002), reach from
+memberships and estates (ADR-0003). The bare legacy env key is the
+one exception (global admin, unattributable, documented blast
+radius) pending retirement.
+_Avoid_: Token (overloaded with human JWTs), API key.
 
 **Capture**:
 The act of writing a thought. Today: ingest path goes through
