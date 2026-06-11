@@ -1,0 +1,415 @@
+// Access policy — the pure rules deciding what a principal may do.
+//
+// This module is the single home for OB1's permission *decisions*: which brains
+// a caller may name, which they may use, and which actions (read, write, delete,
+// restore, purge) they may perform on a resolved brain. It encodes the v24
+// decision surface as amended by ADR-0002 (the enforced monotone role ladder)
+// and ADR-0003 (estate-bound admin reach; retirement of the brain-bound-key
+// naming clamp).
+//
+// PURITY CONTRACT (the whole point of the module): no config/db/pg/jose import,
+// no I/O, no throw-for-control-flow. Inputs are plain data an adapter fetches;
+// outputs are verdict data. Refusals are returned as `denied`/`not_found`/...
+// verdicts, never thrown — throwing is reserved for programmer error (a bad
+// argument shape), which is a bug, not a control-flow path. This is what lets
+// the suite run with zero infrastructure.
+//
+// Mapping verdicts to HTTP statuses, fetching membership rows, and reading the
+// caller off the wire are the Stage-2 adapter's jobs, not this module's.
+
+// ---------------------------------------------------------------------------
+// Vocabulary (CONTEXT.md-bound)
+// ---------------------------------------------------------------------------
+
+// The five concrete actions. Rules behind the seam may coarsen, but the verbs a
+// caller authorizes against are exactly these (PRD docs/34).
+export const ACTIONS = Object.freeze({
+  READ: "read",
+  WRITE: "write",
+  DELETE: "delete",
+  RESTORE: "restore",
+  PURGE: "purge",
+});
+
+// Brain membership roles form a monotone ladder: viewer ⊂ editor ⊂ owner
+// (ADR-0002). Purge is outside the ladder entirely.
+export const BRAIN_ROLES = Object.freeze({
+  VIEWER: "viewer",
+  EDITOR: "editor",
+  OWNER: "owner",
+});
+
+// Estate membership roles: member ⊂ admin (ADR-0002).
+export const ESTATE_ROLES = Object.freeze({
+  MEMBER: "member",
+  ADMIN: "admin",
+});
+
+// Caller shapes, mirroring the auth module's authSource values.
+export const CALLER_KINDS = Object.freeze({
+  HUMAN_TOKEN: "human_token",
+  SERVICE_KEY: "service_key",
+  LEGACY_ADMIN_KEY: "legacy_admin_key",
+});
+
+// Verdict kinds. Action authorization yields ALLOW or DENIED; selector
+// resolution yields RESOLVED / NOT_FOUND / DENIED / AMBIGUOUS; comparing two
+// selectors yields SELECTOR_CONFLICT.
+export const VERDICTS = Object.freeze({
+  ALLOW: "allow",
+  DENIED: "denied",
+  RESOLVED: "resolved",
+  NOT_FOUND: "not_found",
+  AMBIGUOUS: "ambiguous",
+  SELECTOR_CONFLICT: "selector_conflict",
+});
+
+// The `reason` carried by a DENIED verdict. The Stage-2 adapter switches on
+// these to choose an HTTP status and an audit annotation, so they are a
+// contract, not free text — frozen here and asserted in the suite.
+export const DENY_REASONS = Object.freeze({
+  BRAIN_DENY: "brain_deny",
+  INSUFFICIENT_ROLE: "insufficient_role",
+  NOT_AUTHORIZED: "not_authorized",
+  LEGACY_ADMIN_CANNOT_PURGE: "legacy_admin_cannot_purge",
+  PURGE_REQUIRES_NAMED_ADMIN_SERVICE_KEY: "purge_requires_named_admin_service_key",
+});
+
+// ---------------------------------------------------------------------------
+// Verdict constructors
+// ---------------------------------------------------------------------------
+
+// `actor` is the audit descriptor a Stage-2 adapter stamps onto the write it
+// performs. Same shape the auth module's authorize* functions return today.
+function allow(actor) {
+  return { kind: VERDICTS.ALLOW, actor };
+}
+function denied(reason) {
+  return { kind: VERDICTS.DENIED, reason };
+}
+function resolved(brain) {
+  return { kind: VERDICTS.RESOLVED, brain: { brainId: brain.brainId, brainSlug: brain.brainSlug ?? null } };
+}
+function notFound() {
+  return { kind: VERDICTS.NOT_FOUND };
+}
+function ambiguous() {
+  return { kind: VERDICTS.AMBIGUOUS };
+}
+function selectorConflict() {
+  return { kind: VERDICTS.SELECTOR_CONFLICT };
+}
+
+// The audit actor descriptor for an allow verdict.
+function makeActor(caller) {
+  return {
+    auth_source: caller.kind,
+    principal_id: caller.principalId ?? null,
+    is_admin: Boolean(caller.isAdmin),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Selector classification
+// ---------------------------------------------------------------------------
+
+const BRAIN_UUID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// A selector is either a brain UUID or a brain slug. UUID-ness governs the
+// not-found-vs-denied asymmetry (see resolveSelector): a known UUID is proof
+// enough to learn a brain exists; a guessed slug is not.
+export function isBrainUuid(selector) {
+  return typeof selector === "string" && BRAIN_UUID_RE.test(selector);
+}
+
+// ---------------------------------------------------------------------------
+// Caller-shape predicates
+// ---------------------------------------------------------------------------
+
+function isLegacyAdmin(caller) {
+  return caller.kind === CALLER_KINDS.LEGACY_ADMIN_KEY;
+}
+
+// A stored is_admin key whose reach (ADR-0003) is its home estate ∪ its
+// membership-derived scope. Covers both legacy and stored admin via caller.isAdmin
+// elsewhere; this names the stored-admin case for clarity.
+function isStoredAdmin(caller) {
+  return Boolean(caller.isAdmin) && caller.kind !== CALLER_KINDS.LEGACY_ADMIN_KEY;
+}
+
+// Purge is key-shape-gated (ADR-0002 D9 / ADR-0003): a NAMED admin service key
+// only — stored is_admin, service_key shape, attributable principal. The bare
+// legacy env key (unattributable) is forbidden; estate-admin/owner roles never
+// confer purge.
+function isNamedAdminServiceKey(caller) {
+  return (
+    Boolean(caller.isAdmin) &&
+    caller.kind === CALLER_KINDS.SERVICE_KEY &&
+    caller.principalId != null
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Action authorization — the exhaustive decision core
+// ---------------------------------------------------------------------------
+
+// Capability of a principal (non-admin) on a single resolved brain, given the
+// brain role and estate role that apply to it. Roles are additive (OR), not
+// clamping: a brain `viewer` who is also estate `admin` gets the admin
+// capability. Only a brain-level DENY clamps, and that is handled before this
+// runs. estate `member` is read-only (ADR-0002).
+function principalCan(action, brainRole, estateRole) {
+  switch (action) {
+    case ACTIONS.READ:
+      return (
+        brainRole === BRAIN_ROLES.VIEWER ||
+        brainRole === BRAIN_ROLES.EDITOR ||
+        brainRole === BRAIN_ROLES.OWNER ||
+        estateRole === ESTATE_ROLES.MEMBER ||
+        estateRole === ESTATE_ROLES.ADMIN
+      );
+    case ACTIONS.WRITE:
+      return (
+        brainRole === BRAIN_ROLES.EDITOR ||
+        brainRole === BRAIN_ROLES.OWNER ||
+        estateRole === ESTATE_ROLES.ADMIN
+      );
+    case ACTIONS.DELETE:
+    case ACTIONS.RESTORE:
+      return brainRole === BRAIN_ROLES.OWNER || estateRole === ESTATE_ROLES.ADMIN;
+    case ACTIONS.PURGE:
+      // Never via a role. A principal cannot purge.
+      return false;
+    default:
+      throw new Error(`Unknown action: ${action}`);
+  }
+}
+
+// Authorize a single action on an already-resolved brain. The brain is assumed
+// in the caller's reach (selector resolution enforced that); this decides
+// *capability*. `brainMembership` / `estateMembership` describe the caller's
+// relationship to THIS brain and THIS brain's estate (or null when none).
+//
+// Inputs:
+//   caller           : { kind, principalId, isAdmin, ... }
+//   action           : one of ACTIONS
+//   brainMembership  : { role, isDeny } | null
+//   estateMembership : { role, isDeny } | null
+// Returns: allow(actor) | denied(reason)
+export function authorizeAction({ caller, action, brainMembership = null, estateMembership = null }) {
+  if (!Object.values(ACTIONS).includes(action)) {
+    throw new Error(`Unknown action: ${action}`);
+  }
+
+  const actor = makeActor(caller);
+
+  // Brain-level DENY overrides EVERYTHING (ADR-0002), including admin keys. A
+  // DENY row on the caller's own principal blocks the action even for a stored
+  // admin key. (Legacy admin has no memberships, so this never fires for it.)
+  if (brainMembership?.isDeny) {
+    return denied(DENY_REASONS.BRAIN_DENY);
+  }
+
+  // Legacy env key: the only global actor (documented blast radius). Full CRUD
+  // on its resolved brain, but NEVER purge — it is unattributable (D9).
+  if (isLegacyAdmin(caller)) {
+    if (action === ACTIONS.PURGE) {
+      return denied(DENY_REASONS.LEGACY_ADMIN_CANNOT_PURGE);
+    }
+    return allow(actor);
+  }
+
+  // Stored admin key: full CRUD within its reach (read/write/delete/restore).
+  // Purge requires the named-admin-service-key shape, which a stored admin key
+  // satisfies — but we re-check the shape so the gate lives in one predicate.
+  if (isStoredAdmin(caller)) {
+    if (action === ACTIONS.PURGE) {
+      return isNamedAdminServiceKey(caller)
+        ? allow(actor)
+        : denied(DENY_REASONS.PURGE_REQUIRES_NAMED_ADMIN_SERVICE_KEY);
+    }
+    return allow(actor);
+  }
+
+  // Principal: the role ladder. Estate DENY rows are treated as ABSENT
+  // membership (fail-closed, ADR-0002) — collapse them to null here.
+  const brainRole = brainMembership && !brainMembership.isDeny ? brainMembership.role : null;
+  const estateRole = estateMembership && !estateMembership.isDeny ? estateMembership.role : null;
+
+  return principalCan(action, brainRole, estateRole)
+    ? allow(actor)
+    : denied(DENY_REASONS.INSUFFICIENT_ROLE);
+}
+
+// ---------------------------------------------------------------------------
+// Scope derivation
+// ---------------------------------------------------------------------------
+
+// Derive the two brain sets a caller has, from membership rows and a brain
+// catalog. The catalog is the candidate set the adapter fetched: every brain
+// reachable via a brain membership, an estate membership, or (for an admin key)
+// the caller's home estate. Each catalog entry is { brainId, brainSlug, estateId }.
+//
+//   accessible — brains the caller may USE (the fanout target for an unscoped
+//                read; the set an action may operate on).
+//   lookup     — brains the caller may NAME. A superset of accessible: it also
+//                includes estate-granted brains hidden by a brain-level DENY, so
+//                naming them resolves-then-denies (403) rather than 404s.
+//
+// Inputs:
+//   caller            : { isAdmin, homeEstateId, kind, ... }
+//   brainMemberships  : [{ brainId, role, isDeny }]
+//   estateMemberships : [{ estateId, role, isDeny }]
+//   catalog           : [{ brainId, brainSlug, estateId }]
+// Returns: { accessible: [{brainId,brainSlug}], accessibleIds: Set, lookup: [{brainId,brainSlug}] }
+export function deriveScope({ caller, brainMemberships = [], estateMemberships = [], catalog = [] }) {
+  const estateAllowed = new Set(
+    estateMemberships.filter((m) => !m.isDeny).map((m) => m.estateId),
+  );
+
+  const accessible = [];
+  const accessibleIds = new Set();
+  const lookup = [];
+  const seen = new Set();
+
+  for (const brain of catalog) {
+    if (seen.has(brain.brainId)) continue; // dedupe a catalog with repeats
+    seen.add(brain.brainId);
+
+    const rows = brainMemberships.filter((m) => m.brainId === brain.brainId);
+    const hasDenyBrain = rows.some((m) => m.isDeny);
+    const hasGrantBrain = rows.some((m) => !m.isDeny);
+    const estateOk = estateAllowed.has(brain.estateId);
+    // ADR-0003: a stored admin key reaches every brain in its home estate, even
+    // without an explicit membership row.
+    const adminHomeReach = Boolean(caller.isAdmin) && brain.estateId === caller.homeEstateId;
+
+    const ref = { brainId: brain.brainId, brainSlug: brain.brainSlug ?? null };
+
+    // DENY overrides every grant path (ADR-0002, fail-closed).
+    const isAccessible = !hasDenyBrain && (hasGrantBrain || adminHomeReach || estateOk);
+    // Nameable if any grant path exists. A brain-DENY does not strip
+    // nameability that an estate grant / admin reach provides (resolve-then-403);
+    // but a pure brain-DENY with no other grant is NOT nameable (404).
+    const isNameable = hasGrantBrain || adminHomeReach || estateOk;
+
+    if (isAccessible) {
+      accessible.push(ref);
+      accessibleIds.add(brain.brainId);
+    }
+    if (isNameable) {
+      lookup.push(ref);
+    }
+  }
+
+  return { accessible, accessibleIds, lookup };
+}
+
+// ---------------------------------------------------------------------------
+// Selector resolution
+// ---------------------------------------------------------------------------
+
+// Resolve a slug-or-UUID selector against a derived scope (the unified path for
+// human tokens, service keys, and stored admin keys per ADR-0003).
+//
+// Verdicts:
+//   resolved   — selector names an accessible brain.
+//   denied     — selector names a brain the caller may not use:
+//                  * a UUID/slug in `lookup` but not `accessible`
+//                    (estate-granted, brain-DENY-shadowed), OR
+//                  * a UUID that exists somewhere out of scope (existsGlobally).
+//   ambiguous  — a slug matching more than one nameable brain.
+//   not_found  — selector matches nothing nameable. For a slug this hides
+//                existence (a guessed slug learns nothing); for a UUID it means
+//                the brain does not exist at all.
+//
+// `existsGlobally` (UUID selectors only) tells whether the UUID names a real
+// brain outside the caller's scope; the adapter supplies it. It is the only
+// existence fact the pure module cannot derive from scope alone, and it drives
+// the deliberate UUID-vs-slug asymmetry above.
+export function resolveSelector({ selector, scope, existsGlobally = false }) {
+  if (isBrainUuid(selector)) {
+    const hit = scope.accessible.find((b) => b.brainId === selector);
+    if (hit) return resolved(hit);
+
+    const shadowed = scope.lookup.find((b) => b.brainId === selector);
+    if (shadowed) return denied(DENY_REASONS.NOT_AUTHORIZED);
+
+    // Knowing the UUID is proof enough to learn it exists — reveal as 403, not 404.
+    if (existsGlobally) return denied(DENY_REASONS.NOT_AUTHORIZED);
+
+    return notFound();
+  }
+
+  // Slug: ambiguity and existence are scope-relative. Dedupe by brainId so a
+  // catalog that lists the same brain twice does not read as ambiguous.
+  const seen = new Set();
+  const matches = scope.lookup.filter((b) => {
+    if (b.brainSlug !== selector) return false;
+    if (seen.has(b.brainId)) return false;
+    seen.add(b.brainId);
+    return true;
+  });
+
+  if (matches.length === 0) return notFound();
+  if (matches.length > 1) return ambiguous();
+
+  const match = matches[0];
+  return scope.accessibleIds.has(match.brainId) ? resolved(match) : denied(DENY_REASONS.NOT_AUTHORIZED);
+}
+
+// Resolve a selector for the bare legacy env key, which has GLOBAL reach and so
+// never produces a `denied` resolution verdict — only resolved / not_found /
+// ambiguous. `candidates` are the brains matching the selector globally, which
+// the adapter supplies (it cannot be derived from a scope, the legacy key having
+// none). Each candidate is { brainId, brainSlug }.
+export function resolveSelectorGlobal({ candidates = [] }) {
+  if (candidates.length === 0) return notFound();
+  if (candidates.length > 1) return ambiguous();
+  return resolved(candidates[0]);
+}
+
+// Compare an L1 selector resolution (route/query/header) with a body/tool-arg
+// resolution. If both resolved to brains and they differ, the request carries
+// conflicting selectors — a 400, not a silent override (v24 D3). Returns the
+// conflict verdict, or null when there is no conflict. Inputs are the resolved
+// brain refs ({ brainId } each) or null.
+export function detectSelectorConflict(l1Brain, bodyBrain) {
+  if (l1Brain && bodyBrain && l1Brain.brainId !== bodyBrain.brainId) {
+    return selectorConflict();
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Read fanout
+// ---------------------------------------------------------------------------
+
+// The set of brains a READ spans (v24 D4/D6).
+//   * an explicit (body or L1) selector narrows to exactly that one brain;
+//   * otherwise the legacy env key reads only its single effective brain
+//     (it does not fan out — it has no accessible set);
+//   * otherwise an unscoped read fans out across every accessible brain;
+//   * with no accessible brains, it falls back to the single effective brain.
+//
+// Inputs:
+//   caller         : { kind, ... }
+//   scope          : result of deriveScope
+//   explicitBrain  : resolved { brainId, brainSlug } | null  (a selector was given)
+//   effectiveBrain : { brainId, brainSlug } | null           (default/L1 brain)
+// Returns: [{ brainId, brainSlug }]
+export function planReadFanout({ caller, scope, explicitBrain = null, effectiveBrain = null }) {
+  const ref = (b) => ({ brainId: b.brainId, brainSlug: b.brainSlug ?? null });
+  if (explicitBrain) {
+    return [ref(explicitBrain)];
+  }
+  if (isLegacyAdmin(caller)) {
+    return effectiveBrain ? [ref(effectiveBrain)] : [];
+  }
+  if (scope.accessible.length > 0) {
+    // Return a copy: the result must not alias (and let a caller mutate) the scope.
+    return scope.accessible.map(ref);
+  }
+  return effectiveBrain ? [ref(effectiveBrain)] : [];
+}
