@@ -193,7 +193,13 @@ the thought-delete rollout runbook become standing regression tests.
   are preserved except where ADR-0002/ADR-0003 deliberately amend them.
 - **Thought store** owns the lifecycle verbs — capture/upsert, soft-delete,
   restore, purge, metadata patch, per-brain stats — and is the only module
-  issuing SQL against the thoughts and thought-audit tables. Each verb
+  issuing lifecycle SQL against the thoughts and thought-audit tables.
+  Ratified read-only exceptions (2026-06-12): the ANN match RPCs in the
+  retrieval subsystem (tombstone-filtered in-database, migration 011) and
+  the graph projector's candidate scan (a thoughts join keyed on projection
+  revision + graph database — projector bookkeeping, not lifecycle). If
+  literal sole-reader purity is ever wanted, the store can grow a typed
+  candidate-rows reader; recorded as an option, not a commitment. Each verb
   requires an explicit brain identity in its interface (defense in depth:
   the store never infers scope). Audit emission and idempotency are
   internal guarantees of the verbs, not caller obligations. The existing
