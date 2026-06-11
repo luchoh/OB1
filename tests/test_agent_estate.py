@@ -26,10 +26,25 @@ import urllib.request
 BASE_URL = os.environ.get("OPEN_BRAIN_BASE_URL", "http://localhost:8787").rstrip("/")
 
 ESTATE = "zzt-acc"
+ESTATE2 = "zzt-acc2"  # a second, foreign estate for ADR-0003 admin-reach deltas
 P_SLUG = "zzt-acc-p"
+P_ADMIN = "zzt-acc-admin"
 B_DEF, B_ALLOW, B_DENY = "zzt-acc-def", "zzt-acc-allow", "zzt-acc-deny"
-KEY = "zzt-acc-" + secrets.token_hex(8)
-KEY_HASH = hashlib.sha256(KEY.encode()).hexdigest()
+# ADR-0002/0003 delta fixtures: a plain viewer brain, an estate-member-only
+# brain (no brain membership), an admin-self-DENY'd brain, and two foreign-estate
+# brains (one the admin has a cross-estate membership on, one it does not).
+B_VIEW, B_MEMBER, B_ADMINDENY = "zzt-acc-view", "zzt-acc-member", "zzt-acc-admindeny"
+B_FOREIGN, B_FMEMBER = "zzt-acc2-foreign", "zzt-acc2-fmember"
+
+
+def _mkkey(prefix: str):
+    k = prefix + secrets.token_hex(8)
+    return k, hashlib.sha256(k.encode()).hexdigest()
+
+
+KEY, KEY_HASH = _mkkey("zzt-acc-")                 # zzt-acc-p, non-admin service key
+KEY_ADMIN, KEY_ADMIN_HASH = _mkkey("zzt-acc-adm-")  # zzt-acc-admin, stored is_admin key
+KEY_BOUND, KEY_BOUND_HASH = _mkkey("zzt-acc-bnd-")  # zzt-acc-p, brain-bound (brain_id=B_DEF)
 
 
 def _pg_conn():
@@ -73,12 +88,12 @@ def _psql(sql: str, *, capture: bool = False) -> str:
     return out.stdout.strip()
 
 
-def _post(path: str, payload: dict, *, query: str = ""):
+def _post(path: str, payload: dict, *, query: str = "", key: str = KEY):
     url = f"{BASE_URL}{path}{query}"
     data = json.dumps(payload).encode()
     req = urllib.request.Request(
         url, data=data, method="POST",
-        headers={"content-type": "application/json", "x-access-key": KEY},
+        headers={"content-type": "application/json", "x-access-key": key},
     )
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
@@ -99,9 +114,14 @@ class AgentEstateAcceptance(unittest.TestCase):
             urllib.request.urlopen(f"{BASE_URL}/health", timeout=5)
         except Exception as exc:  # noqa: BLE001
             raise unittest.SkipTest(f"runtime not reachable at {BASE_URL}: {exc}")
-        _psql(f"delete from households where slug = '{ESTATE}'")
+        _psql(
+            f"delete from thoughts where brain_id in (select b.id from brains b "
+            f"join households h on h.id=b.household_id where h.slug in ('{ESTATE}','{ESTATE2}')); "
+            f"delete from households where slug in ('{ESTATE}','{ESTATE2}')"
+        )
         _psql(
             f"""
+            -- Home estate (zzt-acc) and its brains.
             insert into households(slug,display_name) values ('{ESTATE}','acc');
             insert into brains(household_id,slug,display_name,kind)
               select id,'{B_DEF}','d','personal' from households where slug='{ESTATE}';
@@ -109,6 +129,21 @@ class AgentEstateAcceptance(unittest.TestCase):
               select id,'{B_ALLOW}','a','personal' from households where slug='{ESTATE}';
             insert into brains(household_id,slug,display_name,kind)
               select id,'{B_DENY}','y','personal' from households where slug='{ESTATE}';
+            insert into brains(household_id,slug,display_name,kind)
+              select id,'{B_VIEW}','v','personal' from households where slug='{ESTATE}';
+            insert into brains(household_id,slug,display_name,kind)
+              select id,'{B_MEMBER}','m','personal' from households where slug='{ESTATE}';
+            insert into brains(household_id,slug,display_name,kind)
+              select id,'{B_ADMINDENY}','ad','personal' from households where slug='{ESTATE}';
+            -- Foreign estate (zzt-acc2) and its brains.
+            insert into households(slug,display_name) values ('{ESTATE2}','acc2');
+            insert into brains(household_id,slug,display_name,kind)
+              select id,'{B_FOREIGN}','f','personal' from households where slug='{ESTATE2}';
+            insert into brains(household_id,slug,display_name,kind)
+              select id,'{B_FMEMBER}','fm','personal' from households where slug='{ESTATE2}';
+
+            -- Principal zzt-acc-p: owner(def), editor(allow), viewer+DENY(deny),
+            -- viewer(view), no membership on (member) -> estate-member read only.
             insert into brain_principals(household_id,slug,display_name,principal_type,default_brain_id)
               select h.id,'{P_SLUG}','p','agent',b.id from households h
               join brains b on b.household_id=h.id and b.slug='{B_DEF}' where h.slug='{ESTATE}';
@@ -124,12 +159,39 @@ class AgentEstateAcceptance(unittest.TestCase):
               select p.id,b.id,'viewer',true from brain_principals p
               join households h on h.id=p.household_id join brains b on b.household_id=h.id and b.slug='{B_DENY}'
               where h.slug='{ESTATE}' and p.slug='{P_SLUG}';
+            insert into brain_memberships(principal_id,brain_id,role,is_deny)
+              select p.id,b.id,'viewer',false from brain_principals p
+              join households h on h.id=p.household_id join brains b on b.household_id=h.id and b.slug='{B_VIEW}'
+              where h.slug='{ESTATE}' and p.slug='{P_SLUG}';
             insert into estate_memberships(principal_id,estate_id,role,is_deny)
               select p.id,h.id,'member',false from brain_principals p
               join households h on h.id=p.household_id where h.slug='{ESTATE}' and p.slug='{P_SLUG}';
             insert into brain_access_keys(principal_id,brain_id,is_admin,key_hash,is_active,label,credential_type)
               select p.id,null,false,'{KEY_HASH}',true,'acc','service_key' from brain_principals p
               join households h on h.id=p.household_id where h.slug='{ESTATE}' and p.slug='{P_SLUG}';
+            -- Brain-bound key (brain_id=B_DEF): ADR-0003 retires the naming clamp.
+            insert into brain_access_keys(principal_id,brain_id,is_admin,key_hash,is_active,label,credential_type)
+              select p.id,b.id,false,'{KEY_BOUND_HASH}',true,'acc-bound','service_key' from brain_principals p
+              join households h on h.id=p.household_id join brains b on b.household_id=h.id and b.slug='{B_DEF}'
+              where h.slug='{ESTATE}' and p.slug='{P_SLUG}';
+
+            -- Admin principal zzt-acc-admin (home estate = zzt-acc): a stored
+            -- is_admin key, a cross-estate membership on B_FMEMBER, and an
+            -- owner+DENY on B_ADMINDENY (to prove DENY clamps even an admin key).
+            insert into brain_principals(household_id,slug,display_name,principal_type,default_brain_id)
+              select h.id,'{P_ADMIN}','pa','agent',b.id from households h
+              join brains b on b.household_id=h.id and b.slug='{B_DEF}' where h.slug='{ESTATE}';
+            insert into brain_memberships(principal_id,brain_id,role,is_deny)
+              select pa.id,bf.id,'owner',false from brain_principals pa
+              join households h on h.id=pa.household_id and h.slug='{ESTATE}'
+              join brains bf on bf.slug='{B_FMEMBER}' where pa.slug='{P_ADMIN}';
+            insert into brain_memberships(principal_id,brain_id,role,is_deny)
+              select pa.id,b.id,'owner',true from brain_principals pa
+              join households h on h.id=pa.household_id and h.slug='{ESTATE}'
+              join brains b on b.household_id=h.id and b.slug='{B_ADMINDENY}' where pa.slug='{P_ADMIN}';
+            insert into brain_access_keys(principal_id,brain_id,is_admin,key_hash,is_active,label,credential_type)
+              select pa.id,null,true,'{KEY_ADMIN_HASH}',true,'acc-admin','service_key' from brain_principals pa
+              join households h on h.id=pa.household_id where h.slug='{ESTATE}' and pa.slug='{P_ADMIN}';
             """
         )
 
@@ -141,14 +203,14 @@ class AgentEstateAcceptance(unittest.TestCase):
         try:
             _psql(
                 f"delete from thoughts where brain_id in (select b.id from brains b "
-                f"join households h on h.id=b.household_id where h.slug='{ESTATE}'); "
-                f"delete from households where slug='{ESTATE}'"
+                f"join households h on h.id=b.household_id where h.slug in ('{ESTATE}','{ESTATE2}')); "
+                f"delete from households where slug in ('{ESTATE}','{ESTATE2}')"
             )
         except Exception as exc:  # noqa: BLE001
             # A failed cleanup must be LOUD — leftover fixtures in a shared/prod
             # DB are worse than a noisy teardown.
             print(
-                f"\nWARNING: agent-estate test cleanup FAILED; '{ESTATE}' "
+                f"\nWARNING: agent-estate test cleanup FAILED; '{ESTATE}'/'{ESTATE2}' "
                 f"fixtures may remain in the DB: {exc}",
                 file=sys.stderr,
             )
@@ -213,6 +275,108 @@ class AgentEstateAcceptance(unittest.TestCase):
         slugs = {m["brain_slug"] for m in matches}
         self.assertIn(B_ALLOW, slugs)
         self.assertIn(B_DEF, slugs)
+
+    # --- ADR-0002/0003 behavior deltas vs the pre-policy auth.mjs ---
+    # Each test pins exactly one place where the old runtime and the ADRs
+    # disagreed. The handback maps delta -> test.
+
+    # D-editor (preserved, regression guard): editor CAN write. Already covered
+    # by test_capture_explicit_brain_lands_there (B_ALLOW is editor -> 201).
+
+    def test_delta_viewer_cannot_write_403(self):
+        # ADR-0002: viewer is read-only. Old auth.mjs had no write gate -> 201.
+        status, _ = _post("/ingest/thought", {"content": "v", "extract_metadata": False, "brain": B_VIEW})
+        self.assertEqual(status, 403)
+
+    def test_delta_viewer_can_still_read_200(self):
+        # The 403 above must be a capability denial, not a scope denial: the
+        # viewer brain is readable. (Also proves the 403 is not a masked 404.)
+        status, _ = _post(
+            "/admin/thought/similar",
+            {"queries": ["anything"], "match_threshold": 0.4, "match_count": 5, "brain": B_VIEW},
+        )
+        self.assertEqual(status, 200)
+
+    def test_delta_estate_member_cannot_write_403(self):
+        # ADR-0002: estate `member` is read-only. Old auth.mjs treated any
+        # accessible (incl. estate-member) brain as writable -> 201.
+        status, _ = _post("/ingest/thought", {"content": "m", "extract_metadata": False, "brain": B_MEMBER})
+        self.assertEqual(status, 403)
+
+    def test_delta_estate_member_can_still_read_200(self):
+        status, _ = _post(
+            "/admin/thought/similar",
+            {"queries": ["anything"], "match_threshold": 0.4, "match_count": 5, "brain": B_MEMBER},
+        )
+        self.assertEqual(status, 200)
+
+    def test_delta_viewer_cannot_patch_metadata_403(self):
+        # ADR-0002: a metadata patch is a WRITE. A viewer-role principal must not
+        # mutate via the metadata path either. The write gate runs before the
+        # thought lookup, so this is a 403 (capability), not a 404 (missing id) —
+        # a dummy thought_id is sufficient to pin it.
+        status, _ = _post(
+            "/admin/thought/metadata",
+            {"thought_id": "00000000-0000-4000-8000-000000000000", "brain": B_VIEW, "metadata_patch": {"k": 1}},
+        )
+        self.assertEqual(status, 403)
+
+    def test_delta_bound_key_can_name_other_in_scope_brain(self):
+        # ADR-0003: a key's brain_id is a default hint, not a naming clamp. Old
+        # auth.mjs 403'd a bound key naming any brain != its bound brain.
+        status, body = _post(
+            "/ingest/thought",
+            {"content": "bound names allow", "extract_metadata": False, "brain": B_ALLOW},
+            key=KEY_BOUND,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(self._brain_of(body["thought"]["id"]), B_ALLOW)
+
+    def test_delta_admin_foreign_brain_body_unreachable_404(self):
+        # ADR-0003: a stored admin key's body-arg reach is bounded to home
+        # estate ∪ memberships. Old auth.mjs resolved admin body args GLOBALLY,
+        # so a foreign-estate brain it had no membership on resolved (and acted).
+        status, _ = _post(
+            "/ingest/thought",
+            {"content": "x", "extract_metadata": False, "brain": B_FOREIGN},
+            key=KEY_ADMIN,
+        )
+        self.assertEqual(status, 404)
+
+    def test_delta_admin_cross_estate_membership_l1_nameable(self):
+        # ADR-0003: an admin key's L1 (query/header) reach WIDENS to its
+        # membership-derived cross-estate brains. Old auth.mjs resolved admin L1
+        # selectors household-wide only, so a cross-estate membership brain 404'd.
+        status, body = _post(
+            "/ingest/thought",
+            {"content": "admin cross-estate", "extract_metadata": False},
+            query=f"?brain={B_FMEMBER}",
+            key=KEY_ADMIN,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(self._brain_of(body["thought"]["id"]), B_FMEMBER)
+
+    def test_delta_admin_reaches_home_estate_without_membership_201(self):
+        # Preserved ADR-0003 behavior (regression guard): an admin key reaches
+        # every brain in its home estate even without a brain membership row.
+        status, body = _post(
+            "/ingest/thought",
+            {"content": "admin home reach", "extract_metadata": False, "brain": B_ALLOW},
+            key=KEY_ADMIN,
+        )
+        self.assertEqual(status, 201)
+        self.assertEqual(self._brain_of(body["thought"]["id"]), B_ALLOW)
+
+    def test_delta_brain_deny_overrides_admin_key_403(self):
+        # ADR-0002 (ratified): brain-level DENY overrides EVERYTHING, including a
+        # stored admin key on its own principal. Old auth.mjs short-circuited on
+        # is_admin before any deny check, so the admin acted regardless.
+        status, _ = _post(
+            "/ingest/thought",
+            {"content": "x", "extract_metadata": False, "brain": B_ADMINDENY},
+            key=KEY_ADMIN,
+        )
+        self.assertEqual(status, 403)
 
 
 if __name__ == "__main__":

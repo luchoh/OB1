@@ -2,7 +2,7 @@ import { Hono } from "hono";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
-import { HttpError, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
+import { HttpError, authorizeWrite, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
 import { config } from "./config.mjs";
 import { closePool, formatVector, healthcheckDatabase, query } from "./db.mjs";
 import {
@@ -353,6 +353,10 @@ async function upsertThought({ brainId, content, embedding, metadata, dedupeKey 
 
 async function handleCaptureThought(args, accessContext) {
   const { brainId } = await resolveRequestBrain(accessContext, args.brain);
+  // ADR-0002 write ladder: capture is a WRITE. Authorize before doing any work.
+  // (Pre-ADR-0002 the runtime had no write gate — any reachable brain was
+  // writable; this is the call site that enforcement was missing.)
+  await authorizeWrite(accessContext, brainId);
   const content = args.content.trim();
   const metadata = args.metadata ?? {};
   const shouldExtractMetadata = args.extract_metadata ?? true;
@@ -1417,6 +1421,11 @@ app.post("/admin/thought/metadata", async (c) => {
     const accessContext = await resolveAccessContext(c);
     const payload = updateThoughtMetadataInput.parse(await c.req.json());
     const { brainId } = await resolveRequestBrain(accessContext, payload.brain);
+    // ADR-0002 write ladder: a metadata patch mutates a Thought -> WRITE. Gate
+    // it like capture so the ladder has no inconsistent seam (a viewer must not
+    // mutate via the metadata path). Runs before the thought lookup, so an
+    // unauthorized caller gets 403, not a 404 leak.
+    await authorizeWrite(accessContext, brainId);
     const result = await updateThoughtMetadata({
       brainId,
       thoughtId: payload.thought_id,

@@ -2,6 +2,27 @@ import crypto from "node:crypto";
 import { createRemoteJWKSet, jwtVerify } from "jose";
 import { config } from "./config.mjs";
 import { query } from "./db.mjs";
+import {
+  ACTIONS,
+  CALLER_KINDS,
+  VERDICTS,
+  isBrainUuid,
+  deriveScope,
+  resolveSelector,
+  resolveSelectorGlobal,
+  detectSelectorConflict,
+  authorizeAction,
+  planReadFanout,
+} from "./access-policy.mjs";
+
+// auth.mjs is the ADAPTER around the pure Access policy module (src/access-policy.mjs).
+// It does two impure things the policy refuses to: (1) FETCH the rows the policy
+// decides over — brain/estate memberships, the brain catalog, the existsGlobally
+// hint — and (2) MAP the policy's verdict data onto HTTP outcomes (HttpError /
+// returned data). All decision logic — scope derivation, selector resolution,
+// action authorization, read fanout, the v24/ADR-0002/ADR-0003 semantics — lives
+// in the policy module and is exercised by its 73-test pure suite. Nothing in
+// this file decides; it fetches, calls the policy, and translates.
 
 export class HttpError extends Error {
   constructor(status, message) {
@@ -62,181 +83,248 @@ async function verifyHumanJwt(token) {
   }
 }
 
-async function loadPrincipalMemberships(principalId) {
-  const result = await query(
-    `
-      select
-        p.id as principal_id,
-        p.household_id,
-        p.default_brain_id,
-        b.id as brain_id,
-        b.slug as brain_slug,
-        bm.role
-      from brain_principals p
-      left join brain_memberships bm
-        on bm.principal_id = p.id
-      left join brains b
-        on b.id = bm.brain_id
-      where p.id = $1::uuid
-    `,
-    [principalId],
-  );
-
-  if (result.rowCount === 0) {
-    throw new HttpError(403, "Principal not found");
+function explicitServiceBrainSlug(c) {
+  const queryValue = c.req.query("brain");
+  if (queryValue?.trim()) {
+    return queryValue.trim();
   }
 
-  const first = result.rows[0];
-  const memberships = result.rows
-    .filter((row) => row.brain_id)
-    .map((row) => ({
-      brainId: row.brain_id,
-      brainSlug: row.brain_slug,
-      role: row.role,
-    }));
-
-  return {
-    principalId: first.principal_id,
-    householdId: first.household_id,
-    defaultBrainId: first.default_brain_id,
-    memberships,
-  };
-}
-
-async function resolveBrainBySlugForHousehold(householdId, brainSlug) {
-  const result = await query(
-    `
-      select id, household_id, slug
-      from brains
-      where household_id = $1::uuid
-        and slug = $2
-      limit 1
-    `,
-    [householdId, brainSlug],
-  );
-
-  return result.rows[0] ?? null;
-}
-
-async function resolveBrainBySlugGlobal(brainSlug) {
-  const result = await query(
-    `
-      select id, household_id, slug
-      from brains
-      where slug = $1
-      order by created_at asc
-      limit 2
-    `,
-    [brainSlug],
-  );
-
-  if (result.rowCount > 1) {
-    throw new HttpError(409, `Brain slug is ambiguous: ${brainSlug}`);
+  const headerValue = c.req.header("x-brain-slug");
+  if (headerValue?.trim()) {
+    return headerValue.trim();
   }
 
-  return result.rows[0] ?? null;
+  return null;
 }
 
-const BRAIN_UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// ---------------------------------------------------------------------------
+// Row adapters — the only place SQL meets the policy. Each returns plain data
+// shaped exactly as the policy module's inputs expect.
+// ---------------------------------------------------------------------------
 
-// v24 D1/D5: compute the brains a principal can USE (accessible) and the brains
-// a principal may NAME (lookup = accessible plus estate brains, including estate
-// brains overridden by a brain-level deny so they resolve-then-403 rather than 404).
-async function loadBrainScopes(principalId) {
-  const accessible = await query(
-    `
-      select b.id, b.slug
-      from brains b
-      where case
-        when exists (
-          select 1 from brain_memberships bm
-          where bm.principal_id = $1::uuid and bm.brain_id = b.id
-        )
-        then exists (
-          select 1 from brain_memberships bm
-          where bm.principal_id = $1::uuid and bm.brain_id = b.id and bm.is_deny = false
-        )
-        else exists (
-          select 1 from estate_memberships em
-          where em.principal_id = $1::uuid and em.estate_id = b.household_id and em.is_deny = false
-        )
-      end
-    `,
+async function fetchBrainMemberships(principalId) {
+  const result = await query(
+    `select brain_id, role, is_deny from brain_memberships where principal_id = $1::uuid`,
     [principalId],
   );
+  return result.rows.map((r) => ({ brainId: r.brain_id, role: r.role, isDeny: r.is_deny }));
+}
 
-  const lookup = await query(
+async function fetchEstateMemberships(principalId) {
+  const result = await query(
+    `select estate_id, role, is_deny from estate_memberships where principal_id = $1::uuid`,
+    [principalId],
+  );
+  return result.rows.map((r) => ({ estateId: r.estate_id, role: r.role, isDeny: r.is_deny }));
+}
+
+// The candidate brain set the policy derives scope over: every brain reachable
+// via a brain membership (incl. deny rows — the policy classifies them), via a
+// non-deny estate membership, or — for an admin key (ADR-0003) — by living in
+// the caller's home estate.
+async function fetchBrainCatalog(principalId, { isAdmin, homeEstateId }) {
+  const result = await query(
     `
-      select b.id, b.slug
+      select b.id as brain_id, b.slug as brain_slug, b.household_id as estate_id
       from brains b
       where exists (
           select 1 from brain_memberships bm
-          where bm.principal_id = $1::uuid and bm.brain_id = b.id and bm.is_deny = false
+          where bm.principal_id = $1::uuid and bm.brain_id = b.id
         )
         or exists (
           select 1 from estate_memberships em
           where em.principal_id = $1::uuid and em.estate_id = b.household_id and em.is_deny = false
         )
+        or ($2::boolean and b.household_id = $3::uuid)
     `,
-    [principalId],
+    [principalId, Boolean(isAdmin), homeEstateId],
   );
-
-  return {
-    accessible: accessible.rows.map((r) => ({ brainId: r.id, brainSlug: r.slug })),
-    accessibleIds: new Set(accessible.rows.map((r) => r.id)),
-    lookup: lookup.rows.map((r) => ({ id: r.id, slug: r.slug })),
-  };
+  return result.rows.map((r) => ({ brainId: r.brain_id, brainSlug: r.brain_slug, estateId: r.estate_id }));
 }
 
-// v24 D2/D3/D5: resolve an explicit slug-or-UUID selector for a non-admin,
-// non-brain-bound principal. 404 = not nameable (or nonexistent UUID), 403 =
-// nameable/exists but denied, 409 = ambiguous slug. No existence-hiding beyond
-// the lookup scope; an inaccessible-but-existing UUID is 403, not downgraded to 404.
-async function resolveSelectorInScope(selector, scopes) {
-  if (BRAIN_UUID_RE.test(selector)) {
-    if (scopes.accessibleIds.has(selector)) {
-      const hit = scopes.accessible.find((b) => b.brainId === selector);
-      return { id: hit.brainId, slug: hit.brainSlug };
-    }
-    const existing = await query("select id from brains where id = $1::uuid", [selector]);
-    if (existing.rowCount === 0) {
-      throw new HttpError(404, `Brain not found: ${selector}`);
-    }
-    throw new HttpError(403, `Not authorized for brain: ${selector}`);
-  }
-
-  const matches = scopes.lookup.filter((b) => b.slug === selector);
-  if (matches.length === 0) {
-    throw new HttpError(404, `Brain not found: ${selector}`);
-  }
-  if (matches.length > 1) {
-    throw new HttpError(409, `Brain slug is ambiguous: ${selector}`);
-  }
-  const brain = matches[0];
-  if (!scopes.accessibleIds.has(brain.id)) {
-    throw new HttpError(403, `Not authorized for brain: ${selector}`);
-  }
-  return brain;
+async function brainExists(brainId) {
+  const r = await query("select 1 from brains where id = $1::uuid limit 1", [brainId]);
+  return r.rowCount > 0;
 }
 
 async function resolveDefaultAdminBrain() {
   const result = await query(
     `
-      select
-        p.default_brain_id as brain_id,
-        b.household_id
+      select p.default_brain_id as brain_id, b.household_id
       from brain_principals p
-      join brains b
-        on b.id = p.default_brain_id
+      join brains b on b.id = p.default_brain_id
       where p.principal_type = 'person'
         and p.default_brain_id is not null
       order by p.created_at asc
       limit 1
     `,
   );
-
   return result.rows[0] ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// Verdict → HTTP translation. The policy returns verdict data with semantic
+// kinds; the transport owns the status mapping (the ADRs/PRD fix the mapping,
+// not the policy).
+// ---------------------------------------------------------------------------
+
+// resolved -> {brainId, brainSlug}; not_found -> 404; denied -> 403; ambiguous -> 409.
+function selectorVerdictToBrain(verdict, selector) {
+  switch (verdict.kind) {
+    case VERDICTS.RESOLVED:
+      return verdict.brain;
+    case VERDICTS.NOT_FOUND:
+      throw new HttpError(404, `Brain not found: ${selector}`);
+    case VERDICTS.DENIED:
+      throw new HttpError(403, `Not authorized for brain: ${selector}`);
+    case VERDICTS.AMBIGUOUS:
+      throw new HttpError(409, `Brain slug is ambiguous: ${selector}`);
+    default:
+      throw new HttpError(500, `Unexpected selector verdict: ${verdict.kind}`);
+  }
+}
+
+// allow -> actor descriptor; denied -> 403.
+function actionVerdictToActor(verdict, action) {
+  if (verdict.kind === VERDICTS.ALLOW) {
+    return verdict.actor;
+  }
+  throw new HttpError(403, `Not authorized to ${action} in this brain`);
+}
+
+// Resolve a selector through a principal's derived scope (human / service /
+// stored-admin — the unified ADR-0003 path). Supplies the existsGlobally hint
+// the policy needs to tell a known-but-out-of-scope UUID (403) from a
+// nonexistent one (404).
+async function resolveScopedSelector(selector, scope) {
+  const existsGlobally = isBrainUuid(selector) ? await brainExists(selector) : false;
+  const verdict = resolveSelector({ selector, scope, existsGlobally });
+  return selectorVerdictToBrain(verdict, selector);
+}
+
+// Resolve a selector for the bare legacy env key (global reach, never denied).
+// Returns {brainId, brainSlug, estateId}; throws 404/409 via the policy verdict.
+async function resolveGlobalSelector(selector) {
+  let rows;
+  if (isBrainUuid(selector)) {
+    rows = (await query("select id, slug, household_id from brains where id = $1::uuid", [selector])).rows;
+  } else {
+    rows = (await query(
+      "select id, slug, household_id from brains where slug = $1 order by created_at asc limit 2",
+      [selector],
+    )).rows;
+  }
+  const candidates = rows.map((r) => ({ brainId: r.id, brainSlug: r.slug, estateId: r.household_id }));
+  const verdict = resolveSelectorGlobal({ candidates });
+  if (verdict.kind === VERDICTS.RESOLVED) {
+    return candidates[0]; // keep estateId the policy strips off
+  }
+  return selectorVerdictToBrain(verdict, selector); // throws for not_found / ambiguous
+}
+
+// ---------------------------------------------------------------------------
+// Access context assembly
+// ---------------------------------------------------------------------------
+
+async function slugForBrain(brainId, scope) {
+  if (!brainId) return null;
+  const hit = [...scope.accessible, ...scope.lookup].find((b) => b.brainId === brainId);
+  if (hit) return hit.brainSlug;
+  const r = await query("select slug from brains where id = $1::uuid", [brainId]);
+  return r.rows[0]?.slug ?? null;
+}
+
+// Build the request access context for a principal-backed caller (human token
+// or stored service key, incl. stored admin). `defaultBrainOverride` is the
+// key's brain_id hint when present (ADR-0003: a default hint, never a clamp).
+async function buildPrincipalContext(
+  principalId,
+  { authSource, isAdmin, defaultBrainOverride = null, requireUsableBrain },
+  requestedBrainSlug,
+) {
+  const base = await query(
+    "select household_id, default_brain_id from brain_principals where id = $1::uuid",
+    [principalId],
+  );
+  if (base.rowCount === 0) {
+    throw new HttpError(403, "Principal not found");
+  }
+  const homeEstateId = base.rows[0].household_id;
+  const defaultBrainId = defaultBrainOverride ?? base.rows[0].default_brain_id;
+
+  const caller = {
+    kind: authSource,
+    principalId,
+    homeEstateId,
+    isAdmin: Boolean(isAdmin),
+    defaultBrainId,
+  };
+
+  const [brainMemberships, estateMemberships, catalog] = await Promise.all([
+    fetchBrainMemberships(principalId),
+    fetchEstateMemberships(principalId),
+    fetchBrainCatalog(principalId, caller),
+  ]);
+
+  const scope = deriveScope({ caller, brainMemberships, estateMemberships, catalog });
+
+  let requestedBrain = null;
+  if (requestedBrainSlug) {
+    requestedBrain = await resolveScopedSelector(requestedBrainSlug, scope);
+  }
+
+  const effectiveBrainId = requestedBrain?.brainId ?? defaultBrainId ?? null;
+  if (requireUsableBrain && !effectiveBrainId) {
+    throw new HttpError(403, "Access key is not bound to a usable brain");
+  }
+  const effectiveBrainSlug = requestedBrain?.brainSlug ?? (await slugForBrain(effectiveBrainId, scope));
+
+  return makeContext({
+    caller,
+    scope,
+    brainMemberships,
+    estateMemberships,
+    catalog,
+    requestedBrain,
+    effectiveBrainId,
+    effectiveBrainSlug,
+  });
+}
+
+// Assemble the accessContext server.mjs consumes, plus the `_policy` bundle the
+// authorize/resolve helpers reuse so a single request fetches rows once.
+function makeContext({
+  caller,
+  scope,
+  brainMemberships,
+  estateMemberships,
+  catalog,
+  requestedBrain,
+  effectiveBrainId,
+  effectiveBrainSlug,
+}) {
+  const brainMembershipById = new Map(
+    brainMemberships.map((m) => [m.brainId, { role: m.role, isDeny: m.isDeny }]),
+  );
+  const estateMembershipByEstate = new Map(
+    estateMemberships.map((m) => [m.estateId, { role: m.role, isDeny: m.isDeny }]),
+  );
+  const brainEstateById = new Map(catalog.map((b) => [b.brainId, b.estateId]));
+
+  return {
+    authSource: caller.kind,
+    principalId: caller.principalId,
+    householdId: caller.homeEstateId,
+    defaultBrainId: caller.defaultBrainId,
+    allowedBrainIds: brainMemberships.filter((m) => !m.isDeny).map((m) => m.brainId),
+    accessibleBrains: scope.accessible,
+    effectiveBrainId,
+    effectiveBrainSlug,
+    requestedBrainId: requestedBrain?.brainId ?? null,
+    requestedBrainSlug: requestedBrain?.brainSlug ?? null,
+    isAdmin: caller.isAdmin,
+    _policy: { caller, scope, brainMembershipById, estateMembershipByEstate, brainEstateById },
+  };
 }
 
 async function resolveHumanAccessContext(c, requestedBrainSlug) {
@@ -280,68 +368,21 @@ async function resolveHumanAccessContext(c, requestedBrainSlug) {
     throw new HttpError(403, "Authenticated user is not bound to an OB1 principal");
   }
 
-  const memberships = await loadPrincipalMemberships(bindingResult.rows[0].principal_id);
-  const scopes = await loadBrainScopes(memberships.principalId);
-  // v24 D3: human tokens resolve a selector (route/query/header) uniformly, via
-  // the same estate-aware scope logic as service keys.
-  const requestedBrain = requestedBrainSlug
-    ? await resolveSelectorInScope(requestedBrainSlug, scopes)
-    : null;
-
-  return {
-    authSource: "human_token",
-    principalId: memberships.principalId,
-    householdId: memberships.householdId,
-    defaultBrainId: memberships.defaultBrainId,
-    allowedBrainIds: memberships.memberships.map((entry) => entry.brainId),
-    accessibleBrains: scopes.accessible,
-    effectiveBrainId: requestedBrain?.id ?? memberships.defaultBrainId,
-    effectiveBrainSlug: requestedBrain?.slug
-      ?? scopes.accessible.find((entry) => entry.brainId === memberships.defaultBrainId)?.brainSlug
-      ?? memberships.memberships.find((entry) => entry.brainId === memberships.defaultBrainId)?.brainSlug
-      ?? null,
-    requestedBrainId: requestedBrain?.id ?? null,
-    requestedBrainSlug: requestedBrain?.slug ?? null,
-    isAdmin: false,
-  };
-}
-
-function explicitServiceBrainSlug(c) {
-  const queryValue = c.req.query("brain");
-  if (queryValue?.trim()) {
-    return queryValue.trim();
-  }
-
-  const headerValue = c.req.header("x-brain-slug");
-  if (headerValue?.trim()) {
-    return headerValue.trim();
-  }
-
-  return null;
+  // Human tokens are never admin keys; reach is purely membership-derived.
+  return buildPrincipalContext(
+    bindingResult.rows[0].principal_id,
+    { authSource: CALLER_KINDS.HUMAN_TOKEN, isAdmin: false, requireUsableBrain: false },
+    requestedBrainSlug,
+  );
 }
 
 async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
   const result = await query(
     `
-      select
-        k.id as access_key_id,
-        k.brain_id as key_brain_id,
-        k.is_admin,
-        p.id as principal_id,
-        p.household_id,
-        p.default_brain_id,
-        b.id as brain_id,
-        b.slug as brain_slug,
-        bm.role
+      select k.brain_id as key_brain_id, k.is_admin, p.id as principal_id
       from brain_access_keys k
-      join brain_principals p
-        on p.id = k.principal_id
-      left join brain_memberships bm
-        on bm.principal_id = p.id
-      left join brains b
-        on b.id = bm.brain_id
-      where k.key_hash = $1
-        and k.is_active = true
+      join brain_principals p on p.id = k.principal_id
+      where k.key_hash = $1 and k.is_active = true
     `,
     [keyHash],
   );
@@ -351,104 +392,75 @@ async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
   }
 
   await query(
-    `
-      update brain_access_keys
-      set
-        last_used_at = now(),
-        updated_at = now()
-      where key_hash = $1
-    `,
+    "update brain_access_keys set last_used_at = now(), updated_at = now() where key_hash = $1",
     [keyHash],
   );
 
-  const first = result.rows[0];
-  const memberships = result.rows
-    .filter((row) => row.brain_id)
-    .map((row) => ({
-      brainId: row.brain_id,
-      brainSlug: row.brain_slug,
-      role: row.role,
-    }));
+  const row = result.rows[0];
+  // ADR-0003: the key's brain_id is a default-brain hint only — NOT a naming
+  // clamp. The old brain-bound restriction is retired; capability comes from
+  // roles, reach from memberships + (for admin keys) the home estate.
+  return buildPrincipalContext(
+    row.principal_id,
+    {
+      authSource: CALLER_KINDS.SERVICE_KEY,
+      isAdmin: Boolean(row.is_admin),
+      defaultBrainOverride: row.key_brain_id,
+      requireUsableBrain: true,
+    },
+    requestedBrainSlug,
+  );
+}
 
-  const scopes = await loadBrainScopes(first.principal_id);
+// The bare legacy env key: the only global actor (documented blast radius,
+// docs/32 D9). Global selector resolution; full CRUD but never purge
+// (authorizeAction enforces the no-purge rule); reads do not fan out.
+async function resolveLegacyAdminContext(requestedBrainSlug) {
+  const caller = {
+    kind: CALLER_KINDS.LEGACY_ADMIN_KEY,
+    principalId: null,
+    homeEstateId: null,
+    isAdmin: true,
+    defaultBrainId: null,
+  };
 
   let requestedBrain = null;
   if (requestedBrainSlug) {
-    if (first.is_admin) {
-      // Admin stored keys keep their pre-v24 household-wide slug resolution.
-      requestedBrain = await resolveBrainBySlugForHousehold(first.household_id, requestedBrainSlug);
-      if (!requestedBrain) {
-        throw new HttpError(404, `Brain not found: ${requestedBrainSlug}`);
-      }
-    } else if (first.key_brain_id) {
-      // Brain-bound keys may only name their own brain.
-      requestedBrain = await resolveBrainBySlugForHousehold(first.household_id, requestedBrainSlug);
-      if (!requestedBrain) {
-        throw new HttpError(404, `Brain not found: ${requestedBrainSlug}`);
-      }
-      if (requestedBrain.id !== first.key_brain_id) {
-        throw new HttpError(403, `Access key is bound to a different brain: ${requestedBrainSlug}`);
-      }
-    } else {
-      // v24 estate-aware resolution for non-admin, non-brain-bound principals.
-      requestedBrain = await resolveSelectorInScope(requestedBrainSlug, scopes);
-    }
+    requestedBrain = await resolveGlobalSelector(requestedBrainSlug);
   }
 
-  const effectiveBrainId = requestedBrain?.id
-    ?? first.key_brain_id
-    ?? first.default_brain_id;
-
+  let effectiveBrainId = requestedBrain?.brainId ?? null;
+  let householdId = requestedBrain?.estateId ?? null;
   if (!effectiveBrainId) {
-    throw new HttpError(403, "Access key is not bound to a usable brain");
+    const def = await resolveDefaultAdminBrain();
+    if (!def?.brain_id) {
+      throw new HttpError(403, "No default brain is available for legacy admin access");
+    }
+    effectiveBrainId = def.brain_id;
+    householdId = def.household_id ?? null;
   }
 
   return {
-    authSource: "service_key",
-    principalId: first.principal_id,
-    householdId: first.household_id,
-    defaultBrainId: first.default_brain_id,
-    allowedBrainIds: memberships.map((entry) => entry.brainId),
-    accessibleBrains: scopes.accessible,
-    effectiveBrainId,
-    effectiveBrainSlug: requestedBrain?.slug
-      ?? scopes.accessible.find((entry) => entry.brainId === effectiveBrainId)?.brainSlug
-      ?? memberships.find((entry) => entry.brainId === effectiveBrainId)?.brainSlug
-      ?? null,
-    requestedBrainId: requestedBrain?.id ?? null,
-    requestedBrainSlug: requestedBrain?.slug ?? null,
-    isAdmin: Boolean(first.is_admin),
-  };
-}
-
-async function resolveLegacyAdminContext(requestedBrainSlug) {
-  const requestedBrain = requestedBrainSlug
-    ? await resolveBrainBySlugGlobal(requestedBrainSlug)
-    : null;
-
-  if (requestedBrainSlug && !requestedBrain) {
-    throw new HttpError(404, `Brain not found: ${requestedBrainSlug}`);
-  }
-
-  const defaultBrain = requestedBrain ?? await resolveDefaultAdminBrain();
-  if (!defaultBrain?.brain_id && !defaultBrain?.id) {
-    throw new HttpError(403, "No default brain is available for legacy admin access");
-  }
-
-  const effectiveBrainId = requestedBrain?.id ?? defaultBrain.brain_id ?? defaultBrain.id;
-  const householdId = requestedBrain?.household_id ?? defaultBrain.household_id ?? null;
-
-  return {
-    authSource: "legacy_admin_key",
+    authSource: caller.kind,
     principalId: null,
     householdId,
     defaultBrainId: effectiveBrainId,
     allowedBrainIds: effectiveBrainId ? [effectiveBrainId] : [],
+    // No accessible set: the legacy key does not fan out (planReadFanout's
+    // legacy branch reads the single effective brain).
+    accessibleBrains: undefined,
     effectiveBrainId,
-    effectiveBrainSlug: requestedBrain?.slug ?? null,
-    requestedBrainId: requestedBrain?.id ?? null,
-    requestedBrainSlug: requestedBrain?.slug ?? null,
+    effectiveBrainSlug: requestedBrain?.brainSlug ?? null,
+    requestedBrainId: requestedBrain?.brainId ?? null,
+    requestedBrainSlug: requestedBrain?.brainSlug ?? null,
     isAdmin: true,
+    _policy: {
+      caller,
+      scope: { accessible: [], accessibleIds: new Set(), lookup: [] },
+      brainMembershipById: new Map(),
+      estateMembershipByEstate: new Map(),
+      brainEstateById: new Map(),
+    },
   };
 }
 
@@ -477,10 +489,13 @@ export async function resolveAccessContext(c, { routeBrainSlug = null } = {}) {
   return storedContext;
 }
 
-// v24 D3/D4: resolve a body/tool-arg `brain` (slug or UUID) for an already-
-// authenticated request. Absent -> the L1/default effective brain. Admins
-// (legacy env key or stored is_admin) resolve globally; everyone else resolves
-// through their estate-aware scope, reusing the same 403/404/409 logic as L1.
+// ---------------------------------------------------------------------------
+// Per-request resolution + authorization (the stable server.mjs-facing surface)
+// ---------------------------------------------------------------------------
+
+// Resolve a body/tool-arg `brain` selector for an authenticated request. Absent
+// -> the effective (default/L1) brain. A body selector that disagrees with an
+// explicit L1 selector is a conflict (400), not a silent override (v24 D3).
 export async function resolveRequestBrain(accessContext, brainArg) {
   const selector = typeof brainArg === "string" ? brainArg.trim() : brainArg;
   if (selector == null || selector === "") {
@@ -490,147 +505,82 @@ export async function resolveRequestBrain(accessContext, brainArg) {
     };
   }
 
+  const { caller, scope } = accessContext._policy;
   let resolved;
-  if (accessContext.isAdmin) {
-    if (BRAIN_UUID_RE.test(selector)) {
-      const r = await query("select id, slug from brains where id = $1::uuid", [selector]);
-      if (r.rowCount === 0) {
-        throw new HttpError(404, `Brain not found: ${selector}`);
-      }
-      resolved = { brainId: r.rows[0].id, brainSlug: r.rows[0].slug };
-    } else {
-      const r = await query(
-        "select id, slug from brains where slug = $1 order by created_at asc limit 2",
-        [selector],
-      );
-      if (r.rowCount === 0) {
-        throw new HttpError(404, `Brain not found: ${selector}`);
-      }
-      if (r.rowCount > 1) {
-        throw new HttpError(409, `Brain slug is ambiguous: ${selector}`);
-      }
-      resolved = { brainId: r.rows[0].id, brainSlug: r.rows[0].slug };
-    }
+  if (caller.kind === CALLER_KINDS.LEGACY_ADMIN_KEY) {
+    const r = await resolveGlobalSelector(selector);
+    resolved = { brainId: r.brainId, brainSlug: r.brainSlug };
   } else {
-    const scopes = await loadBrainScopes(accessContext.principalId);
-    const brain = await resolveSelectorInScope(selector, scopes);
-    resolved = { brainId: brain.id, brainSlug: brain.slug };
+    resolved = await resolveScopedSelector(selector, scope);
   }
 
-  // v24 D3: a body/tool-arg brain that disagrees with an explicit L1 selector
-  // (route/query/header) is a conflicting request, not a silent override.
-  if (accessContext.requestedBrainId && resolved.brainId !== accessContext.requestedBrainId) {
+  const conflict = detectSelectorConflict(
+    accessContext.requestedBrainId ? { brainId: accessContext.requestedBrainId } : null,
+    { brainId: resolved.brainId },
+  );
+  if (conflict) {
     throw new HttpError(400, "Conflicting brain selectors: explicit selector and body brain differ");
   }
 
   return resolved;
 }
 
-// v24 D4/D6: the set of brains a READ spans. An explicit body/tool-arg selector
-// or an L1 selector narrows to exactly one brain; an omitted selector fans out
-// across every accessible brain. Falls back to the single effective brain for
-// legacy-admin (and any principal whose accessible set is empty).
-// Ensure a {brainId, brainSlug} pair has a slug (D6 requires per-row brain_slug).
-// The legacy-admin / no-membership effective brain carries a null slug, so look
-// it up rather than emit null on every read row.
-async function brainRef(brainId, brainSlug) {
-  if (brainSlug || !brainId) {
-    return { brainId, brainSlug: brainSlug ?? null };
-  }
-  const r = await query("select slug from brains where id = $1::uuid", [brainId]);
-  return { brainId, brainSlug: r.rows[0]?.slug ?? null };
-}
-
-// M3 D4/D9: authorize a destructive op (delete/restore) on a resolved brain.
-// Returns a non-null actor descriptor on allow; throws HttpError(403) on deny.
-//
-// Allow if EITHER:
-//   - accessContext.isAdmin (covers the bare legacy_admin_key AND stored is_admin
-//     keys). D9: legacy-admin destructive (delete/restore) is allowed in M3 and
-//     documented as blast radius; purge is M5 and out of scope here.
-//   - the principal is a brain OWNER of brainId, OR an estate ADMIN of the brain's
-//     estate (household). Editors/viewers/non-members are denied.
-//
-// D4.3 is resolved OWNER-ONLY for M3: there is no `created_by` column on thoughts,
-// so a creator-or-owner policy is unbuildable without one and is deferred. Add a
-// `created_by` column and widen this predicate when that decision lands.
-export async function authorizeDestructive(accessContext, brainId, { action }) {
-  const actor = {
-    auth_source: accessContext.authSource,
-    principal_id: accessContext.principalId ?? null,
-    is_admin: Boolean(accessContext.isAdmin),
-  };
-
-  if (accessContext.isAdmin === true) {
-    return actor;
-  }
-
-  if (!accessContext.principalId) {
-    throw new HttpError(403, `Not authorized to ${action} in this brain`);
-  }
-
-  const result = await query(
-    `
-      select exists (
-        select 1 from brain_memberships bm
-        where bm.principal_id = $1::uuid
-          and bm.brain_id = $2::uuid
-          and bm.role = 'owner'
-          and bm.is_deny = false
-      ) or exists (
-        select 1 from estate_memberships em
-        where em.principal_id = $1::uuid
-          and em.estate_id = (select household_id from brains where id = $2::uuid)
-          and em.role = 'admin'
-          and em.is_deny = false
-      ) as allowed
-    `,
-    [accessContext.principalId, brainId],
-  );
-
-  if (!result.rows[0]?.allowed) {
-    throw new HttpError(403, `Not authorized to ${action} in this brain`);
-  }
-
-  return actor;
-}
-
-// M5 D7/D9: authorize a PURGE (hard erasure) on a resolved brain. Purge is
-// STRICTER than delete/restore: it is admin-only AND forbids the bare legacy key.
-//
-// D9 distinguishes the two admin shapes: the bare MCP_ACCESS_KEY resolves to
-// authSource='legacy_admin_key' with principalId=null (global, cross-household,
-// unattributable) — FORBIDDEN for purge. A named stored is_admin key resolves to
-// authSource='service_key', isAdmin=true, with a non-null principalId — the only
-// caller allowed to purge. Owners can soft-delete but NOT purge; editors/viewers
-// are denied. Returns the same actor descriptor shape as authorizeDestructive.
-export function authorizePurge(accessContext, brainId) {
-  if (
-    accessContext.isAdmin === true
-    && accessContext.authSource === "service_key"
-    && accessContext.principalId
-  ) {
-    return {
-      auth_source: accessContext.authSource,
-      principal_id: accessContext.principalId,
-      is_admin: true,
-    };
-  }
-
-  throw new HttpError(403, "Not authorized to purge in this brain");
-}
-
+// The set of brains a READ spans (v24 D4/D6). An explicit selector narrows to
+// one; otherwise the policy plans the fanout (all accessible, single effective
+// for an L1-narrowed or legacy caller).
 export async function resolveReadBrains(accessContext, brainArg) {
   const selector = typeof brainArg === "string" ? brainArg.trim() : brainArg;
   if (selector) {
     return [await resolveRequestBrain(accessContext, selector)];
   }
-  if (accessContext.requestedBrainId) {
-    return [await brainRef(accessContext.effectiveBrainId, accessContext.effectiveBrainSlug)];
-  }
-  const accessible = accessContext.accessibleBrains;
-  if (Array.isArray(accessible) && accessible.length > 0) {
-    return accessible;
-  }
-  return [await brainRef(accessContext.effectiveBrainId, accessContext.effectiveBrainSlug)];
+
+  const { caller, scope } = accessContext._policy;
+  const effectiveBrain = {
+    brainId: accessContext.effectiveBrainId,
+    brainSlug: accessContext.effectiveBrainSlug ?? null,
+  };
+  return planReadFanout({
+    caller,
+    scope,
+    // An L1 selector (route/query/header) narrows the read to that one brain.
+    explicitBrain: accessContext.requestedBrainId ? effectiveBrain : null,
+    effectiveBrain,
+  });
+}
+
+// Look up the caller's brain/estate membership for a resolved brain, from the
+// rows fetched at context-assembly time.
+function membershipForBrain(accessContext, brainId) {
+  const { brainMembershipById, estateMembershipByEstate, brainEstateById } = accessContext._policy;
+  const brainMembership = brainMembershipById.get(brainId) ?? null;
+  const estateId = brainEstateById.get(brainId) ?? null;
+  const estateMembership = estateId ? (estateMembershipByEstate.get(estateId) ?? null) : null;
+  return { brainMembership, estateMembership };
+}
+
+function authorizeVerb(accessContext, brainId, action) {
+  const { caller } = accessContext._policy;
+  const { brainMembership, estateMembership } = membershipForBrain(accessContext, brainId);
+  const verdict = authorizeAction({ caller, action, brainMembership, estateMembership });
+  return actionVerdictToActor(verdict, action);
+}
+
+// Authorize a WRITE (capture/upsert) on a resolved brain (ADR-0002 ladder:
+// editor/owner, or estate admin; viewer and estate member are read-only).
+// Returns the audit actor descriptor on allow; throws HttpError(403) on deny.
+export async function authorizeWrite(accessContext, brainId) {
+  return authorizeVerb(accessContext, brainId, ACTIONS.WRITE);
+}
+
+// Authorize a destructive op (delete/restore) on a resolved brain. Returns the
+// audit actor on allow; throws HttpError(403) on deny.
+export async function authorizeDestructive(accessContext, brainId, { action }) {
+  return authorizeVerb(accessContext, brainId, action);
+}
+
+// Authorize a PURGE (hard erasure). Stricter than delete/restore: a named admin
+// service key only — the bare legacy key and role-based principals are refused
+// (the policy enforces the shape). Synchronous: all rows are prefetched.
+export function authorizePurge(accessContext, brainId) {
+  return authorizeVerb(accessContext, brainId, ACTIONS.PURGE);
 }
