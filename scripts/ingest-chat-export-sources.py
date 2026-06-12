@@ -7,12 +7,20 @@ import sys
 from hashlib import sha256
 from pathlib import Path
 
-import requests
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 CHATGPT_IMPORTER_PATH = REPO_ROOT / "recipes" / "chatgpt-conversation-import" / "import-chatgpt.py"
 CLAUDE_IMPORTER_PATH = REPO_ROOT / "recipes" / "claude-conversation-import" / "import-claude.py"
+
+from recipes.shared_capture import (  # noqa: E402  (after sys.path setup above)
+    RETRIEVAL_ROLE_SOURCE,
+    CaptureClient,
+    build_payload,
+    conversation_record_key,
+    conversation_source_key,
+)
 
 DEFAULT_BASE_URL = os.environ.get("OPEN_BRAIN_BASE_URL") or f"http://127.0.0.1:{os.environ.get('OPEN_BRAIN_PORT', '8787')}"
 DEFAULT_ACCESS_KEY = os.environ.get("MCP_ACCESS_KEY") or os.environ.get("OPEN_BRAIN_ACCESS_KEY") or ""
@@ -70,25 +78,8 @@ def text_hash(value):
 
 
 def post_ingest(base_url, access_key, payload):
-    response = requests.post(
-        f"{base_url}/ingest/thought",
-        headers={
-            "Content-Type": "application/json",
-            "x-access-key": access_key,
-            "x-ingest-key": access_key,
-        },
-        json=payload,
-        timeout=300,
-    )
-    body_text = response.text
-    try:
-        body = response.json()
-    except ValueError:
-        body = {"raw_response": body_text}
-
-    if response.status_code not in (200, 201):
-        raise RuntimeError(f"{response.status_code} {response.reason}: {body_text}")
-    return body
+    # Shared Capture client: one retry policy, one header/auth convention.
+    return CaptureClient(base_url, access_key).capture(payload)
 
 
 def record_descriptor(platform, title, date_str, conversation_id, conversation_hash):
@@ -164,15 +155,19 @@ def chatgpt_build_items(conv):
     items = [
         {
             "kind": "raw_record",
-            "dedupe_key": f"chatgpt:conversation_record:{conversation_hash}",
-            "payload": {
-                "content": record_descriptor("ChatGPT", title, date_str, conversation_id, conversation_hash),
-                "metadata": {
-                    "source": "chatgpt",
-                    "type": "chatgpt_conversation_record",
-                    "retrieval_role": "source",
-                    "summary": title,
-                    "topics": ["chatgpt", "conversation", "record"],
+            "dedupe_key": conversation_record_key("chatgpt", conversation_hash),
+            "payload": build_payload(
+                content=record_descriptor("ChatGPT", title, date_str, conversation_id, conversation_hash),
+                source="chatgpt",
+                thought_type="chatgpt_conversation_record",
+                retrieval_role=RETRIEVAL_ROLE_SOURCE,
+                summary=title,
+                topics=["chatgpt", "conversation", "record"],
+                tags=["chatgpt", "conversation", "record"],
+                occurred_at=date_str,
+                dedupe_key=conversation_record_key("chatgpt", conversation_hash),
+                extract_metadata=False,
+                metadata={
                     "source_record_origin": "chatgpt_export_direct",
                     "content_format": "chatgpt_export_json",
                     "raw_json_sha256": raw_json_hash,
@@ -180,13 +175,7 @@ def chatgpt_build_items(conv):
                     "normalized_transcript_available": bool(transcript),
                     **common,
                 },
-                "source": "chatgpt",
-                "type": "chatgpt_conversation_record",
-                "tags": ["chatgpt", "conversation", "record"],
-                "occurred_at": date_str,
-                "dedupe_key": f"chatgpt:conversation_record:{conversation_hash}",
-                "extract_metadata": False,
-            },
+            ),
         }
     ]
 
@@ -194,29 +183,27 @@ def chatgpt_build_items(conv):
         items.append(
             {
                 "kind": "transcript_source",
-                "dedupe_key": f"chatgpt:conversation_source:{conversation_hash}",
-                "payload": {
-                    "content": transcript,
-                    "metadata": {
-                        "source": "chatgpt",
-                        "type": "chatgpt_conversation_source",
-                        "retrieval_role": "source",
-                        "summary": title,
-                        "topics": ["chatgpt", "conversation", "source"],
+                "dedupe_key": conversation_source_key("chatgpt", conversation_hash),
+                "payload": build_payload(
+                    content=transcript,
+                    source="chatgpt",
+                    thought_type="chatgpt_conversation_source",
+                    retrieval_role=RETRIEVAL_ROLE_SOURCE,
+                    summary=title,
+                    topics=["chatgpt", "conversation", "source"],
+                    tags=["chatgpt", "conversation", "source"],
+                    occurred_at=date_str,
+                    dedupe_key=conversation_source_key("chatgpt", conversation_hash),
+                    extract_metadata=False,
+                    metadata={
                         "source_record_origin": "chatgpt_export_direct",
                         "content_format": "normalized_visible_transcript",
                         "full_text": transcript,
                         "user_text": user_text,
-                        "source_record_dedupe_key": f"chatgpt:conversation_record:{conversation_hash}",
+                        "source_record_dedupe_key": conversation_record_key("chatgpt", conversation_hash),
                         **common,
                     },
-                    "source": "chatgpt",
-                    "type": "chatgpt_conversation_source",
-                    "tags": ["chatgpt", "conversation", "source"],
-                    "occurred_at": date_str,
-                    "dedupe_key": f"chatgpt:conversation_source:{conversation_hash}",
-                    "extract_metadata": False,
-                },
+                ),
             }
         )
 
@@ -252,15 +239,19 @@ def claude_build_items(conv):
     items = [
         {
             "kind": "raw_record",
-            "dedupe_key": f"claude:conversation_record:{conversation_hash}",
-            "payload": {
-                "content": record_descriptor("Claude", title, date_str, conversation_id, conversation_hash),
-                "metadata": {
-                    "source": "claude",
-                    "type": "claude_conversation_record",
-                    "retrieval_role": "source",
-                    "summary": title,
-                    "topics": ["claude", "conversation", "record"],
+            "dedupe_key": conversation_record_key("claude", conversation_hash),
+            "payload": build_payload(
+                content=record_descriptor("Claude", title, date_str, conversation_id, conversation_hash),
+                source="claude",
+                thought_type="claude_conversation_record",
+                retrieval_role=RETRIEVAL_ROLE_SOURCE,
+                summary=title,
+                topics=["claude", "conversation", "record"],
+                tags=["claude", "conversation", "record"],
+                occurred_at=date_str,
+                dedupe_key=conversation_record_key("claude", conversation_hash),
+                extract_metadata=False,
+                metadata={
                     "source_record_origin": "claude_export_direct",
                     "content_format": "claude_export_json",
                     "raw_json_sha256": raw_json_hash,
@@ -268,13 +259,7 @@ def claude_build_items(conv):
                     "normalized_transcript_available": bool(transcript),
                     **common,
                 },
-                "source": "claude",
-                "type": "claude_conversation_record",
-                "tags": ["claude", "conversation", "record"],
-                "occurred_at": date_str,
-                "dedupe_key": f"claude:conversation_record:{conversation_hash}",
-                "extract_metadata": False,
-            },
+            ),
         }
     ]
 
@@ -282,29 +267,27 @@ def claude_build_items(conv):
         items.append(
             {
                 "kind": "transcript_source",
-                "dedupe_key": f"claude:conversation_source:{conversation_hash}",
-                "payload": {
-                    "content": transcript,
-                    "metadata": {
-                        "source": "claude",
-                        "type": "claude_conversation_source",
-                        "retrieval_role": "source",
-                        "summary": title,
-                        "topics": ["claude", "conversation", "source"],
+                "dedupe_key": conversation_source_key("claude", conversation_hash),
+                "payload": build_payload(
+                    content=transcript,
+                    source="claude",
+                    thought_type="claude_conversation_source",
+                    retrieval_role=RETRIEVAL_ROLE_SOURCE,
+                    summary=title,
+                    topics=["claude", "conversation", "source"],
+                    tags=["claude", "conversation", "source"],
+                    occurred_at=date_str,
+                    dedupe_key=conversation_source_key("claude", conversation_hash),
+                    extract_metadata=False,
+                    metadata={
                         "source_record_origin": "claude_export_direct",
                         "content_format": "normalized_visible_transcript",
                         "full_text": transcript,
                         "user_text": user_text,
-                        "source_record_dedupe_key": f"claude:conversation_record:{conversation_hash}",
+                        "source_record_dedupe_key": conversation_record_key("claude", conversation_hash),
                         **common,
                     },
-                    "source": "claude",
-                    "type": "claude_conversation_source",
-                    "tags": ["claude", "conversation", "source"],
-                    "occurred_at": date_str,
-                    "dedupe_key": f"claude:conversation_source:{conversation_hash}",
-                    "extract_metadata": False,
-                },
+                ),
             }
         )
 

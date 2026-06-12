@@ -17,6 +17,8 @@ from pathlib import Path
 
 import requests
 
+from recipes.shared_capture import CaptureClient
+
 
 LOCAL_LLM_BASE = os.environ.get("LLM_BASE_URL", "").rstrip("/")
 LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "DeepSeek-V4-Flash-nvfp4")
@@ -616,14 +618,17 @@ def summarize_document(title, document_text):
 
 
 def ingest_thought(content, metadata_dict, *, dedupe_key, thought_type, source="document", tags=None, extract_metadata=False):
-    resp = http_post_with_retry(
-        LOCAL_INGEST_URL,
-        headers={
-            "Content-Type": "application/json",
-            "x-access-key": LOCAL_INGEST_KEY,
-            "x-ingest-key": LOCAL_INGEST_KEY,
-        },
-        json_body={
+    # Thin adapter over the shared Capture client (PRD docs/34, module 4,
+    # decision A): this signature is preserved so its callers (document-import,
+    # email-history-import) need no change, while capture traffic now shares the
+    # one retry policy + header/auth convention. The payload shape is unchanged
+    # — metadata_dict is the caller's pre-built block (no structured-core
+    # injection), and no occurred_at key is sent, exactly as before.
+    client = CaptureClient(
+        "", LOCAL_INGEST_KEY, ingest_url=LOCAL_INGEST_URL
+    )
+    return client.capture(
+        {
             "content": content,
             "metadata": metadata_dict,
             "source": source,
@@ -631,13 +636,5 @@ def ingest_thought(content, metadata_dict, *, dedupe_key, thought_type, source="
             "tags": tags or [],
             "dedupe_key": dedupe_key,
             "extract_metadata": extract_metadata,
-        },
-        timeout=240,
+        }
     )
-
-    if not resp:
-        raise RuntimeError("No response from local OB1 ingest endpoint")
-    if resp.status_code not in (200, 201):
-        raise RuntimeError(f"Local OB1 ingest failed ({resp.status_code}): {resp.text[:500]}")
-
-    return resp.json()

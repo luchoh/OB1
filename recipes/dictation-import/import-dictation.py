@@ -33,6 +33,14 @@ from recipes.shared_docling import (
     sha256_text,
     truncate_text,
 )
+from recipes.shared_capture import (
+    RETRIEVAL_ROLE_DISTILLED,
+    RETRIEVAL_ROLE_SOURCE,
+    CaptureClient,
+    build_payload,
+    derived_thought_key,
+    dictation_source_key,
+)
 from recipes.shared_object_store import first_env, optional_env_flag, resolve_minio_endpoint
 from recipes.shared_telegram_review_state import (
     DICTATION_RESOLUTION_EXPIRED,
@@ -352,39 +360,20 @@ def normalize_optional_string(value):
 
 
 def derive_source_dedupe_key(metadata):
-    audio_sha256 = normalize_optional_string(metadata.get("audio_sha256"))
-    artifact_id = normalize_optional_string(metadata.get("artifact_id"))
-    source_host = normalize_optional_string(metadata.get("source_host")) or "unknown"
-    created_at = normalize_optional_string(metadata.get("created_at")) or "unknown"
-    cleaned_text_hash = normalize_optional_string(metadata.get("cleaned_text_hash")) or "unknown"
-
-    if audio_sha256:
-        return f"dictation:{audio_sha256}"
-    if artifact_id:
-        return f"dictation:{artifact_id}"
-    return f"dictation:{source_host}:{created_at}:{cleaned_text_hash}"
+    # Format owned by the shared dedupe-key registry; per-field normalization
+    # (blank/"null"/"none" -> None) stays here, the adapter's job.
+    return dictation_source_key(
+        audio_sha256=normalize_optional_string(metadata.get("audio_sha256")),
+        artifact_id=normalize_optional_string(metadata.get("artifact_id")),
+        source_host=normalize_optional_string(metadata.get("source_host")),
+        created_at=normalize_optional_string(metadata.get("created_at")),
+        cleaned_text_hash=normalize_optional_string(metadata.get("cleaned_text_hash")),
+    )
 
 
 def ingest_row(base_url: str, access_key: str, payload: dict):
-    response = requests.post(
-        f"{base_url.rstrip('/')}/ingest/thought",
-        headers={
-            "Content-Type": "application/json",
-            "x-access-key": access_key,
-            "x-ingest-key": access_key,
-        },
-        json=payload,
-        timeout=300,
-    )
-    body_text = response.text
-    try:
-        body = response.json()
-    except ValueError:
-        body = {"raw_response": body_text}
-
-    if response.status_code not in (200, 201):
-        raise RuntimeError(f"{response.status_code} {response.reason}: {body_text}")
-    return body
+    # Shared Capture client: one retry policy, one header/auth convention.
+    return CaptureClient(base_url, access_key).capture(payload)
 
 
 def summarize_dictation(body_text: str, metadata: dict, llm_model: str):
@@ -602,60 +591,55 @@ def object_descriptor(source_name: str, identifier: str):
 
 def build_source_payload(body_text: str, metadata: dict, *, occurred_at: str | None, dedupe_key: str, artifact_ref: dict):
     title = normalize_optional_string(metadata.get("title")) or "Dictation note"
-    source_metadata = {
-        "source": "dictation",
-        "type": "dictation_note",
-        "retrieval_role": "source",
-        "summary": title,
-        "topics": ["dictation", "capture"],
-        "artifact_id": normalize_optional_string(metadata.get("artifact_id")),
-        "audio_sha256": normalize_optional_string(metadata.get("audio_sha256")),
-        "audio_filename": normalize_optional_string(metadata.get("audio_filename")),
-        "cleanup_mode": normalize_optional_string(metadata.get("cleanup_mode")),
-        "dictation_storage_backend": artifact_ref.get("storage_backend"),
-        "dictation_object_key": artifact_ref.get("object_key"),
-        "dictation_bucket": artifact_ref.get("bucket"),
-        "full_text": body_text,
-        **metadata,
-    }
-    return {
-        "content": body_text,
-        "metadata": source_metadata,
-        "source": "dictation",
-        "type": "dictation_note",
-        "tags": ["dictation", "capture"],
-        "occurred_at": occurred_at,
-        "dedupe_key": dedupe_key,
-        "extract_metadata": False,
-    }
+    # extras end with **metadata so raw frontmatter overrides the structured
+    # keys on collision (splat-last) — build_payload merges extras over its core.
+    return build_payload(
+        content=body_text,
+        source="dictation",
+        thought_type="dictation_note",
+        retrieval_role=RETRIEVAL_ROLE_SOURCE,
+        summary=title,
+        topics=["dictation", "capture"],
+        tags=["dictation", "capture"],
+        occurred_at=occurred_at,
+        dedupe_key=dedupe_key,
+        extract_metadata=False,
+        metadata={
+            "artifact_id": normalize_optional_string(metadata.get("artifact_id")),
+            "audio_sha256": normalize_optional_string(metadata.get("audio_sha256")),
+            "audio_filename": normalize_optional_string(metadata.get("audio_filename")),
+            "cleanup_mode": normalize_optional_string(metadata.get("cleanup_mode")),
+            "dictation_storage_backend": artifact_ref.get("storage_backend"),
+            "dictation_object_key": artifact_ref.get("object_key"),
+            "dictation_bucket": artifact_ref.get("bucket"),
+            "full_text": body_text,
+            **metadata,
+        },
+    )
 
 
 def build_thought_payload(content: str, metadata: dict, *, occurred_at: str | None, source_dedupe_key: str, thought_index: int, artifact_ref: dict):
-    thought_dedupe = f"{source_dedupe_key}:thought:{thought_index}"
-    thought_metadata = {
-        "source": "dictation",
-        "type": "dictation_thought",
-        "retrieval_role": "distilled",
-        "summary": truncate_text(content, 120),
-        "topics": ["dictation"],
-        "artifact_id": normalize_optional_string(metadata.get("artifact_id")),
-        "audio_sha256": normalize_optional_string(metadata.get("audio_sha256")),
-        "source_dedupe_key": source_dedupe_key,
-        "source_created_at": normalize_optional_string(metadata.get("created_at")),
-        "dictation_storage_backend": artifact_ref.get("storage_backend"),
-        "dictation_object_key": artifact_ref.get("object_key"),
-        "dictation_bucket": artifact_ref.get("bucket"),
-    }
-    return {
-        "content": content,
-        "metadata": thought_metadata,
-        "source": "dictation",
-        "type": "dictation_thought",
-        "tags": ["dictation"],
-        "occurred_at": occurred_at,
-        "dedupe_key": thought_dedupe,
-        "extract_metadata": False,
-    }
+    return build_payload(
+        content=content,
+        source="dictation",
+        thought_type="dictation_thought",
+        retrieval_role=RETRIEVAL_ROLE_DISTILLED,
+        summary=truncate_text(content, 120),
+        topics=["dictation"],
+        tags=["dictation"],
+        occurred_at=occurred_at,
+        dedupe_key=derived_thought_key(source_dedupe_key, thought_index),
+        extract_metadata=False,
+        metadata={
+            "artifact_id": normalize_optional_string(metadata.get("artifact_id")),
+            "audio_sha256": normalize_optional_string(metadata.get("audio_sha256")),
+            "source_dedupe_key": source_dedupe_key,
+            "source_created_at": normalize_optional_string(metadata.get("created_at")),
+            "dictation_storage_backend": artifact_ref.get("storage_backend"),
+            "dictation_object_key": artifact_ref.get("object_key"),
+            "dictation_bucket": artifact_ref.get("bucket"),
+        },
+    )
 
 
 def artifact_processed(log: dict, dedupe_key: str, ref_key: str):

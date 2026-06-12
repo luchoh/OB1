@@ -33,6 +33,14 @@ from recipes.shared_docling import (
     local_llm_base_url,
     truncate_text,
 )
+from recipes.shared_capture import (
+    RETRIEVAL_ROLE_DISTILLED,
+    RETRIEVAL_ROLE_SOURCE,
+    CaptureClient,
+    build_payload,
+    derived_thought_key,
+    telegram_message_key,
+)
 from recipes.shared_object_store import first_env, optional_env_flag, resolve_minio_endpoint
 from recipes.shared_telegram_review_state import (
     DICTATION_RESOLUTION_IGNORED,
@@ -575,24 +583,10 @@ def review_thought_novelty(candidate_thoughts: list[str], similar_matches: dict[
 
 
 def ingest_row(base_url: str, access_key: str, payload: dict):
-    response = requests.post(
-        f"{base_url.rstrip('/')}/ingest/thought",
-        headers={
-            "Content-Type": "application/json",
-            "x-access-key": access_key,
-            "x-ingest-key": access_key,
-        },
-        json=payload,
-        timeout=300,
-    )
-    body_text = response.text
-    try:
-        body = response.json()
-    except ValueError:
-        body = {"raw_response": body_text}
-    if response.status_code not in (200, 201):
-        raise RuntimeError(f"{response.status_code} {response.reason}: {body_text}")
-    return body
+    # Shared Capture client: one retry policy (2 retries on 5xx/connection
+    # error), one header/auth convention. Capture is idempotent on dedupe_key,
+    # so a replayed POST after a transient failure updates the existing row.
+    return CaptureClient(base_url, access_key).capture(payload)
 
 
 def build_text_source_payload(message: dict, text: str):
@@ -601,36 +595,30 @@ def build_text_source_payload(message: dict, text: str):
     chat_id = str(chat["id"])
     message_id = message["message_id"]
     occurred_at = datetime.fromtimestamp(message["date"], tz=timezone.utc).isoformat()
-    dedupe_key = f"telegram:{chat_id}:{message_id}"
-    username = from_user.get("username")
 
-    metadata = {
-        "source": "telegram",
-        "type": "telegram_message",
-        "retrieval_role": "source",
-        "summary": truncate_text(text, 120),
-        "topics": ["telegram", "capture"],
-        "telegram_update_id": message.get("_ob1_update_id"),
-        "telegram_chat_id": chat_id,
-        "telegram_chat_type": chat.get("type"),
-        "telegram_message_id": message_id,
-        "telegram_user_id": from_user.get("id"),
-        "telegram_username": username,
-        "telegram_message_date": occurred_at,
-        "telegram_media_type": "text",
-        "full_text": text,
-    }
-
-    return {
-        "content": text,
-        "metadata": metadata,
-        "source": "telegram",
-        "type": "telegram_message",
-        "tags": ["telegram", "capture"],
-        "occurred_at": occurred_at,
-        "dedupe_key": dedupe_key,
-        "extract_metadata": False,
-    }
+    return build_payload(
+        content=text,
+        source="telegram",
+        thought_type="telegram_message",
+        retrieval_role=RETRIEVAL_ROLE_SOURCE,
+        summary=truncate_text(text, 120),
+        topics=["telegram", "capture"],
+        tags=["telegram", "capture"],
+        occurred_at=occurred_at,
+        dedupe_key=telegram_message_key(chat_id, message_id),
+        extract_metadata=False,
+        metadata={
+            "telegram_update_id": message.get("_ob1_update_id"),
+            "telegram_chat_id": chat_id,
+            "telegram_chat_type": chat.get("type"),
+            "telegram_message_id": message_id,
+            "telegram_user_id": from_user.get("id"),
+            "telegram_username": from_user.get("username"),
+            "telegram_message_date": occurred_at,
+            "telegram_media_type": "text",
+            "full_text": text,
+        },
+    )
 
 
 def build_text_thought_payload(message: dict, thought: str, source_dedupe_key: str, index: int):
@@ -638,29 +626,25 @@ def build_text_thought_payload(message: dict, thought: str, source_dedupe_key: s
     from_user = message.get("from") or {}
     occurred_at = datetime.fromtimestamp(message["date"], tz=timezone.utc).isoformat()
 
-    metadata = {
-        "source": "telegram",
-        "type": "telegram_thought",
-        "retrieval_role": "distilled",
-        "summary": truncate_text(thought, 120),
-        "topics": ["telegram"],
-        "telegram_chat_id": str(chat["id"]),
-        "telegram_message_id": message["message_id"],
-        "telegram_user_id": from_user.get("id"),
-        "telegram_username": from_user.get("username"),
-        "source_dedupe_key": source_dedupe_key,
-    }
-
-    return {
-        "content": thought,
-        "metadata": metadata,
-        "source": "telegram",
-        "type": "telegram_thought",
-        "tags": ["telegram"],
-        "occurred_at": occurred_at,
-        "dedupe_key": f"{source_dedupe_key}:thought:{index}",
-        "extract_metadata": True,
-    }
+    return build_payload(
+        content=thought,
+        source="telegram",
+        thought_type="telegram_thought",
+        retrieval_role=RETRIEVAL_ROLE_DISTILLED,
+        summary=truncate_text(thought, 120),
+        topics=["telegram"],
+        tags=["telegram"],
+        occurred_at=occurred_at,
+        dedupe_key=derived_thought_key(source_dedupe_key, index),
+        extract_metadata=True,
+        metadata={
+            "telegram_chat_id": str(chat["id"]),
+            "telegram_message_id": message["message_id"],
+            "telegram_user_id": from_user.get("id"),
+            "telegram_username": from_user.get("username"),
+            "source_dedupe_key": source_dedupe_key,
+        },
+    )
 
 
 def message_text(message: dict) -> str | None:
