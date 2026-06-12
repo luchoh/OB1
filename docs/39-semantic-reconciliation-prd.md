@@ -113,9 +113,11 @@ From the brain owner's perspective:
 6. As a brain owner, I want the probe to show me actual candidate pairs in
    each similarity band, so that I can judge with my own eyes what "0.88
    similar" means under our embedding model.
-7. As a maintainer, I want the probe to derive calibrated skip/reconcile
-   thresholds from our real data, so that we never inherit thresholds
-   tuned for a different embedding model.
+7. As a maintainer, I want the probe to *recommend* calibrated
+   skip/reconcile thresholds from our real data — distribution and sample
+   pairs surfaced for the owner to confirm or override — so that we never
+   inherit thresholds tuned for a different embedding model and never
+   auto-adopt a threshold no human eyeballed.
 8. As a brain owner, I want the probe to be strictly read-only against the
    thoughts store, so that running it carries zero risk to my data.
 9. As a brain owner, I want capture of a semantically near-identical
@@ -190,9 +192,12 @@ From the brain owner's perspective:
 
 **Sequencing and gating.** Three packages, strictly ordered. Package 1
 (SQL fixes) has no dependencies. Package 2 (probe) has no dependencies but
-its report gates package 3: if near-duplicate inflow is negligible
-(guideline: under 1–2% of recent captures with a confirmed-duplicate
-band match), package 3 is shelved and this PRD is closed with the
+its report gates package 3: if near-duplicate inflow is negligible —
+guideline: under 1–2% of the sampled rows have a nearest neighbor at or
+above the *owner-confirmed* skip/reconcile band from the probe report
+(the denominator is the probe's sample, N rows; "confirmed-duplicate band"
+is the band the owner accepted in Package 2, not a value the gate
+re-derives) — package 3 is shelved and this PRD is closed with the
 measurement as its outcome. Package 3 additionally ships in two stages:
 logging-only and enforcing, with the promotion between them a config change
 made after reviewing the logged decisions. In **logging-only** every thought
@@ -208,27 +213,76 @@ ranked retrieval.
 **Package 1 — Migration 013.** A single new migration redefines only the
 read-only retrieval functions that actually carry a defect, leaving the
 already-correct ones untouched. `match_thoughts`, `search_thoughts_text`,
-and `get_thought_connections` are currently `VOLATILE` and become `STABLE`;
-`search_thoughts_text` additionally gets its `NOT IN (subquery)` anti-join
-rewritten as `NOT EXISTS` and its ranking fallbacks aligned with the
-declared column defaults (importance default 3, quality score default 50 on
-a 0–100 scale — currently 5 and 0.50). `match_thoughts_recency` and
-`brain_stats_aggregate` are already `STABLE` (recency is also `parallel
-safe`), and the SQL-language functions `list_recent_thoughts` /
-`thoughts_stats` already default to `STABLE`, so Package 1 does not touch
-any of them. No signature changes, no behavior changes for non-NULL data.
-Historical migrations are not edited.
+and `get_thought_connections` are currently `VOLATILE` (`match_thoughts`
+and `get_thought_connections` carry no volatility keyword and so default to
+`VOLATILE`; `search_thoughts_text` is explicitly marked `volatile`) and
+become `STABLE`; `search_thoughts_text` additionally gets its
+`NOT IN (subquery)` anti-join rewritten as `NOT EXISTS` and its ranking
+fallbacks aligned with the declared column defaults (importance default 3,
+quality score default 50 on a 0–100 scale — currently 5 and 0.50).
+`list_recent_thoughts` and `thoughts_stats` are also redefined `STABLE`:
+they are `LANGUAGE sql` functions, which default to `VOLATILE` just like
+plpgsql (*not* to `STABLE`), so they were genuinely mismarked — and
+`list_recent_thoughts` is a live listing path, so leaving it `VOLATILE`
+would leave story 1 unsatisfied. `stable` is a one-word, behavior-preserving
+addition to each single-SELECT body that also lets the planner inline them.
+That makes five functions Package 1 redefines. `match_thoughts_recency`
+(already `stable parallel safe`) and `brain_stats_aggregate` (already
+`stable`) are the only ranked/stats read functions Package 1 leaves
+untouched.
+
+013 copies each function body **verbatim from migration 011** — the current
+live definition, *not* 005/006/008 — because 011 re-emitted these bodies
+with the `and ... deleted_at is null` tombstone guards added by the
+soft-delete work (docs/32); copying from the original migrations would
+silently regress that fix. Equally, the re-emit must preserve each
+function's other non-default attributes: `search_thoughts_text`'s
+`set statement_timeout` and `get_thought_connections`'s `security definer`
+/ `set search_path`. The only intended deltas are the volatility keyword,
+the `NOT EXISTS` rewrite, and the two coalesce fallbacks (`5→3`,
+`0.50→50`). 013 is a new file (`013_*.sql`), object-level idempotent via
+`CREATE OR REPLACE FUNCTION` (safe to re-apply by hand), though the
+migration runner records and applies each filename once.
+
+No signature changes. The only intended behavior change is the rank
+fallback: rows with `NULL` `importance` or `quality_score` are re-ranked to
+match an explicit-default row — a *deliberate* correction, not pure
+equivalence (see Testing). Rows with non-NULL importance/quality are
+unaffected. `search_thoughts_text` is the repo's dormant/unfiltered lexical
+path, bounding the live blast radius of this re-rank. Historical migrations
+are not edited.
 
 **Package 2 — Similarity probe.** A standalone read-only script (in the
 repo's scripts area, runnable against dev and prod databases) that, per
-brain: samples recent thoughts, computes pairwise nearest-neighbor
-similarity using the existing vector index and the brain's stored
-embeddings, and emits a report with (a) the similarity distribution,
-(b) counts per candidate band, (c) a reviewable sample of concrete pairs
-per band, and (d) recommended skip/reconcile thresholds with the evidence
-behind them. The probe must not depend on package 3 existing. Its
-recommended thresholds become the initial configuration values for
-package 3.
+brain, samples thoughts and measures their nearest-neighbor similarity:
+
+- *Scope and sampling.* The probe queries one brain at a time under the
+  exact predicate set `match_thoughts` uses — `where brain_id = $1 and
+  deleted_at is null and embedding is not null and embedding_dimension =
+  1536` — so it never reaches across brains (ADR-0003) and never measures
+  tombstoned rows. It samples up to N rows (default 1000, configurable;
+  "recent" = most recent by `created_at`), and for *each* sampled row runs
+  a top-k nearest-neighbor query (`order by embedding <=> $row_embedding
+  limit k`, k default 5, excluding self) against that brain's rows via the
+  existing HNSW index. This is k·N indexed lookups, **not** an O(n²)
+  all-pairs scan.
+- *Report.* It emits (a) the full similarity distribution; (b) counts per
+  fixed *measurement bucket* — histogram edges every 0.05 across [0.70,
+  1.00], explicitly labeled measurement buckets, **not** decision
+  thresholds; (c) a reviewable sample of concrete (row, neighbor,
+  similarity) pairs per bucket for the owner to eyeball; and (d) a
+  *recommended* skip/reconcile threshold band. The recommendation is
+  human-in-the-loop, not an automated derivation: the report surfaces the
+  buckets and their sample pairs, and the owner reads down from the top to
+  pick the similarity above which the sample is unambiguously true-duplicate
+  (→ skip) and the lower edge where pairs read as "same fact, different
+  richness" (→ reconcile). The probe proposes a band from the distribution
+  shape; the owner confirms or overrides it from the samples. No threshold
+  is auto-adopted.
+
+The probe must not depend on package 3 existing — it reads only
+`thoughts.embedding` and the HNSW index, both of which predate this PRD. The
+confirmed thresholds become the initial configuration values for package 3.
 
 **Package 3 — Reconciler.** Three pieces:
 
@@ -243,8 +297,10 @@ package 3.
   from upstream: where upstream fails closed (skip on error), we fall back
   to plain `add` with the error recorded — in a personal memory system,
   storing a duplicate is recoverable; dropping a thought is not.
-- *Schema (migration 014).* Three additive, idempotent, re-runnable parts,
-  following the thought-audit pattern of migration 012 (docs/27):
+- *Schema (the reconciliation-schema migration — the next free number, 015,
+  since 013 is the retrieval-correctness fixes and 014 is the legacy-overload
+  drop).* Three additive, idempotent, re-runnable parts, following the
+  thought-audit pattern of migration 012 (docs/27):
   1. A nullable `supersedes_thought_id` link on `thoughts` — a soft
      self-reference (not a FK, mirroring `thought_audit.thought_id`, so it
      survives a future purge of either side). The `create_revision` decision
@@ -291,9 +347,10 @@ package 3.
      the runtime takes whenever `recency_weight > 0`), `search_thoughts_text`,
      `list_recent_thoughts`, and `get_thought_connections` — with the same
      `NOT EXISTS` shape Package 1 introduces. Because these five span
-     different prior states, 014 must *preserve each function's existing
-     correct markings* as it re-emits the body: the `STABLE` Package 1 adds
-     to `match_thoughts` / `search_thoughts_text` / `get_thought_connections`
+     different prior states, the reconciliation-schema migration must
+     *preserve each function's existing correct markings* as it re-emits the
+     body: the `STABLE` Package 1 adds to `match_thoughts` /
+     `search_thoughts_text` / `get_thought_connections` / `list_recent_thoughts`
      and the `stable parallel safe` that `match_thoughts_recency` already
      carries — regressing none of them. `ask_brain` needs no separate
      treatment: its seed retrieval *is* `match_thoughts` /
@@ -391,8 +448,9 @@ exhaustive over the input matrix, no I/O) and the thought-store suite
 (DB-backed against the dev database, fixture-prefixed, audit-asserting).
 
 All four modules get tests (a different cut than the three packages:
-Package 3 splits into decision core and capture wiring, and migrations 013
-and 014 are exercised as one functions module):
+Package 3 splits into decision core and capture wiring, and migration 013
+and the reconciliation-schema migration are exercised as one functions
+module):
 
 - *Reconciler decision core* — pure decision-table tests covering the full
   matrix: identity-dedup hit, no semantic match, match above skip
@@ -413,21 +471,33 @@ and 014 are exercised as one functions module):
   `create_revision` must return the recorded `create_revision` outcome, not
   re-decide to `skip`, and must leave exactly one ledger row (asserted
   against the `(brain_id, source_dedupe_key)` unique index).
-- *Migration 013 functions* — DB-backed assertions that the redefined
-  functions return results identical to the previous definitions on
-  fixture data, carry the expected volatility markings in the catalog, and
-  that the rank formula treats explicit-default and absent values
-  identically. Migration 014 re-runs the same equivalence and volatility
-  assertions after adding the supersession exclusion, plus a case proving a
-  superseded fixture row is excluded from each read function while a
-  non-superseded control remains. Because 014 re-emits the full function
-  bodies that 013 just defined (established practice here — 011 did the same
-  to 006), the equivalence test must run against *both* migrations' outputs
-  so a hand-merge that silently drops a Package 1 correction in the 014 copy
-  fails the suite rather than reaching prod.
-- *Similarity probe* — unit tests for sampling, banding, and report
-  generation with injected data; one DB-backed smoke test that it runs
-  read-only (no writes observed) against the dev database.
+- *Migration 013 functions* — DB-backed assertions, split because the rank
+  fix is a deliberate change, not pure equivalence: (a) on fixtures whose
+  `importance`/`quality_score` are **non-NULL**, the redefined functions
+  return the identical row set and order as the previous definitions;
+  (b) a row with `NULL` importance and a row with explicit `importance = 3`
+  (likewise `quality_score NULL` vs `50`) now produce the *same* rank — the
+  fix itself, which is a change from the old `5` / `0.50` behavior, so the
+  two clauses do not contradict; (c) each redefined function carries
+  `provolatile = 's'` in `pg_proc` (identified by name +
+  `pg_get_function_identity_arguments`), and the re-emit preserved
+  `search_thoughts_text`'s `statement_timeout` and
+  `get_thought_connections`'s `security definer` / `search_path`.
+  The reconciliation-schema migration re-runs the same equivalence and
+  volatility assertions after adding the supersession exclusion, plus a case
+  proving a superseded fixture row is excluded from each read function while a
+  non-superseded control remains. Because that migration re-emits the full
+  function bodies that 013 just defined (established practice here — 011 did
+  the same to 006), the equivalence test must run against *both* migrations'
+  outputs so a hand-merge that silently drops a Package 1 correction in the
+  reconciliation-schema copy fails the suite rather than reaching prod.
+- *Similarity probe* — unit tests for sampling, bucketing, and report
+  generation with injected data; one DB-backed smoke test that asserts
+  read-only operation by enforcement, not observation: the probe holds its
+  connection in a `set transaction read only` block (or connects as a
+  read-only role), so any stray write *errors* rather than passing
+  unnoticed. The smoke test also confirms the brain-scope predicate is
+  applied (a row in a second brain is never sampled).
 
 ## Out of Scope
 
@@ -435,7 +505,7 @@ and 014 are exercised as one functions module):
   tuning, ask-path synthesis changes beyond the seed query, and any
   treatment richer than the binary in/out exclusion. The minimal SQL-level
   exclusion of superseded thoughts from the read functions *is* in scope
-  (Package 3, migration 014, part 3), because without it `create_revision`
+  (Package 3, reconciliation-schema migration, part 3), because without it `create_revision`
   inflates retrieval instead of reducing it. What remains deferred is
   everything beyond a hard in/out, which is the natural phase 2 once
   reconciliation data exists.
@@ -474,7 +544,7 @@ and 014 are exercised as one functions module):
   the audit/evidence ledger; (d) latency — one indexed
   similarity query per capture, negligible against the embedding call
   already in the path; (e) `create_revision` inflating retrieval with a
-  second live variant → mitigated by the migration-014 read-side exclusion
+  second live variant → mitigated by the reconciliation-schema read-side exclusion
   shipping in the same package, so a superseded thought leaves ranked
   retrieval the moment its revision lands; (f) concurrent captures of
   *distinct-key* near-duplicates (each misses the other's in-flight row and
