@@ -112,6 +112,19 @@ each write to identify *which run of which writer* produced it (e.g.,
 from the principal — a principal is durable identity, an author
 session is a single execution.
 
+**Projection / Projector**:
+The graph in Neo4j is a *projection*: a derived, rebuildable copy of
+the canonical Thoughts in Postgres, reshaped into nodes and edges
+(Thought ↔ Conversation / Email / Document / Concept / Person / …)
+for relationship-flavored retrieval. The *projector* is the runtime's
+background loop that keeps it in sync: each tick it scans for new or
+changed Thoughts (per-thought revision bookkeeping), turns each into a
+plan via the pure projection planner, and applies the plan to Neo4j —
+tombstones project as node deletions, restores re-project. Postgres is
+always the source of truth; the graph trails capture by roughly one
+tick and can always be rebuilt.
+_Avoid_: Sync (hides the one-way, derived nature), index, mirror.
+
 **Enriched / Enrichment**:
 A boolean column on `thoughts` and the verb form. A thought is
 "enriched" when an LLM has classified it into the structured columns
