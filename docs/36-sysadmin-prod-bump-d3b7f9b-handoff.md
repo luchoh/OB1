@@ -1,7 +1,8 @@
 # Sysadmin Handoff: Bump production OB1 to `d3b7f9b`
 
 Date: 2026-06-12
-Status: Awaiting system-config implementation
+Status: SUPERSEDED by docs/37 (never executed; the combined modules
+2+3 bump takes this range plus the graph split)
 Owner: System-config (Nix pin bump only — no DB work)
 Companion: PRD `34-architecture-deepening-prd.md` (module 2), docs/35
 (previous bump), docs/32 (D9: wire shapes are law)
