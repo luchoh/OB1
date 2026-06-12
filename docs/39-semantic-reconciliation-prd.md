@@ -309,10 +309,22 @@ package 3.
      inflate them; the fuller retrieval work (ranking/down-weight tuning,
      ask-path synthesis beyond the seed query, graph SUPERSEDES projection)
      stays out of scope.
-- *Capture wiring.* The reconciliation stage runs inside the thought
-  store's capture operation, after identity dedup resolves and before the
-  insert, scoped to the target brain. It is gated by a deployment-level
-  config flag (default off) with a per-request override. The capture
+- *Capture wiring.* Identity dedup is not a stage that resolves before the
+  insert — today it *is* the insert (`INSERT … ON CONFLICT (brain_id,
+  dedupe_key) WHERE deleted_at IS NULL DO UPDATE`, thought-store.mjs).
+  Reconciliation therefore opens with a read-only identity pre-check against
+  that partial unique index, scoped to the target brain: a hit means the
+  capture is an identity duplicate and takes today's path verbatim —
+  including its *refresh* semantics, where `DO UPDATE` overwrites content and
+  embedding and merges metadata (a re-captured, edited Telegram message
+  changes content with no reconciliation pass), so an identity hit is a
+  refresh, not a no-op — and reconciliation is bypassed entirely. A miss runs
+  the similarity query and decision core, and the final write remains the
+  existing atomic statement. The pre-check → write window is benign: if a
+  same-key capture lands in between, `ON CONFLICT DO UPDATE` degrades the
+  write to today's refresh, with reconciliation having merely run once
+  unnecessarily. The stage is gated by a deployment-level config flag
+  (default off) with a per-request override. The capture
   response gains optional reconciliation fields (decision, matched thought
   id, similarity); the existing response contract is unchanged when the
   flag is off. Idempotency: on entry the reconciliation stage looks up the
@@ -340,11 +352,14 @@ package 3.
   ledger-first short-circuit together with the revision's derived dedupe key.
   On a concurrent insert that loses the `(brain_id, source_dedupe_key)` race,
   the losing request reads back the surviving ledger row and returns that
-  decision rather than its own. Within-batch duplicates (story 25) rely on the
-  pipelines capturing batch items sequentially — each committed before the
-  next item's similarity query runs — so the second occurrence reconciles
-  against the first; truly simultaneous distinct captures remain the
-  out-of-scope race in risk (f). A retried request therefore yields exactly
+  decision rather than its own. Within-batch duplicates (story 25) require batch
+  imports to capture items sequentially when reconciliation is enabled — each
+  item committed before the next item's similarity query runs — so the second
+  occurrence reconciles against the first. This is a *requirement on the
+  module-4 pipeline services* (whose code lives outside this repo), to be
+  verified against them before package 3 ships, not an assumed property; a
+  pipeline that captures a batch concurrently falls into the out-of-scope
+  distinct-key race in risk (f). A retried request therefore yields exactly
   one outcome, at most one revision, and at most one evidence row (concurrent
   distinct captures are the separate case in risk (f), not this guarantee).
 
@@ -465,9 +480,16 @@ and 014 are exercised as one functions module):
   *distinct-key* near-duplicates (each misses the other's in-flight row and
   both insert, since the dedupe-key unique index only catches same-key
   collisions) → a known residual race, out of scope here and deferred to the
-  same follow-up as fuller retrieval handling, with a per-brain advisory lock
-  or a post-commit reconciliation sweep as the candidate fix. Same-key
-  concurrent captures are already resolved by the
-  `(brain_id, source_dedupe_key)` unique index plus read-back, and the
-  "exactly one outcome" guarantee above is scoped to retries of the same
-  capture, not to races between distinct captures.
+  same follow-up as fuller retrieval handling. The candidate fix is a
+  post-commit reconciliation sweep (subsumed by the already-deferred backfill
+  job); a cross-statement advisory lock is *not* a candidate — under the
+  autocommit-only `pool.query()` layer, `pg_advisory_xact_lock` releases at
+  statement end and a session lock on a pooled connection can unlock on a
+  different connection or leak on crash, so holding a lock across the
+  similarity-query → decision → write flow needs the same pinned-client
+  transaction plumbing that does not exist. The residual is acceptable
+  because the failure mode is byte-for-byte today's behavior — one duplicate
+  pair stored, no loss and no wrong skip. Same-key concurrent captures are
+  already resolved by the `(brain_id, source_dedupe_key)` unique index plus
+  read-back, and the "exactly one outcome" guarantee above is scoped to
+  retries of the same capture, not to races between distinct captures.
