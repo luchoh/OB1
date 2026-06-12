@@ -69,6 +69,27 @@ Service lifecycle rule:
 - do not run `devenv up`, `devenv down`, `npm start`, `npm run dev`, `node local/open-brain-mcp/src/index.mjs`, or similar orchestration commands unless the user explicitly instructs you
 - focus on code changes, diagnostics, health probes, and tests
 
+## OB1 Brain Usage (Dogfooding)
+
+This repo is estate-scoped like every other repo: agent sessions authenticate
+as the `ob1` principal (repo key in gitignored `.env.local`, loaded by
+`direnv`), and captures default to the `ob1` brain.
+
+1. Use the `mcp__ob1__*` tools. `search_thoughts` before non-trivial work —
+   the brain may already know. `capture_thought` for durable findings as you
+   work: calibrations, incident root causes, operational state changes,
+   decisions. Use a stable `dedupe_key` (`<agent>:<topic>:<date>`) and set
+   `source` to your agent name.
+2. OB1-project findings stay in the default `ob1` brain. Genuinely cross-repo
+   knowledge goes to `brain="agent-common"`. NEVER capture into a personal
+   brain.
+3. Session-local scratch does not belong in the brain; durable, cross-session
+   knowledge does.
+4. Debug escalation (estate-wide admin reach for cross-brain reads or admin
+   HTTP routes) is deliberate and per-launch, never the resting state:
+   `OB1_MCP_ACCESS_KEY="$MCP_ACCESS_KEY" claude`. Drop back to the scoped key
+   afterward.
+
 ## Repo Shape
 
 - `docs/` — setup, PRD, operational notes
