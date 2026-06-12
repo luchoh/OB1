@@ -255,6 +255,10 @@ export async function retrieveThoughts({
   };
 }
 
+// Deliberately LAX parse (any non-empty suffix) — load-bearing for callers
+// that pass raw thought ids (expand_context). The strict, fail-closed UUID
+// parse for graph identity is projection-planner.mjs's thoughtUuidFromCanonicalId;
+// these are two intents, not duplicates — do not consolidate into one.
 function thoughtIdFromCanonicalId(canonicalId) {
   if (typeof canonicalId !== "string" || !canonicalId.startsWith("thought:")) {
     return null;

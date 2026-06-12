@@ -457,6 +457,46 @@ describe("projection planner — claim/entity metadata (source-first-chat-claims
     assert.deepEqual(labelCounts(bare.nodes), { Thought: 1 });
     assert.equal(bare.edges.length, 0);
   });
+
+  // Ratified Proposal 2: hand-authored plan cases modeled on the live structure
+  // evals (graph-claim-entity-structure-eval-cases.json) — a Place case and a
+  // Concept-only case — pinned at plan level instead of converting the seed refs.
+  it("a location scope key yields a Place via LOCATED_AT (cf. restaurant_claim_entities)", () => {
+    const placePlan = planProjection(
+      baseRow({
+        content: "Best ramen is in Tokyo",
+        metadata: {
+          type: "claim",
+          source: "chatgpt",
+          user_metadata: { claim_kind: "fact", claim_subject: "Best Ramen", claim_strength: "weak", claim_scope: { city: ["Tokyo"] } },
+        },
+      }),
+      { schemaVariant: "source-first-chat-claims-v1", projectedAt: TS },
+    );
+    assert.deepEqual(labelCounts(placePlan.nodes), { Thought: 1, Concept: 1, Place: 1 });
+    assert.deepEqual(namesForLabel(placePlan.nodes, "Place"), ["Tokyo"]);
+    assert.deepEqual(edgeTuples(placePlan.edges), ["Thought-ABOUT->Concept", "Thought-LOCATED_AT->Place"]);
+    const place = placePlan.nodes.find((n) => n.label === "Place");
+    assert.equal(place.properties.source_scope_key, "city");
+    assert.equal(place.properties.confidence, 0.72); // weak claim
+  });
+
+  it("a subject-only claim yields a single Concept via ABOUT (cf. noir_transformer_claim_entities)", () => {
+    const conceptPlan = planProjection(
+      baseRow({
+        content: "The Noir Transformer is a thing",
+        metadata: {
+          type: "claim",
+          source: "chatgpt",
+          user_metadata: { claim_kind: "fact", claim_subject: "Noir Transformer" },
+        },
+      }),
+      { schemaVariant: "source-first-chat-claims-v1", projectedAt: TS },
+    );
+    assert.deepEqual(labelCounts(conceptPlan.nodes), { Thought: 1, Concept: 1 });
+    assert.deepEqual(namesForLabel(conceptPlan.nodes, "Concept"), ["Noir Transformer"]);
+    assert.deepEqual(edgeTuples(conceptPlan.edges), ["Thought-ABOUT->Concept"]);
+  });
 });
 
 describe("projection planner — malformed metadata degrades without fabricating (guard rail #5)", () => {
