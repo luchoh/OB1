@@ -1,7 +1,8 @@
 # PRD: Architecture Deepening — Thought Store, Membership Decision, Projection Planner, Capture Client, Test Harness
 
 Date: 2026-06-11
-Status: needs-triage
+Status: IMPLEMENTED 2026-06-12 — all five modules landed, verified, and
+(runtime) deployed to prod; see Outcome at the end of this document
 Owner: Runtime / Ingest / Verification
 Companion: ADR-0001 (agent estate), v24 PRD (canonical agent-estate semantics),
 docs/32 (thought-delete decision, D1–D9), docs/33 (thought-delete rollout runbook)
@@ -386,3 +387,34 @@ numbers will drift.
   the auth module; graph retrieval policy as a real seam (default +
   file adapters) with an eval program; handlers shared between HTTP and
   MCP surfaces.
+
+## Outcome (closeout, 2026-06-12)
+
+All five modules landed within two days of the PRD, each in two stages
+(inert module + suite, then rewire), each independently verified before
+landing, with three deliberate ADR-backed semantic amendments and zero
+unplanned behavior changes.
+
+| Module | Landed as | Tests |
+|--------|-----------|-------|
+| 1. Access policy | `src/access-policy.mjs` + auth.mjs adapter (ADR-0002/0003) | 73 pure |
+| 2. Thought store | `src/thought-store.mjs`; server.mjs −393 lines | 17 DB-backed |
+| 3. Projection planner + graph split | `projection-planner` / `graph-driver` / `graph-reads` (one scrub seam) / `graph-projection`; graph.mjs 2,504 → 42-line facade | 25 pure |
+| 4. Capture client | `recipes/shared_capture.py`; four pipelines became adapters | 19 + 6 equivalence (golden, proven against both old and new builders) |
+| 5. Test harness | materialized along the way: `npm test` (115) + acceptance (21) + Python suite (79) | — |
+
+Scoreboard against the problem statement: the runtime went from zero
+tests to 115 in-process + 21 acceptance; the ADR-0001 permission matrix,
+tombstone invisibility, audit emission, purge authorization, and
+projection shapes are all provable in seconds; lifecycle SQL exists in
+exactly one module; graph reads are scrubbed by construction; the
+capture contract lives in one Python module. Runtime deployed to prod
+2026-06-12 (docs/37; pin drift closed at system-config d9c782f) and
+verified live. Pipeline changes are repo-only (not Nix-deployed) —
+long-running ingest services (telegram bridge) pick them up on their
+next restart; one-shot scripts on next run.
+
+Residual items, tracked outside this PRD: legacy env key retirement
+(gated on a named ops admin key); `household` → `estate` rename;
+live-Neo4j projector integration environment; the store-as-sole-
+thoughts-reader option recorded in Implementation Decisions.
