@@ -6,6 +6,9 @@ Before work:
 - Read `WORKING_AGREEMENT.md`.
 - Then read this file.
 - Treat `CLAUDE.md` as a pointer back here, not a separate policy source.
+- Follow the **Brain Protocol** below. It is not optional and not housekeeping:
+  retrieve before you act, capture the moment you decide or learn. If you are
+  about to start a task or make a decision and have not touched the brain, stop.
 
 ## What This Repo Is
 
@@ -68,6 +71,44 @@ OB1 now supports a repo-managed `direnv` + `devenv` workflow.
 Service lifecycle rule:
 - do not run `devenv up`, `devenv down`, `npm start`, `npm run dev`, `node local/open-brain-mcp/src/index.mjs`, or similar orchestration commands unless the user explicitly instructs you
 - focus on code changes, diagnostics, health probes, and tests
+
+## Brain Protocol (reflex — not optional)
+
+OB1 *is* a memory system. Using it is the first and last step of every task,
+not an afterthought. Sessions are estate-scoped to the `ob1` principal, so
+`mcp__ob1__*` captures default to the `ob1` brain. Three reflex points, every
+session — treat them like `git status`/tests, not like extra credit:
+
+**RETRIEVE — before you act.** Before you research, decide, or answer anything
+non-trivial, run `mcp__ob1__search_thoughts` on the task's key terms. The brain
+may already hold the answer, a prior decision, a calibration, or a past mistake.
+Do this *even when you think you remember* — recall goes stale, the brain is
+ground truth. Skipping retrieval is the same class of error as acting on an
+unread file.
+
+**CAPTURE — the moment you learn or decide, in the same turn.** When you reach a
+finding, make or change a non-obvious decision, root-cause something, change
+operational/prod state, or correct an earlier belief — call
+`mcp__ob1__capture_thought` *then and there*, before moving on. A finding that
+lives only in a chat reply is NOT recorded and will evaporate when the turn
+ends. Never defer capture to "later" or "end of task."
+- Capture (durable): calibrations, measurements, root causes, decisions **and
+  the reasoning behind them**, operational state changes, corrections, gotchas.
+- Don't capture (scratch): progress narration, anything derivable from
+  code/git, one-off command output, facts true only inside this conversation.
+- `dedupe_key` = `<agent>:<topic>:<date>` — re-capture with the same key to
+  UPDATE/correct a stale thought (a wrong thought is worse than none). `source`
+  = your agent name. OB1 knowledge → `ob1` brain; genuinely cross-repo →
+  `brain="agent-common"`; NEVER a personal brain.
+
+**VERIFY — before you end the turn.** Ask yourself: did this turn produce a
+durable finding or decision, and is it in the brain (not just my reply)? If not,
+capture it now. This backstop is what makes the reflex self-correcting — it is
+the same checkpoint as "did I run the tests before claiming done."
+
+Debug escalation (estate-wide admin reach for cross-brain reads or admin HTTP
+routes) is deliberate and per-launch, never the resting state:
+`OB1_MCP_ACCESS_KEY="$MCP_ACCESS_KEY" claude`. Drop back to the scoped key after.
 
 ## Repo Shape
 

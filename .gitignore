@@ -20,3 +20,4 @@ local/open-brain-mcp/.runtime/*
 
 # Provisioned agent access keys (plaintext, local only)
 .agent-estate-keys/
+.env.local

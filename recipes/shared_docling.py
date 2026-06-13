@@ -480,6 +480,38 @@ def should_run_vlm_fallback(signals):
     return len(signals["soft_fail_reasons"]) >= DOCLING_VLM_FALLBACK_REQUIRED_SOFT_FAILS
 
 
+def vlm_result_is_better(standard_signals, vlm_signals):
+    """Whether the VLM fallback output should REPLACE the standard output.
+
+    The 2026-03-15 imap incident: a Cyrillic scan double-soft-failed the
+    standard (tesseract) pipeline, the granite VLM fallback transcribed it
+    into Latin-lookalike mojibake in a repetition loop, and the result was
+    accepted UNCONDITIONALLY (`if vlm_chunks:`) even though its own quality
+    signals were strictly worse (duplicate_line_ratio 0.708 vs 0.564). The
+    signals were already computed for both sides — just never compared.
+
+    Rules:
+      * A VLM result with hard fails never wins.
+      * If the standard result hard-failed (zero chunks / empty text), any
+        hard-fail-free VLM result wins — something beats nothing.
+      * Otherwise the VLM result must have strictly FEWER soft fails than
+        the standard result, and must not sit above the duplicate-line
+        threshold while also being worse than standard on that ratio.
+    """
+    if vlm_signals["hard_fail_reasons"]:
+        return False
+    if standard_signals["hard_fail_reasons"]:
+        return True
+    if len(vlm_signals["soft_fail_reasons"]) >= len(standard_signals["soft_fail_reasons"]):
+        return False
+    if (
+        vlm_signals["duplicate_line_ratio"] > DOCLING_VLM_FALLBACK_MAX_DUPLICATE_LINE_RATIO
+        and vlm_signals["duplicate_line_ratio"] > standard_signals["duplicate_line_ratio"]
+    ):
+        return False
+    return True
+
+
 def docling_request(base_url, path, chunker, *, pipeline="standard", force_ocr=None):
     path = Path(path)
     endpoint = {
@@ -546,7 +578,10 @@ def docling_chunk(base_url, path, chunker, *, force_ocr=None):
             vlm_text = collect_chunk_text(vlm_chunks)
             vlm_signals = score_extraction_quality(path, vlm_chunks, vlm_text)
 
-            if vlm_chunks:
+            if not vlm_chunks:
+                fallback_error = "vlm_returned_zero_chunks"
+                final_signals = standard_signals
+            elif vlm_result_is_better(standard_signals, vlm_signals):
                 final_payload = vlm_payload
                 final_chunks = vlm_chunks
                 final_text = vlm_text
@@ -554,7 +589,9 @@ def docling_chunk(base_url, path, chunker, *, force_ocr=None):
                 fallback_triggered = True
                 final_signals = vlm_signals
             else:
-                fallback_error = "vlm_returned_zero_chunks"
+                # 2026-03-15 incident guard: keep the standard output when the
+                # VLM result is no better by its own quality signals.
+                fallback_error = "vlm_result_not_better"
                 final_signals = standard_signals
         except Exception as exc:
             fallback_error = str(exc)
