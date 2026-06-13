@@ -13,6 +13,7 @@ This file defines the working contract for changes in this repository.
 7. If I find an operational workaround, I will document it instead of burying it in code.
 8. I will disclose risks to systems outside this repo (other repos, services, deployments, open PRs) in the first response that proposes the action that creates the risk — not when the user asks.
 9. When I report divergence between two refs, branches, files, or environments, I will also check the corresponding local-vs-remote pair and disclose any asymmetry in the same response. Hidden asymmetry is broken trust.
+10. I will treat the OB1 brain as a reflex, not an afterthought (see the Brain Protocol in `AGENTS.md`): I search it before non-trivial work, I capture durable findings and decisions the moment I reach them — in the same turn, not "later" — and I verify they are stored before I claim done. A finding that lives only in a chat reply is not recorded.
 
 ## Evidence Standard
 
@@ -27,6 +28,7 @@ Work is only complete when:
 - the changed files are coherent
 - the relevant checks were run or clearly called out as blocked
 - known risks or workarounds are stated plainly
+- durable findings, decisions, and corrections produced by the work are captured to the OB1 brain (not left only in this conversation)
 
 ## Response Standard
 
