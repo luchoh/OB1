@@ -57,6 +57,7 @@ export async function sampleEvalPairs({ runQuery, brainId, poolSize = 2000, perB
     `with sample as (
        select id, content, embedding from thoughts
        where brain_id = $1 and deleted_at is null and embedding is not null and embedding_dimension = 1536
+         and coalesce(metadata->>'type', '') not in ('chatgpt_conversation_record', 'claude_conversation_record')
        order by created_at desc limit $2
      )
      select s.id as source_id, left(s.content, $3) as source_content,
@@ -67,6 +68,7 @@ export async function sampleEvalPairs({ runQuery, brainId, poolSize = 2000, perB
        select t.id, t.content, 1 - (t.embedding <=> s.embedding) as sim
        from thoughts t
        where t.brain_id = $1 and t.deleted_at is null and t.embedding is not null and t.embedding_dimension = 1536
+         and coalesce(t.metadata->>'type', '') not in ('chatgpt_conversation_record', 'claude_conversation_record')
          and t.id <> s.id
        order by t.embedding <=> s.embedding
        limit 1
