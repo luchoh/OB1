@@ -56,6 +56,17 @@ Four layers, strongest to softest:
    `~/.codex/AGENTS.md`, pi context); optionally a `Stop`/`SessionEnd` hook on
    Claude + Codex that nudges capture of durable findings.
 
+## Boundary: what OB1 can and cannot do
+
+OB1 **cannot make any agent consult it.** A server answers requests; it does not
+drive clients. OB1's only contributions to adoption are passive: (1) **hint** —
+the optional MCP `instructions` field (a client may ignore it); (2) **be
+callable** — expose `search_thoughts`, and optionally ship a convenience script a
+hook can invoke. The actual *enforcement* — running something on every prompt —
+is a **harness hook** that lives in Claude/Codex config and is owned entirely by
+system-config. **Adoption is a harness-configuration job, not an OB1 feature.**
+The OB1-side items below are enablers for that job, not the job itself.
+
 ## In OB1's write scope (buildable now — proposal)
 
 **A. MCP server `instructions` field** — `local/open-brain-mcp/src/server.mjs`.
