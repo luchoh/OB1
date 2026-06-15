@@ -40,10 +40,15 @@ Four layers, strongest to softest:
    hits as `additionalContext`, so the agent *starts each task already holding
    the relevant memory* — zero discipline required. This is the load-bearing
    layer (instructions alone demonstrably under-fire — see this session).
-2. **OB1 MCP server `instructions` (universal soft backstop):** an `instructions`
-   string on the MCP server reaches *every* connected client (Claude, Codex, pi
-   if MCP-wired, ChatGPT, Claude Desktop) at init. Soft (model may ignore), but
-   universal and cheap, and the only cross-harness lever buildable in this repo.
+2. **OB1 MCP server `instructions` (best-effort hint — NOT universal):** the MCP
+   `initialize` response can carry an `instructions` string (settable in
+   `server.mjs`, one line). But per the MCP spec this is an *optional hint* a
+   client *MAY* surface to the model — the server only **offers** it; it cannot
+   make any client use it. Coverage is **client-dependent and unverified** (we do
+   not know which of Claude Code / Codex / ChatGPT / Claude Desktop inject server
+   instructions). So this is a free, cheap backstop, NOT a reliable mechanism and
+   NOT relied upon. The reliable layer is the hook (#1), because the harness
+   enforces it client-side rather than hoping the client honors a server hint.
 3. **pi extension + instruction:** an OB1 tool pi can call, plus a line in pi's
    instructions; respects pi's no-auto-inject principle.
 4. **Capture side (soft, all harnesses):** the search-before / capture-after
@@ -54,10 +59,15 @@ Four layers, strongest to softest:
 ## In OB1's write scope (buildable now — proposal)
 
 **A. MCP server `instructions` field** — `local/open-brain-mcp/src/server.mjs`.
-Add a short server-level instruction returned at MCP init: "This is the OB1
-memory. Before non-trivial work, `search_thoughts`. Capture durable findings
-(decisions, calibrations, incident root-causes) with `capture_thought` and a
-stable dedupe_key. Don't capture scratch." One change, every MCP client sees it.
+Pass `{ instructions: "…" }` as the second arg to `new McpServer(...)` (currently
+absent at `server.mjs:847`; SDK support verified at `server/index.js:50,279`).
+The hint: "This is the OB1 memory. Before non-trivial work, `search_thoughts`.
+Capture durable findings (decisions, calibrations, incident root-causes) with
+`capture_thought` and a stable dedupe_key. Don't capture scratch." It is returned
+in the `initialize` response — but a client surfaces it to the model only if it
+chooses to (optional per spec). Cheap and free; do not count on it reaching every
+client. **Worth verifying** which of our clients actually inject server
+instructions before assigning it any weight.
 
 **B. Shared retrieve-hook script** — `local/open-brain-mcp/scripts/ob1-retrieve-hook.sh`
 (canonical artifact; harnesses reference it at the managed checkout path).
