@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
 import { HttpError, authorizeWrite, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
+import { projectSearchResults } from "./search-projection.mjs";
 import { config } from "./config.mjs";
 import { closePool, healthcheckDatabase, query } from "./db.mjs";
 import {
@@ -77,6 +78,20 @@ const askBrainSchema = {
   graph_neighbor_limit: z.number().int().min(1).max(24).optional().describe("Maximum number of additional graph-related thought rows to add when graph-assisted retrieval is enabled."),
 };
 const askBrainInput = z.object(askBrainSchema);
+
+// POST /search input — plain ranked retrieval for programmatic callers (e.g. the
+// auto-retrieve hook). `min_similarity` is the relevance floor (mapped to the
+// cosine match_threshold); below it, rows are dropped so callers can inject
+// "only good hits" and nothing on a weak query.
+const searchRouteInput = z.object({
+  query: z.string().min(1),
+  brain: z.string().optional(),
+  match_count: z.number().int().min(1).max(50).optional(),
+  min_similarity: z.number().min(0).max(1).optional(),
+  recency_weight: z.number().min(0).max(1).optional(),
+  half_life_days: z.number().positive().optional(),
+  filter: z.record(z.any()).optional(),
+});
 
 const updateThoughtMetadataSchema = {
   thought_id: z.string().uuid().describe("Canonical OB1 thought UUID."),
@@ -844,10 +859,23 @@ async function handleExpandContext(args, accessContext) {
 }
 
 function buildMcpServer(accessContext) {
-  const server = new McpServer({
-    name: config.serviceName,
-    version: "0.1.0",
-  });
+  const server = new McpServer(
+    {
+      name: config.serviceName,
+      version: "0.1.0",
+    },
+    {
+      // Advisory MCP hint surfaced at initialize. Clients MAY add it to the
+      // model's context (optional per spec) — a cheap backstop, NOT enforcement.
+      // The reliable reflex is a harness-side hook calling POST /search.
+      instructions:
+        "This is the Open Brain (OB1) personal memory. Before non-trivial work, call " +
+        "search_thoughts to check what is already known. Capture durable findings — " +
+        "decisions, calibrations, incident root-causes, operational state changes — with " +
+        "capture_thought using a stable dedupe_key (<agent>:<topic>:<date>); do not capture " +
+        "session scratch.",
+    },
+  );
 
   server.tool(
     "capture_thought",
@@ -1034,6 +1062,40 @@ app.post("/ask", async (c) => {
     const payload = askBrainInput.parse(await c.req.json());
     const result = await handleAskBrain(payload, accessContext);
     return c.json(result);
+  } catch (error) {
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
+  }
+});
+
+// POST /search — plain ranked retrieval for programmatic callers (the
+// auto-retrieve hook). Read-only; same x-access-key auth and brain-scoping as
+// the search_thoughts MCP tool (reuses handleSearchThoughts), then projects to a
+// compact { id, brain, score, title, summary } list. Distinct from /ask, which
+// returns a synthesized RAG answer rather than raw ranked thoughts.
+app.post("/search", async (c) => {
+  try {
+    const accessContext = await resolveAccessContext(c);
+    const payload = searchRouteInput.parse(await c.req.json());
+    const matchCount = payload.match_count ?? 4;
+    const full = await handleSearchThoughts(
+      {
+        query: payload.query,
+        brain: payload.brain,
+        match_count: matchCount,
+        match_threshold: payload.min_similarity ?? 0.4,
+        recency_weight: payload.recency_weight,
+        half_life_days: payload.half_life_days,
+        filter: payload.filter,
+      },
+      accessContext,
+    );
+    return c.json({
+      success: true,
+      query: full.query,
+      brains_searched: full.brains_searched,
+      count: full.count,
+      results: projectSearchResults(full, { limit: matchCount }),
+    });
   } catch (error) {
     return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
