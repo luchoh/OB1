@@ -1,7 +1,13 @@
 # OB1 Adoption — Cross-Harness Reflexive-Use Plan (proposal + handover)
 
+> **SUPERSEDED 2026-06-16 — see docs/43.** This plan had the hook *do the
+> retrieval* (curl a new HTTP `/search` route, inject results). Decision: the
+> hook only **reminds**; the agent retrieves via the existing `search_thoughts`
+> MCP tool, so no HTTP route is needed. The route/projection implementation is
+> parked on branch `parking/http-search-route`. Kept below for context.
+
 Date: 2026-06-15
-Status: PROPOSAL — OB1-side pieces buildable now; per-harness wiring is a system-config handover
+Status: SUPERSEDED by docs/43 (was: PROPOSAL — OB1-side pieces + system-config handover)
 Owner: OB1 (MCP server instructions + shared hook script); System-config (per-harness wiring)
 Companion: AGENTS.md "Brain Protocol", docs/39 (PRD, Package 3 shelved)
 
