@@ -77,7 +77,7 @@ The OB1-side items below are enablers for that job, not the job itself.
 
 **A. MCP server `instructions` field** — `local/open-brain-mcp/src/server.mjs`.
 Pass `{ instructions: "…" }` as the second arg to `new McpServer(...)` (currently
-absent at `server.mjs:847`; SDK support verified at `server/index.js:50,279`).
+absent at `server.mjs:847`; SDK support verified at `server/index.js:53,282`).
 The hint: "This is the OB1 memory. Before non-trivial work, `search_thoughts`.
 Capture durable findings (decisions, calibrations, incident root-causes) with
 `capture_thought` and a stable dedupe_key. Don't capture scratch." It is returned
