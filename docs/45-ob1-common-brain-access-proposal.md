@@ -1,10 +1,10 @@
 # 45 — The Cloud-Egress Boundary
 
-**Status: PROPOSAL — owner has approved nothing.**
-**Date:** 2026-06-23
-**Rev:** 8 (Codex reviews v1–v7 folded — disposition in §10–§16)
+**Status: FROZEN design baseline (Rev 8) — coherent enough to implement; NOT "approved secure." Owner has approved nothing.** Security now depends on code, migrations, tests, and operational proof — not more prose. The prose red-team loop is closed at v8: no further architecture rewrites here. Resolved-vs-owner-discretion choices and the implementation gates are in §17; the executable plan (migrations, policy helper, capability matrix, test matrix) lives in a separate implementation doc.
+**Date:** 2026-06-24
+**Rev:** 8 — FROZEN (Codex reviews v1–v8 folded — disposition §10–§16; freeze §17)
 **Author:** Claude Code (Opus 4.8)
-**Lineage:** supersedes the veil framing in [docs/44](44-ob1-reflexive-capture-and-veil-prd.md); folds [docs/46](46-ob1-common-brain-access-design-and-postmortem.md); red-team findings in [review-v1](45-ob1-common-brain-access-proposal-review-v1.md) + [review-v2](45-ob1-common-brain-access-proposal-review-v2.md) + [review-v3](45-ob1-common-brain-access-proposal-review-v3.md) + [review-v4](45-ob1-common-brain-access-proposal-review-v4.md) + [review-v5](45-ob1-common-brain-access-proposal-review-v5.md) + [review-v6](45-ob1-common-brain-access-proposal-review-v6.md) + [review-v7](45-ob1-common-brain-access-proposal-review-v7.md). Defers all access policy to ADR-0001 / ADR-0002 / ADR-0003 and `CONTEXT.md`.
+**Lineage:** supersedes the veil framing in [docs/44](44-ob1-reflexive-capture-and-veil-prd.md); folds [docs/46](46-ob1-common-brain-access-design-and-postmortem.md); red-team findings in [review-v1](45-ob1-common-brain-access-proposal-review-v1.md) + [review-v2](45-ob1-common-brain-access-proposal-review-v2.md) + [review-v3](45-ob1-common-brain-access-proposal-review-v3.md) + [review-v4](45-ob1-common-brain-access-proposal-review-v4.md) + [review-v5](45-ob1-common-brain-access-proposal-review-v5.md) + [review-v6](45-ob1-common-brain-access-proposal-review-v6.md) + [review-v7](45-ob1-common-brain-access-proposal-review-v7.md) + [review-v8](45-ob1-common-brain-access-proposal-review-v8.md). Defers all access policy to ADR-0001 / ADR-0002 / ADR-0003 and `CONTEXT.md`.
 
 **The through-line (Codex v3):** every "create" path is really *create-or-update* (capture is an upsert), every origin label must be **non-washable** (monotonic taint), and every private-processor check must happen **before bytes leave the handler** (egress precedes insert). These three discipline the seams below.
 
@@ -287,7 +287,7 @@ Cost is operator-borne, not capability-amputated. Usefulness is real but **opera
 10. **`brains.kind` as a Layer-A pre-filter** — exists (`005:21`) but `fetchBrainCatalog` (`auth.mjs:120-143`) never selects it.
 11. **pi's local-trusted transport (§6.12)** — sidecar vs session broker vs keychain helper? How is the transport addressed out of band so a cloud harness can't copy it from repo config? What is the human-gated caller-binding (hidden-TTY passphrase vs per-call approval)?
 12. **Policy composition** — *shape resolved* (Codex v5 F5, v6 F3): one centralised helper returning a **confidentiality+integrity vector** keyed on inputs incl. a **sink** dimension (§6.15), fail-closed on unknowns. Remaining open: the exact enum domains, and whether a `public`/`repo` brain may even *hold* a `restricted` row or the model forbids it (the v1 trigger says it cannot, §9).
-13. **Layer A isolation mechanism (§5)** — pick: (i) separate estate for `private_local` brains + invariant test, or (ii) `brains.egress_class` as an authorization input excluding them from estate/admin fanout + a named non-fanout maintenance capability. (ii) is idiot-proof-by-construction; (i) is zero-code but operationally fragile.
+13. **Layer A isolation mechanism (§5)** — *RESOLVED at freeze (§17.1)*: option (ii), `brains.egress_class` as an authorization input (idiot-proof-by-construction), a v1 ADR change. (Option (i), separate-estate, rejected as operationally fragile.)
 14. **v1 shared-restricted invariant (§9, Codex v5 F1)** — confirm the chosen guarantee: v1 *structurally forbids* `restricted`/`personal` rows in any cloud-accessible/shared brain (so the row clamp can be v2), vs pulling Layer B forward into v1.
 
 ---
@@ -412,3 +412,37 @@ Contract gaps, not architecture. F1/F7 corrected conflations this doc introduced
 | 8 | MED | `origin_egress_class` tracks writer, not content adversariality | §6.11: separate `source_trust_class`; external imports default untrusted-for-instructions; `trust_level = min(writer, source)` |
 
 **v7 acceptance tests adopted:** (1) a cloud-bound principal with an explicit `brain_memberships` grant to a `private_local` brain still cannot name/read/stat/graph/mutate it outside the scoped maintenance path; (2) a row read/projected/logged while `standard` then raised to `restricted` records prior exposure and scrubs/marks derived artifacts; (3) making a graph/log/audit/backup sink cloud-agent-readable fails while restricted artifacts exist in it; (4) maintenance can repair a specific target but cannot return content/rollups/graph context/`old_state`/private counts; (5) adding one restricted row does not move any cloud-visible count/`top_people`/rollup/graph-stat/telemetry-count/maintenance summary; (6) a downstream side-effecting tool refuses an action derived from `side_effect_allowed=false` evidence; (7) a local-trusted read session cannot review/downgrade/publish/export/purge without operation-specific capability + human confirmation; (8) a locally-imported external email/web/chat row is readable per its tier but marked untrusted-for-instructions even though the importer was local-trusted.
+
+## 17. Freeze (Codex v8) — baseline closed, implementation gates open
+
+Codex v8 verdict: the boundary is named correctly; **freeze Rev 8 as the design baseline, not as "secure."** No ninth prose loop unless implementation discovers a contradiction that changes the boundary. What "freeze" requires:
+
+### 17.1 Resolved for v1 (no longer "open" — §8 entries reconciled here)
+- **Layer A mechanism = `brains.egress_class` as an authorization input** (not the separate-estate option). It is a **v1** ADR change — a new subtractive authorization input alongside brain-level DENY (§5/§6.13/§8.13).
+- **No `restricted`/`personal` rows outside `private_local`/`quarantine_review` brains** — enforced by the `thoughts→brains` trigger + continuous scan (§9). A shared/cloud-accessible brain holds only `standard` until Layer B (v2).
+- **Graph stays dead-to-cloud for v1** behind an explicit, testable kill-switch (§17.3 / Codex v8 F6), not a vibe. Partitioning is pulled into v1 only if graph is enabled for cloud-bound callers.
+- **`caller.read_egress_class` (confidentiality) is a v1 prerequisite**, split from `capabilities` (authority) (§6.2).
+
+### 17.2 Still owner-discretion (record the pick before coding — Codex v8 F1)
+- **Representation: row-flag vs two-brain** (§8.2). Both reviewers recommend **two-brain** (separate `common-public` / `common-private` brains) — it pushes most isolation into Layer A. *Owner to confirm; gates schema/migration.*
+- **`personal` tier: map to `restricted`-equivalent, or drop** (§8.1). Recommended: **drop for v1** (no schema representation today; `restricted` covers the need) — re-add later if a distinct "human-only" semantic is wanted.
+- **pi transport mechanism: sidecar vs session-broker vs keychain-helper** (§8.11). Implementation detail of §6.12; the *contract* (caller-binding + lease + per-op approval) is frozen; the mechanism can be chosen at build time.
+
+### 17.3 Implementation gates (the executable plan — Codex v8 F2–F7)
+These are *not* prose to refine; they are the contracts the implementation doc + test matrix must pin:
+1. **Capability grammar (F3)** — an exact vocabulary (`read_private`, `review_quarantine`, `downgrade_tier`, `downgrade_brain_egress`, `export_private`, `purge_private`, `repair_audit`, `reconcile_projection_state`, `run_backfill`, …), a caller-class × capability matrix, which capabilities require human-confirmation/TTL/target-binding/audit/approved-sink, and a route/action matrix for **MCP and HTTP**. No route improvises.
+2. **Exposure-event taxonomy (F2)** — define exactly what increments `max_egress_reached`: response materialization, processor dispatch, telemetry/log write, graph projection, audit snapshot, backup/export, diagnostics, calibration export, maintenance output, HTTP/MCP parity. Which events update the row vs an artifact registry vs only incident/audit state. **Existing artifacts backfill as `unknown`/`possibly_exposed`, never `never_exposed`.**
+3. **Migration staging (F4)** — pessimistic: add nullable columns → backfill **`unknown`/`untrusted`/`possibly_exposed`** (never silently trusted) → dual-write → invariant scans → enable CHECKs/triggers → enforce policy. Fail-closed on unknown enums, with operator visibility so "fail-closed" never becomes "comment out the guard."
+4. **Policy helper is pre-materialization (F5)** — define per-plane insertion points: SQL/by-id predicates apply **before** rank/threshold/limit/aggregation/graph-expansion/telemetry/answer; processor dispatch + capture-preflight call policy **before any outbound request**; background materializers call policy **before** writing a sink. Denied rows are **absent**, not redacted-after.
+5. **Graph v1 kill-switch (F6)** — a single documented+tested deployment posture: no cloud-held graph-admin key; legacy admin unreachable from harnesses; Neo4j creds not in repo/env/tool output; graph REST materializes no private data; projection writes no private/restricted previews to a cloud-reachable sink.
+6. **ADR patches (F7)** — patch ADR-0001 (pt 5 distinct local principal; pt 6 key-name split), ADR-0002 (second subtractive mechanism: `egress_class` authorization), ADR-0003 (capability-per-key) **before/with the first implementation PR**, so a reader derives this model from ADRs + `CONTEXT.md` alone. PRs contradicting the patched ADRs are rejected.
+7. **Test matrix** — the ~30 acceptance gates accumulated in §10–§16 become an executable matrix, starting with the four §6.15 policy quadrants.
+
+### 17.4 First implementation slice (Codex v8, in order)
+1. ADR patches (principal boundary, subtractive egress auth, capability-per-key).
+2. Schema migration skeleton — fail-closed enum domains + pessimistic backfill.
+3. Central policy helper + JS wrapper — unit tests for the four §6.15 quadrants.
+4. v1 graph posture — explicitly disabled to cloud-bound callers, with negative tests.
+5. Route/action capability matrix (MCP + HTTP) — *before* any route patches.
+
+Then route enforcement, in that order.
