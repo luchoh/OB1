@@ -383,6 +383,199 @@ export function detectSelectorConflict(l1Brain, bodyBrain) {
 }
 
 // ---------------------------------------------------------------------------
+// Effective egress — §6.15 cloud-egress boundary (pure, slice 1)
+// ---------------------------------------------------------------------------
+
+// Egress classifications for brains (brain.egressClass).
+export const BRAIN_EGRESS_CLASS = Object.freeze({
+  PUBLIC: "public",
+  REPO: "repo",
+  PRIVATE_LOCAL: "private_local",
+  QUARANTINE_REVIEW: "quarantine_review",
+});
+
+// Sensitivity tiers for rows (row.sensitivityTier).
+export const SENSITIVITY_TIER = Object.freeze({
+  STANDARD: "standard",
+  RESTRICTED: "restricted",
+});
+
+// Caller egress classifications (caller.readEgressClass).
+export const CALLER_EGRESS_CLASS = Object.freeze({
+  LOCAL_TRUSTED: "local_trusted",
+  CLOUD_BOUND: "cloud_bound",
+});
+
+// Writer-taint classification (row.originEgressClass) — the WRITE path that
+// contributed the row. Monotonic taint; never washed by review (§6.11).
+export const ORIGIN_EGRESS_CLASS = Object.freeze({
+  LOCAL_TRUSTED: "local_trusted",
+  CLOUD_ORIGIN: "cloud_origin",
+});
+
+// Content/source-trust classification (row.sourceTrustClass) — whether the
+// row's *content* is trusted for instructions, independent of who wrote it
+// (§6.11 Codex v7 F8: a local-trusted importer can ingest adversarial text).
+export const SOURCE_TRUST_CLASS = Object.freeze({
+  TRUSTED: "trusted",
+  UNTRUSTED: "untrusted",
+});
+
+// Quarantine review states (row.reviewState) — a three-valued enum. Quarantine
+// fires only on UNREVIEWED; NONE (no workflow applied) and REVIEWED (lifted)
+// clear it. Absent/unknown fails closed to unreviewed (§6.11).
+export const REVIEW_STATE = Object.freeze({
+  NONE: "none",
+  UNREVIEWED: "unreviewed",
+  REVIEWED: "reviewed",
+});
+
+// Integrity verdict (trustLevel) on the §6.15 vector — separate axis from
+// confidentiality.
+export const TRUST_LEVEL = Object.freeze({
+  TRUSTED: "trusted",
+  UNTRUSTED: "untrusted",
+});
+
+// Confidentiality redaction levels (redactionLevel) on the §6.15 vector.
+export const REDACTION_LEVEL = Object.freeze({
+  NONE: "none",
+  LOCAL_METADATA_ONLY: "local_metadata_only",
+  FULL: "full",
+});
+
+// The provenance fields a materialized cloud-origin/untrusted row must carry to
+// a local-trusted audience (§6.11: provenance on every read plane).
+const PROVENANCE_FIELDS = Object.freeze(["originEgressClass", "sourceTrustClass"]);
+
+// ---------------------------------------------------------------------------
+// Effective-egress helpers (pure; fail-closed on every unknown enum value)
+// ---------------------------------------------------------------------------
+
+// The AUDIENCE these bytes would reach. With a caller it is the caller's read
+// egress; for a background job (caller=null) it is the SINK's reachability.
+// Fail-closed both ways: an unknown caller egress is cloud_bound; an absent
+// sink.cloudAgentReachable is cloud-reachable (only an explicit `false` clears).
+function audienceIsCloudBound(caller, sink) {
+  if (caller !== null && caller !== undefined) {
+    return caller.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED;
+  }
+  return sink?.cloudAgentReachable !== false;
+}
+
+// A row is LOCAL-ONLY when its effective egress is restricted: a restricted
+// sensitivity tier, or a private_local / quarantine_review brain. Fail-closed:
+// an unknown brain egress class or sensitivity tier is treated as local-only.
+function isLocalOnlyRow(brainEgressClass, sensitivityTier) {
+  const brainConfines =
+    brainEgressClass !== BRAIN_EGRESS_CLASS.PUBLIC &&
+    brainEgressClass !== BRAIN_EGRESS_CLASS.REPO;
+  const tierConfines = sensitivityTier !== SENSITIVITY_TIER.STANDARD;
+  return brainConfines || tierConfines;
+}
+
+// QUARANTINE: a cloud-origin + restricted + unreviewed row is absent on every
+// plane except an explicit review endpoint (out of scope for slice 1 → deny).
+// Each predicate fails closed on an unknown value: absent originEgressClass is
+// not local_trusted (eligible), absent sensitivityTier is not standard
+// (restricted), and only the explicit NONE/REVIEWED states clear the review gate.
+function isQuarantinedRow(originEgressClass, sensitivityTier, reviewState) {
+  const writerEligible = originEgressClass !== ORIGIN_EGRESS_CLASS.LOCAL_TRUSTED;
+  const tierEligible = sensitivityTier !== SENSITIVITY_TIER.STANDARD;
+  const reviewClears =
+    reviewState === REVIEW_STATE.REVIEWED || reviewState === REVIEW_STATE.NONE;
+  return writerEligible && tierEligible && !reviewClears;
+}
+
+// TRUST is the WORST of writer taint (originEgressClass) and content/source
+// trust (sourceTrustClass) — two independent axes (§6.11 F8). Either being
+// non-clean yields untrusted, which forbids side effects. Fail-closed: an
+// unknown value on either axis is untrusted.
+function assessTrust(originEgressClass, sourceTrustClass) {
+  const writerTainted = originEgressClass !== ORIGIN_EGRESS_CLASS.LOCAL_TRUSTED;
+  const contentUntrusted = sourceTrustClass !== SOURCE_TRUST_CLASS.TRUSTED;
+  const untrusted = writerTainted || contentUntrusted;
+  return {
+    untrusted,
+    trustLevel: untrusted ? TRUST_LEVEL.UNTRUSTED : TRUST_LEVEL.TRUSTED,
+    sideEffectAllowed: !untrusted,
+  };
+}
+
+// Determine effective egress decision for a row materialization request.
+//
+// Inputs (plain objects; any field may be absent → treated as most restrictive):
+//   brain               : { egressClass }
+//   row                 : { sensitivityTier, reviewState, originEgressClass, sourceTrustClass, maxEgressReached }
+//   requestedOperation  : 'read' | 'mutate' | 'process'
+//   caller              : { readEgressClass } | null   (null = background job)
+//   sink                : { type, cloudAgentReachable }
+//
+// Returns a plain decision object (never throws for business logic).
+//
+// `requestedOperation` is part of the interface (above) but is not yet read:
+// the read/mutate/process branch lands in a later slice with its own tests, so
+// per TDD it is not destructured here until a behavior demands it.
+export function effectiveEgress({ brain, row, caller, sink }) {
+  // Resolve input fields; every predicate below defaults to most-restrictive on
+  // an absent/unknown value, so no normalization is needed here.
+  const brainEgressClass = brain?.egressClass;
+  const sensitivityTier = row?.sensitivityTier;
+
+  // The audience these bytes would reach (caller, else background-job sink).
+  const cloudBoundAudience = audienceIsCloudBound(caller, sink);
+
+  // --- Confidentiality axis ---
+  const localOnly = isLocalOnlyRow(brainEgressClass, sensitivityTier);
+  const quarantined = isQuarantinedRow(
+    row?.originEgressClass,
+    sensitivityTier,
+    row?.reviewState,
+  );
+  // Local-only content may materialize only for a local-trusted audience.
+  // Quarantine is an additional absolute deny that overrides audience trust.
+  const canMaterialize = !quarantined && !(localOnly && cloudBoundAudience);
+
+  // Local-only rows reaching a (necessarily local-trusted) audience are carried
+  // as metadata only; non-local-only rows are unredacted; denials are full.
+  const redactionLevel = !canMaterialize
+    ? REDACTION_LEVEL.FULL
+    : localOnly
+      ? REDACTION_LEVEL.LOCAL_METADATA_ONLY
+      : REDACTION_LEVEL.NONE;
+
+  // A processor sink is allowed only when the content materializes and NEITHER
+  // the audience nor the sink itself is cloud-reachable (checked independently).
+  // Fail-closed: an absent sink.cloudAgentReachable is treated as cloud-reachable.
+  const processorSinkAllowed =
+    canMaterialize && !cloudBoundAudience && sink?.cloudAgentReachable === false;
+
+  // --- Trust (integrity) axis — SEPARATE from confidentiality ---
+  const { untrusted, trustLevel, sideEffectAllowed } = assessTrust(
+    row?.originEgressClass,
+    row?.sourceTrustClass,
+  );
+
+  // Provenance must accompany a cloud-origin/untrusted row only when it actually
+  // materializes to a LOCAL-TRUSTED audience (not for cloud-bound audiences).
+  const provenanceFieldsRequired =
+    canMaterialize && untrusted && !cloudBoundAudience ? [...PROVENANCE_FIELDS] : [];
+
+  // Audit whenever materialization is denied OR the content is untrusted.
+  const auditRequired = !canMaterialize || untrusted;
+
+  return {
+    canMaterialize,
+    redactionLevel,
+    processorSinkAllowed,
+    trustLevel,
+    sideEffectAllowed,
+    provenanceFieldsRequired,
+    auditRequired,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Read fanout
 // ---------------------------------------------------------------------------
 
