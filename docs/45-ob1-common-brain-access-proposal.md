@@ -276,7 +276,7 @@ Cost is operator-borne, not capability-amputated. Usefulness is real but **opera
 ## 8. Open decisions
 
 1. **`personal` tier** — map to `restricted`-equivalent at every clamp, or drop? No schema representation today.
-2. **Row-flag vs two-brain** — two-brain pushes work into Layer A **only across distinct principals** (§3). Both reviewers recommend two-brain; owner unconfirmed.
+2. **Row-flag vs two-brain** — *RESOLVED (owner, 2026-06-24): TWO-BRAIN* (`common-public` + `common-private`). Isolation lives in Layer A (membership-absence). Owner acknowledges the write-time cost (per-capture public/private filing, mixed-sensitivity thoughts split across stores, re-tiering = move-not-flag) and accepts it for the cleaner enforcement boundary.
 3. **Graph plane** — "keep dead" sufficient for v1 **iff**: (1) legacy admin out of harness reach; (2) no cloud key is admin/`local_trusted`; (3) Neo4j creds unreachable from agent context; (4) graph stats/telemetry don't leak. Cross-brain entity traversal (§5) is tier-independent and remains even for admins.
 4. **Count oracle** — *resolved, not an accepted residual* (Codex v7 F5): the invariant already forbids "derived data," and "no content ≠ no signal" (counts, `top_people`, source/type rollups leak existence + shape). So clamp **before aggregation** via the §6.15 helper: a cloud-bound caller gets **no per-brain row, no zero/nonzero distinction, no top-metadata rollup** for a private brain (in v1, Layer-A isolation already removes private brains from a cloud caller's `handleStats` (`server.mjs:690`/`brainStats` `thought-store.mjs:495`); the clamp is the belt to that suspenders, and is required for the shared-brain v2 case). Maintenance stats return only bounded status to an approved sink (§6.13). Adding one `restricted` row must not move any cloud-visible count.
 5. **Error sanitization depth** — opaque ids + operator sink (§6.6).
@@ -424,7 +424,7 @@ Codex v8 verdict: the boundary is named correctly; **freeze Rev 8 as the design 
 - **`caller.read_egress_class` (confidentiality) is a v1 prerequisite**, split from `capabilities` (authority) (§6.2).
 
 ### 17.2 Still owner-discretion (record the pick before coding — Codex v8 F1)
-- **Representation: row-flag vs two-brain** (§8.2). Both reviewers recommend **two-brain** (separate `common-public` / `common-private` brains) — it pushes most isolation into Layer A. *Owner to confirm; gates schema/migration.*
+- **Representation: ~~row-flag vs~~ two-brain** (§8.2) — **RESOLVED (owner, 2026-06-24): two-brain** (`common-public` / `common-private`). Isolation via Layer A membership-absence; the row-level clamp (Layer B) is needed only if a single brain ever holds mixed tiers.
 - **`personal` tier: map to `restricted`-equivalent, or drop** (§8.1). Recommended: **drop for v1** (no schema representation today; `restricted` covers the need) — re-add later if a distinct "human-only" semantic is wanted.
 - **pi transport mechanism: sidecar vs session-broker vs keychain-helper** (§8.11). Implementation detail of §6.12; the *contract* (caller-binding + lease + per-op approval) is frozen; the mechanism can be chosen at build time.
 
