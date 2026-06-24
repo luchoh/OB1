@@ -202,6 +202,39 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
     assert.equal(second.review_state, "unreviewed", "re-capture must not clear the quarantine");
   });
 
+  // --- Layer C write-guard (docs/45 §6.10): a cloud_bound caller may not mutate
+  //     an existing restricted row; it appears NOT_FOUND (no existence oracle).
+  //     local_trusted may; a standard row stays mutable by cloud_bound. Absent
+  //     caller egress fails closed (cloud_bound). ---
+  const notFound = (e) => e.name === "ThoughtStoreError" && e.kind === "not_found";
+
+  it("Layer C: cloud_bound cannot patch a restricted row (NOT_FOUND); local_trusted can", async () => {
+    const row = await cap({ dedupeKey: "lcp", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none" });
+    await assert.rejects(() => store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "x", callerReadEgressClass: "cloud_bound" }), notFound);
+    const ok = await store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "x", callerReadEgressClass: "local_trusted" });
+    assert.equal(ok.status, "x");
+  });
+
+  it("Layer C: cloud_bound CAN patch a standard row", async () => {
+    const row = await cap({ dedupeKey: "lcs" });
+    const ok = await store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "ok", callerReadEgressClass: "cloud_bound" });
+    assert.equal(ok.status, "ok");
+  });
+
+  it("Layer C: cloud_bound cannot soft-delete or restore a restricted row; local_trusted can", async () => {
+    const row = await cap({ dedupeKey: "lcd", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none" });
+    await assert.rejects(() => store.softDeleteThought({ brainId, thoughtId: row.id, actor: ACTOR, callerReadEgressClass: "cloud_bound" }), notFound);
+    await store.softDeleteThought({ brainId, thoughtId: row.id, actor: ACTOR, callerReadEgressClass: "local_trusted" });
+    await assert.rejects(() => store.restoreThought({ brainId, thoughtId: row.id, actor: ACTOR, callerReadEgressClass: "cloud_bound" }), notFound);
+    const r = await store.restoreThought({ brainId, thoughtId: row.id, actor: ACTOR, callerReadEgressClass: "local_trusted" });
+    assert.equal(r.outcome, "restored");
+  });
+
+  it("Layer C: absent/unknown caller egress fails closed (cannot mutate a restricted row)", async () => {
+    const row = await cap({ dedupeKey: "lcu", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none" });
+    await assert.rejects(() => store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "x" }), notFound);
+  });
+
   // --- soft-delete / restore ---
   it("softDeleteThought sets deleted_at and writes exactly one delete audit row", async () => {
     const row = await capture({ content: "to delete", dedupeKey: "d1" });

@@ -86,7 +86,9 @@ const updateThoughtMetadataSchema = {
   metadata_patch: z.record(z.any()).optional().describe("Metadata patch merged into the thought metadata without changing content or embeddings."),
   type: z.string().min(1).max(64).optional().describe("Structured type column. Free-form; consumers may constrain to a known taxonomy."),
   source_type: z.string().min(1).max(64).optional().describe("Structured source_type column."),
-  sensitivity_tier: z.enum(["standard", "personal", "restricted"]).optional().describe("Structured sensitivity_tier column."),
+  // sensitivity_tier is intentionally NOT patchable here (docs/45 §6.7): this
+  // generic route must not be a declassification path. Tier transitions go
+  // through a dedicated local-trusted capability (a later slice).
   importance: z.number().int().min(0).max(100).optional().describe("Structured importance column (0-100)."),
   quality_score: z.number().min(0).max(100).optional().describe("Structured quality_score column (0-100)."),
   enriched: z.boolean().optional().describe("Mark the thought as enriched (or not)."),
@@ -99,7 +101,6 @@ const updateThoughtMetadataInput = z
       v.metadata_patch !== undefined
       || v.type !== undefined
       || v.source_type !== undefined
-      || v.sensitivity_tier !== undefined
       || v.importance !== undefined
       || v.quality_score !== undefined
       || v.enriched !== undefined
@@ -1087,11 +1088,12 @@ app.post("/admin/thought/metadata", async (c) => {
       metadataPatch: payload.metadata_patch,
       type: payload.type,
       sourceType: payload.source_type,
-      sensitivityTier: payload.sensitivity_tier,
       importance: payload.importance,
       qualityScore: payload.quality_score,
       enriched: payload.enriched,
       status: payload.status,
+      // §6.10: a cloud_bound caller cannot mutate a restricted row.
+      callerReadEgressClass: accessContext._policy.caller.readEgressClass,
     });
     return c.json({
       success: true,
@@ -1125,6 +1127,7 @@ app.post("/admin/thought/delete", async (c) => {
       brainId,
       thoughtId: payload.thought_id,
       actor,
+      callerReadEgressClass: accessContext._policy.caller.readEgressClass,
     });
     return c.json(deleteResponse(result));
   } catch (error) {
@@ -1142,6 +1145,7 @@ app.post("/admin/thought/restore", async (c) => {
       brainId,
       thoughtId: payload.thought_id,
       actor,
+      callerReadEgressClass: accessContext._policy.caller.readEgressClass,
     });
     return c.json(restoreResponse(result));
   } catch (error) {

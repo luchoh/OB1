@@ -187,11 +187,13 @@ export async function patchThoughtMetadata({
   metadataPatch,
   type,
   sourceType,
-  sensitivityTier,
   importance,
   qualityScore,
   enriched,
   status,
+  // docs/45 §6.10: a cloud-bound caller may not mutate an existing restricted
+  // row. Fail-closed: absent/unknown egress class is treated as cloud_bound.
+  callerReadEgressClass = "cloud_bound",
 }) {
   const setClauses = [];
   const params = [thoughtId, brainId];
@@ -214,10 +216,12 @@ export async function patchThoughtMetadata({
     paramIndex++;
   }
 
+  // sensitivity_tier is NOT patchable here (docs/45 §6.7): the generic metadata
+  // route is not a declassification path. Tier transitions go through a dedicated
+  // local-trusted capability (a later slice).
   const structured = [
     ["type", type, "text"],
     ["source_type", sourceType, "text"],
-    ["sensitivity_tier", sensitivityTier, "text"],
     ["importance", importance, "smallint"],
     ["quality_score", qualityScore, "numeric(5,2)"],
     ["enriched", enriched, "boolean"],
@@ -238,6 +242,9 @@ export async function patchThoughtMetadata({
   }
   setClauses.push("updated_at = now()");
 
+  params.push(callerReadEgressClass);
+  const egressIdx = params.length;
+
   const result = await query(
     `
       update thoughts
@@ -245,6 +252,9 @@ export async function patchThoughtMetadata({
       where id = $1::uuid
         and brain_id = $2::uuid
         and deleted_at is null
+        -- §6.10 Layer C: a cloud_bound caller mutates only a 'standard' row;
+        -- a restricted (or unknown-tier, fail-closed) row matches 0 rows → NOT_FOUND
+        and (sensitivity_tier is not distinct from 'standard' or $${egressIdx} = 'local_trusted')
       returning
         id,
         metadata,
@@ -276,16 +286,21 @@ export async function patchThoughtMetadata({
 // tombstone + a live row may share a key). Idempotent: a second delete returns
 // `already_deleted` and writes NO new audit row. Audit emission is internal and
 // invariant-checked (one audit row per state change).
-export async function softDeleteThought({ brainId, thoughtId, actor }) {
+export async function softDeleteThought({ brainId, thoughtId, actor, callerReadEgressClass = "cloud_bound" }) {
+  // §6.10 Layer C: a cloud_bound caller cannot delete a restricted row. The
+  // guard scopes BOTH `target` (existence) and `upd` (mutation), so a restricted
+  // row reads as NOT_FOUND to a cloud_bound caller — no existence oracle.
   const result = await query(
     `
       with target as (
         select id, deleted_at from thoughts
         where id = $1::uuid and brain_id = $2::uuid
+          and (sensitivity_tier is not distinct from 'standard' or $4 = 'local_trusted')
       ),
       upd as (
         update thoughts set deleted_at = now(), updated_at = now()
         where id = $1::uuid and brain_id = $2::uuid and deleted_at is null
+          and (sensitivity_tier is not distinct from 'standard' or $4 = 'local_trusted')
         returning id
       ),
       aud as (
@@ -299,7 +314,7 @@ export async function softDeleteThought({ brainId, thoughtId, actor }) {
         (select count(*) from upd) as changed,
         (select count(*) from aud) as audited
     `,
-    [thoughtId, brainId, JSON.stringify(actor)],
+    [thoughtId, brainId, JSON.stringify(actor), callerReadEgressClass],
   );
 
   const { existed, changed, audited } = result.rows[0];
@@ -321,16 +336,20 @@ export async function softDeleteThought({ brainId, thoughtId, actor }) {
 // docs/32 D7: restore is the symmetric atomic CTE — clears `deleted_at`,
 // snapshots the prior tombstone time into old_state, writes an action='restore'
 // audit row. Idempotent: restoring a live thought is `already_live`, no audit row.
-export async function restoreThought({ brainId, thoughtId, actor }) {
+export async function restoreThought({ brainId, thoughtId, actor, callerReadEgressClass = "cloud_bound" }) {
+  // §6.10 Layer C: a cloud_bound caller cannot restore a restricted row (it
+  // reads as NOT_FOUND). Guard scopes both `target` and `upd`.
   const result = await query(
     `
       with target as (
         select id, deleted_at from thoughts
         where id = $1::uuid and brain_id = $2::uuid
+          and (sensitivity_tier is not distinct from 'standard' or $4 = 'local_trusted')
       ),
       upd as (
         update thoughts set deleted_at = null, updated_at = now()
         where id = $1::uuid and brain_id = $2::uuid and deleted_at is not null
+          and (sensitivity_tier is not distinct from 'standard' or $4 = 'local_trusted')
         returning id
       ),
       aud as (
@@ -345,7 +364,7 @@ export async function restoreThought({ brainId, thoughtId, actor }) {
         (select count(*) from upd) as changed,
         (select count(*) from aud) as audited
     `,
-    [thoughtId, brainId, JSON.stringify(actor)],
+    [thoughtId, brainId, JSON.stringify(actor), callerReadEgressClass],
   );
 
   const { existed, changed, audited } = result.rows[0];
