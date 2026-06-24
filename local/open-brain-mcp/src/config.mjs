@@ -341,6 +341,26 @@ async function loadConfig() {
     "truncated",
   );
 
+  // Layer-A read egress enforcement staging (docs/45 §6.13/§6.2/§9). Default
+  // OBSERVE: deriveScope reports what WOULD be excluded for a cloud-bound caller
+  // but does not alter scope — zero behaviour change. 'enforce' actually strips
+  // local-only brains for cloud-bound callers; 'off' disables the rule entirely.
+  // Unknown values fail SAFE for behaviour (no silent enforcement): fall back to
+  // 'observe' and log, so an operator typo never accidentally restricts reads.
+  const egressEnforceRaw = envOptionalString("OB1_EGRESS_ENFORCE");
+  let egressEnforce = egressEnforceRaw ?? "observe";
+  if (!["off", "observe", "enforce"].includes(egressEnforce)) {
+    console.warn(
+      JSON.stringify({
+        event: "config.egress_enforce.invalid",
+        provided: egressEnforceRaw,
+        fallback: "observe",
+        allowed: ["off", "observe", "enforce"],
+      }),
+    );
+    egressEnforce = "observe";
+  }
+
   return {
     serviceName: process.env.OPEN_BRAIN_SERVICE_NAME ?? "open-brain-local",
     runtimeRole,
@@ -358,6 +378,7 @@ async function loadConfig() {
     expectedEmbeddingDimension: envOptionalNumber("EMBEDDING_STORE_DIMENSION", 1536) ?? 1536,
     metadataMaxTokens: envOptionalNumber("OPEN_BRAIN_METADATA_MAX_TOKENS", 400) ?? 400,
     answerMaxTokens: envOptionalNumber("OPEN_BRAIN_ANSWER_MAX_TOKENS", 600) ?? 600,
+    egressEnforce,
     auth: {
       humanTokenAuth: {
         enabled: humanTokenAuthEnabled,

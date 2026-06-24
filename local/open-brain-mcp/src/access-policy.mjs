@@ -258,12 +258,13 @@ export function authorizeAction({ caller, action, brainMembership = null, estate
 //                naming them resolves-then-denies (403) rather than 404s.
 //
 // Inputs:
-//   caller            : { isAdmin, homeEstateId, kind, ... }
+//   caller            : { isAdmin, homeEstateId, kind, readEgressClass, ... }
 //   brainMemberships  : [{ brainId, role, isDeny }]
 //   estateMemberships : [{ estateId, role, isDeny }]
-//   catalog           : [{ brainId, brainSlug, estateId }]
-// Returns: { accessible: [{brainId,brainSlug}], accessibleIds: Set, lookup: [{brainId,brainSlug}] }
-export function deriveScope({ caller, brainMemberships = [], estateMemberships = [], catalog = [] }) {
+//   catalog           : [{ brainId, brainSlug, estateId, egressClass? }]
+//   egressMode        : 'off' | 'observe' | 'enforce'  (absent → 'off')
+// Returns: { accessible: [{brainId,brainSlug}], accessibleIds: Set, lookup: [{brainId,brainSlug}], egressExcluded: [{brainId,brainSlug}] }
+export function deriveScope({ caller, brainMemberships = [], estateMemberships = [], catalog = [], egressMode }) {
   const estateAllowed = new Set(
     estateMemberships.filter((m) => !m.isDeny).map((m) => m.estateId),
   );
@@ -303,7 +304,62 @@ export function deriveScope({ caller, brainMemberships = [], estateMemberships =
     }
   }
 
-  return { accessible, accessibleIds, lookup };
+  // --- Layer-A egress enforcement (§6.13/§6.2/§9) ---
+  // egressMode absent or 'off': NO filtering. Return as-is.
+  // egressMode 'observe': compute egressExcluded but leave accessible/lookup unchanged.
+  // egressMode 'enforce': remove local-only brains from accessible, accessibleIds, AND lookup
+  //                       for a cloud-bound caller; populate egressExcluded.
+  //
+  // A brain is LOCAL-ONLY when its egressClass ∉ {public, repo} (fail-closed: absent/unknown → local-only).
+  // A caller is cloud-bound when readEgressClass !== 'local_trusted' (fail-closed: absent/unknown → cloud-bound).
+
+  const mode = egressMode ?? "off";
+  if (mode === "off") {
+    return { accessible, accessibleIds, lookup, egressExcluded: [] };
+  }
+
+  const callerIsCloudBound = caller.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED;
+  if (!callerIsCloudBound) {
+    // Local-trusted caller: no exclusion regardless of mode.
+    return { accessible, accessibleIds, lookup, egressExcluded: [] };
+  }
+
+  // Collect ALL nameable (lookup) brains that are local-only — not just accessible ones.
+  // A DENY-shadowed brain lands in lookup but not accessible; it must also be stripped
+  // from lookup to prevent existence leaks (spec: 'so a cloud-bound caller naming a
+  // local-only brain resolves NOT_FOUND, never a denied/exists leak').
+  const egressExcluded = [];
+  const seenEgress = new Set();
+  for (const ref of lookup) {
+    if (seenEgress.has(ref.brainId)) continue;
+    seenEgress.add(ref.brainId);
+    // Find the catalog entry to check egressClass.
+    const entry = catalog.find((b) => b.brainId === ref.brainId);
+    const ec = entry?.egressClass;
+    const localOnly =
+      ec !== BRAIN_EGRESS_CLASS.PUBLIC && ec !== BRAIN_EGRESS_CLASS.REPO;
+    if (localOnly) {
+      egressExcluded.push({ brainId: ref.brainId, brainSlug: ref.brainSlug });
+    }
+  }
+
+  if (mode === "observe" || egressExcluded.length === 0) {
+    // observe: report but don't alter accessible/lookup.
+    return { accessible, accessibleIds, lookup, egressExcluded };
+  }
+
+  // enforce: remove excluded brains from accessible, accessibleIds, and lookup.
+  const excludedIds = new Set(egressExcluded.map((b) => b.brainId));
+  const filteredAccessible = accessible.filter((b) => !excludedIds.has(b.brainId));
+  const filteredAccessibleIds = new Set([...accessibleIds].filter((id) => !excludedIds.has(id)));
+  const filteredLookup = lookup.filter((b) => !excludedIds.has(b.brainId));
+
+  return {
+    accessible: filteredAccessible,
+    accessibleIds: filteredAccessibleIds,
+    lookup: filteredLookup,
+    egressExcluded,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +391,10 @@ export function resolveSelector({ selector, scope, existsGlobally = false }) {
 
     const shadowed = scope.lookup.find((b) => b.brainId === selector);
     if (shadowed) return denied(DENY_REASONS.NOT_AUTHORIZED);
+
+    // If the UUID was stripped by egress enforcement (§6.13/§9), treat as not_found.
+    // A cloud-bound caller must never learn a local-only brain exists via the UUID path.
+    if (scope.egressExcluded?.some((b) => b.brainId === selector)) return notFound();
 
     // Knowing the UUID is proof enough to learn it exists — reveal as 403, not 404.
     if (existsGlobally) return denied(DENY_REASONS.NOT_AUTHORIZED);
@@ -594,15 +654,21 @@ export function effectiveEgress({ brain, row, caller, sink }) {
 // Returns: [{ brainId, brainSlug }]
 export function planReadFanout({ caller, scope, explicitBrain = null, effectiveBrain = null }) {
   const ref = (b) => ({ brainId: b.brainId, brainSlug: b.brainSlug ?? null });
+  // An egress-excluded brain (docs/45 §6.13, enforce mode) must never re-enter
+  // the fanout via the default/effective-brain fallback — otherwise the stripped
+  // default brain leaks through the unscoped read planes. egressExcluded is [] in
+  // off/observe and for callers built without it, so this is a no-op there.
+  const egressExcludedIds = new Set((scope.egressExcluded ?? []).map((b) => b.brainId));
+  const fallback = (b) => (b && !egressExcludedIds.has(b.brainId) ? [ref(b)] : []);
   if (explicitBrain) {
-    return [ref(explicitBrain)];
+    return egressExcludedIds.has(explicitBrain.brainId) ? [] : [ref(explicitBrain)];
   }
   if (isLegacyAdmin(caller)) {
-    return effectiveBrain ? [ref(effectiveBrain)] : [];
+    return fallback(effectiveBrain);
   }
   if (scope.accessible.length > 0) {
     // Return a copy: the result must not alias (and let a caller mutate) the scope.
     return scope.accessible.map(ref);
   }
-  return effectiveBrain ? [ref(effectiveBrain)] : [];
+  return fallback(effectiveBrain);
 }

@@ -5,6 +5,7 @@ import { query } from "./db.mjs";
 import {
   ACTIONS,
   CALLER_KINDS,
+  CALLER_EGRESS_CLASS,
   VERDICTS,
   isBrainUuid,
   deriveScope,
@@ -125,7 +126,8 @@ async function fetchEstateMemberships(principalId) {
 async function fetchBrainCatalog(principalId, { isAdmin, homeEstateId }) {
   const result = await query(
     `
-      select b.id as brain_id, b.slug as brain_slug, b.household_id as estate_id
+      select b.id as brain_id, b.slug as brain_slug, b.household_id as estate_id,
+             b.egress_class as egress_class
       from brains b
       where exists (
           select 1 from brain_memberships bm
@@ -139,7 +141,14 @@ async function fetchBrainCatalog(principalId, { isAdmin, homeEstateId }) {
     `,
     [principalId, Boolean(isAdmin), homeEstateId],
   );
-  return result.rows.map((r) => ({ brainId: r.brain_id, brainSlug: r.brain_slug, estateId: r.estate_id }));
+  return result.rows.map((r) => ({
+    brainId: r.brain_id,
+    brainSlug: r.brain_slug,
+    estateId: r.estate_id,
+    // egress_class is an AUTHORIZATION INPUT to scope derivation (docs/45 §6.13).
+    // NULL/absent → the policy fail-closes it to local-only.
+    egressClass: r.egress_class ?? undefined,
+  }));
 }
 
 async function brainExists(brainId) {
@@ -239,7 +248,7 @@ async function slugForBrain(brainId, scope) {
 // key's brain_id hint when present (ADR-0003: a default hint, never a clamp).
 async function buildPrincipalContext(
   principalId,
-  { authSource, isAdmin, defaultBrainOverride = null, requireUsableBrain },
+  { authSource, isAdmin, defaultBrainOverride = null, requireUsableBrain, readEgressClass = CALLER_EGRESS_CLASS.CLOUD_BOUND },
   requestedBrainSlug,
 ) {
   const base = await query(
@@ -258,6 +267,9 @@ async function buildPrincipalContext(
     homeEstateId,
     isAdmin: Boolean(isAdmin),
     defaultBrainId,
+    // Layer-A egress audience (docs/45 §6.2). Only a stored key explicitly marked
+    // local_trusted is trusted; every other shape is cloud_bound (fail-closed).
+    readEgressClass,
   };
 
   const [brainMemberships, estateMemberships, catalog] = await Promise.all([
@@ -266,7 +278,25 @@ async function buildPrincipalContext(
     fetchBrainCatalog(principalId, caller),
   ]);
 
-  const scope = deriveScope({ caller, brainMemberships, estateMemberships, catalog });
+  const egressMode = config.egressEnforce;
+  const scope = deriveScope({ caller, brainMemberships, estateMemberships, catalog, egressMode });
+
+  // docs/45 §9: in observe/enforce, record (audit only) the local-only brains a
+  // cloud-bound caller's read would otherwise reach. Slugs only — NEVER thought
+  // content. observe = visibility without behaviour change; enforce = these were
+  // actually stripped from scope.
+  if ((egressMode === "observe" || egressMode === "enforce") && scope.egressExcluded.length > 0) {
+    console.warn(
+      JSON.stringify({
+        event: "egress.read_excluded",
+        mode: egressMode,
+        authSource: caller.kind,
+        principalId: caller.principalId,
+        readEgressClass: caller.readEgressClass,
+        excludedBrainSlugs: scope.egressExcluded.map((b) => b.brainSlug),
+      }),
+    );
+  }
 
   let requestedBrain = null;
   if (requestedBrainSlug) {
@@ -368,10 +398,18 @@ async function resolveHumanAccessContext(c, requestedBrainSlug) {
     throw new HttpError(403, "Authenticated user is not bound to an OB1 principal");
   }
 
-  // Human tokens are never admin keys; reach is purely membership-derived.
+  // Human tokens are never admin keys; reach is purely membership-derived. A
+  // human token is a cloud-bound audience (docs/45 §6.2): no key-level
+  // local_trusted marking exists for it, so it never reads local-only brains
+  // under enforce.
   return buildPrincipalContext(
     bindingResult.rows[0].principal_id,
-    { authSource: CALLER_KINDS.HUMAN_TOKEN, isAdmin: false, requireUsableBrain: false },
+    {
+      authSource: CALLER_KINDS.HUMAN_TOKEN,
+      isAdmin: false,
+      requireUsableBrain: false,
+      readEgressClass: CALLER_EGRESS_CLASS.CLOUD_BOUND,
+    },
     requestedBrainSlug,
   );
 }
@@ -379,7 +417,7 @@ async function resolveHumanAccessContext(c, requestedBrainSlug) {
 async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
   const result = await query(
     `
-      select k.brain_id as key_brain_id, k.is_admin, p.id as principal_id
+      select k.brain_id as key_brain_id, k.is_admin, k.read_egress_class, p.id as principal_id
       from brain_access_keys k
       join brain_principals p on p.id = k.principal_id
       where k.key_hash = $1 and k.is_active = true
@@ -400,6 +438,12 @@ async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
   // ADR-0003: the key's brain_id is a default-brain hint only — NOT a naming
   // clamp. The old brain-bound restriction is retired; capability comes from
   // roles, reach from memberships + (for admin keys) the home estate.
+  // docs/45 §6.2: only an explicit local_trusted marking trusts the key for
+  // local-only reads. NULL/unknown fails closed to cloud_bound.
+  const readEgressClass = row.read_egress_class === CALLER_EGRESS_CLASS.LOCAL_TRUSTED
+    ? CALLER_EGRESS_CLASS.LOCAL_TRUSTED
+    : CALLER_EGRESS_CLASS.CLOUD_BOUND;
+
   return buildPrincipalContext(
     row.principal_id,
     {
@@ -407,6 +451,7 @@ async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
       isAdmin: Boolean(row.is_admin),
       defaultBrainOverride: row.key_brain_id,
       requireUsableBrain: true,
+      readEgressClass,
     },
     requestedBrainSlug,
   );
@@ -422,6 +467,10 @@ async function resolveLegacyAdminContext(requestedBrainSlug) {
     homeEstateId: null,
     isAdmin: true,
     defaultBrainId: null,
+    // The bare legacy key is an unattributable, cloud-bound audience (docs/45
+    // §6.2). It does not fan out (no accessible set), so egress filtering on the
+    // legacy path is moot, but the field is set for shape consistency / fail-safe.
+    readEgressClass: CALLER_EGRESS_CLASS.CLOUD_BOUND,
   };
 
   let requestedBrain = null;
