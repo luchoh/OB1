@@ -8,12 +8,14 @@ import { config } from "./config.mjs";
 import { closePool, healthcheckDatabase, query } from "./db.mjs";
 import {
   captureThought,
+  peekCaptureConflictTier,
   patchThoughtMetadata,
   softDeleteThought,
   restoreThought,
   purgeThought,
   brainStats,
   ThoughtStoreError,
+  STORE_ERROR,
 } from "./thought-store.mjs";
 import {
   graphNeighbors,
@@ -316,6 +318,19 @@ async function handleCaptureThought(args, accessContext) {
   // (Pre-ADR-0002 the runtime had no write gate — any reachable brain was
   // writable; this is the call site that enforcement was missing.)
   await authorizeWrite(accessContext, brainId);
+  const callerReadEgressClass = accessContext._policy.caller.readEgressClass;
+
+  // §6.10/§6.5 PREFLIGHT (before any processor call): a cloud_bound caller may
+  // not upsert OVER an existing restricted row. Deny here so the content never
+  // reaches the embedding/LLM processors. The captureThought ON CONFLICT guard
+  // is the atomic backstop; this is the egress-safe early exit.
+  if (args.dedupe_key) {
+    const existingTier = await peekCaptureConflictTier({ brainId, dedupeKey: args.dedupe_key });
+    if (existingTier !== undefined && existingTier !== "standard" && callerReadEgressClass !== "local_trusted") {
+      throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, `Thought not found: ${args.dedupe_key}`);
+    }
+  }
+
   const content = args.content.trim();
   const metadata = args.metadata ?? {};
   const shouldExtractMetadata = args.extract_metadata ?? true;
@@ -366,6 +381,7 @@ async function handleCaptureThought(args, accessContext) {
     originEgressClass: stamp.originEgressClass,
     sourceTrustClass: stamp.sourceTrustClass,
     reviewState: stamp.reviewState,
+    callerReadEgressClass,
   });
 
   return {

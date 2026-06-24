@@ -196,9 +196,11 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
   });
 
   it("re-capture does not clear an existing quarantine (review_state)", async () => {
-    const first = await cap({ dedupeKey: "stq", content: "q1", sensitivityTier: "restricted", originEgressClass: "cloud_origin", reviewState: "unreviewed" });
+    // local_trusted: re-capturing a restricted row is allowed (the cloud_bound
+    // upsert-over-restricted denial is exercised separately below).
+    const first = await cap({ dedupeKey: "stq", content: "q1", sensitivityTier: "restricted", originEgressClass: "cloud_origin", reviewState: "unreviewed", callerReadEgressClass: "local_trusted" });
     assert.equal(first.review_state, "unreviewed");
-    const second = await cap({ dedupeKey: "stq", content: "q2", sensitivityTier: "restricted", originEgressClass: "cloud_origin", reviewState: "none" });
+    const second = await cap({ dedupeKey: "stq", content: "q2", sensitivityTier: "restricted", originEgressClass: "cloud_origin", reviewState: "none", callerReadEgressClass: "local_trusted" });
     assert.equal(second.review_state, "unreviewed", "re-capture must not clear the quarantine");
   });
 
@@ -233,6 +235,27 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
   it("Layer C: absent/unknown caller egress fails closed (cannot mutate a restricted row)", async () => {
     const row = await cap({ dedupeKey: "lcu", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none" });
     await assert.rejects(() => store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "x" }), notFound);
+  });
+
+  // --- Layer C, capture-upsert path (docs/45 §6.10 / Codex v3 F1): a cloud_bound
+  //     caller may not upsert OVER an existing restricted row (its content must
+  //     not change). local_trusted may; a standard row stays re-capturable. ---
+  it("Layer C: cloud_bound cannot upsert-over an existing restricted row (content unchanged); local_trusted can", async () => {
+    const first = await cap({ dedupeKey: "uc1", content: "v1", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none", callerReadEgressClass: "local_trusted" });
+    assert.equal(first.sensitivity_tier, "restricted");
+    await assert.rejects(() => cap({ dedupeKey: "uc1", content: "hacked", callerReadEgressClass: "cloud_bound" }), notFound);
+    const check = await query("select content from thoughts where id = $1::uuid", [first.id]);
+    assert.equal(check.rows[0].content, "v1", "cloud_bound upsert must not mutate the restricted row");
+    const second = await cap({ dedupeKey: "uc1", content: "v2", callerReadEgressClass: "local_trusted" });
+    assert.equal(second.id, first.id);
+    assert.equal(second.content, "v2");
+  });
+
+  it("Layer C: cloud_bound CAN re-capture over a standard row", async () => {
+    const first = await cap({ dedupeKey: "uc2", content: "s1", callerReadEgressClass: "cloud_bound" });
+    const second = await cap({ dedupeKey: "uc2", content: "s2", callerReadEgressClass: "cloud_bound" });
+    assert.equal(second.id, first.id);
+    assert.equal(second.content, "s2");
   });
 
   // --- soft-delete / restore ---

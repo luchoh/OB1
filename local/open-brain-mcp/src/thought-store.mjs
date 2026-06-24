@@ -69,6 +69,9 @@ export async function captureThought({
   originEgressClass = null,
   sourceTrustClass = null,
   reviewState = null,
+  // §6.10: a cloud_bound caller may not upsert-OVER an existing restricted row.
+  // Fail-closed: absent/unknown egress class is cloud_bound.
+  callerReadEgressClass = "cloud_bound",
 }) {
   const typeValue = typeof metadata?.type === "string" && metadata.type.trim()
     ? metadata.type.trim()
@@ -78,7 +81,9 @@ export async function captureThought({
   // restrictive (monotone): cloud_origin / untrusted stick, an existing
   // quarantine is never cleared, and the tier is preserved (a re-capture must
   // not declassify). The monotonic-taint trigger (016) also backstops origin.
-  // The full "deny a cloud-bound upsert over a restricted row" guard is slice 5.
+  // The DO UPDATE is additionally guarded (§6.10): a cloud_bound re-capture over
+  // an existing restricted row matches no conflict-update row → 0 rows → the
+  // handler's preflight (or this fail-closed backstop) denies it as NOT_FOUND.
   const result = await query(
     `
       insert into thoughts (
@@ -137,6 +142,7 @@ export async function captureThought({
           else coalesce(thoughts.review_state, excluded.review_state)
         end,
         updated_at = now()
+      where (thoughts.sensitivity_tier is not distinct from 'standard' or $13 = 'local_trusted')
       returning
         id,
         brain_id,
@@ -167,10 +173,38 @@ export async function captureThought({
       originEgressClass,
       sourceTrustClass,
       reviewState,
+      callerReadEgressClass,
     ],
   );
 
+  // 0 rows ⇒ the conflict targeted an existing restricted row and the guard
+  // (above) blocked the DO UPDATE for a cloud_bound caller. Deny without
+  // confirming the row exists (§6.10: no existence oracle). The handler's
+  // preflight normally catches this before any processor call; this is the
+  // atomic, TOCTOU-safe backstop.
+  if (result.rows.length === 0) {
+    throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, `Thought not found: ${dedupeKey ?? "(no dedupe key)"}`);
+  }
+
   return result.rows[0];
+}
+
+// Preflight (docs/45 §6.10 + Codex v3 F1 / v4 F3): the sensitivity tier of the
+// existing LIVE row a capture with this dedupe_key would upsert OVER, or
+// `undefined` when there is no such row (a fresh insert). The handler calls this
+// BEFORE the embedding/LLM processors so a cloud_bound upsert over a restricted
+// row is denied before any content leaves the box. Returns `null` for an
+// existing row whose tier is NULL (fail-closed → treat as non-standard).
+export async function peekCaptureConflictTier({ brainId, dedupeKey }) {
+  if (!dedupeKey) {
+    return undefined;
+  }
+  const r = await query(
+    `select sensitivity_tier from thoughts
+       where brain_id = $1::uuid and dedupe_key = $2 and deleted_at is null`,
+    [brainId, dedupeKey],
+  );
+  return r.rowCount === 0 ? undefined : (r.rows[0].sensitivity_tier ?? null);
 }
 
 // ---------------------------------------------------------------------------
