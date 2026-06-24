@@ -551,8 +551,23 @@ export async function resolveAccessContext(c, { routeBrainSlug = null } = {}) {
 export async function resolveRequestBrain(accessContext, brainArg) {
   const selector = typeof brainArg === "string" ? brainArg.trim() : brainArg;
   if (selector == null || selector === "") {
+    const brainId = accessContext.effectiveBrainId;
+    // §6.13 (audit H1): an EXPLICIT selector for an egress-excluded brain already
+    // 404s (it is gone from `scope.lookup` under enforce), but the no-selector
+    // DEFAULT-brain fallback bypasses scope — so a cloud_bound caller whose
+    // default brain is private_local would leak it through ask_brain /
+    // expand_context (single-brain reads) and could write to it. Reject the
+    // default brain here under enforce too. (This also settles the enforce
+    // write-path question: enforce excludes such a brain for BOTH read and write,
+    // which is fail-safe — a properly-provisioned cloud principal never holds a
+    // private_local membership in the first place.)
+    const { scope, egressMode } = accessContext._policy;
+    if (egressMode === "enforce" && brainId
+        && scope.egressExcluded?.some((b) => b.brainId === brainId)) {
+      throw new HttpError(404, "Brain not found");
+    }
     return {
-      brainId: accessContext.effectiveBrainId,
+      brainId,
       brainSlug: accessContext.effectiveBrainSlug ?? null,
     };
   }

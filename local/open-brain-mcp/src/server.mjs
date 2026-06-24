@@ -818,8 +818,12 @@ async function handleExpandContext(args, accessContext) {
   const requestedLimit = args.limit ?? 6;
 
   try {
+    // §6.13 (audit H1): route the brain through resolveRequestBrain so the
+    // default/effective brain is egress-checked under enforce (a cloud_bound
+    // admin's private_local default must not leak via graph expansion).
+    const { brainId } = await resolveRequestBrain(accessContext, args.brain);
     const result = await expandContextRows({
-      brainId: accessContext.effectiveBrainId,
+      brainId,
       thoughtId: args.thought_id,
       canonicalId: args.canonical_id,
       questionText: args.question ?? "",
