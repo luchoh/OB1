@@ -1,7 +1,52 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { effectiveEgress } from "../src/access-policy.mjs";
+import { effectiveEgress, deriveCaptureStamp } from "../src/access-policy.mjs";
+
+// --------------------------------------------------------------------------
+// deriveCaptureStamp — the PURE write-stamping decision (docs/45 §6.8/§6.11).
+// What columns a capture writes, derived from the caller's egress class.
+// The persistence (captureThought SQL) is integration-tested separately.
+// --------------------------------------------------------------------------
+
+test("stamp: local_trusted caller + standard → local_trusted origin, none review", () => {
+  assert.deepEqual(
+    deriveCaptureStamp({ caller: { readEgressClass: "local_trusted" }, sensitivityTier: "standard" }),
+    { originEgressClass: "local_trusted", sourceTrustClass: "trusted", reviewState: "none" },
+  );
+});
+
+test("stamp: cloud_bound caller + standard → cloud_origin, none review (materializes, untrusted handled at read)", () => {
+  assert.deepEqual(
+    deriveCaptureStamp({ caller: { readEgressClass: "cloud_bound" }, sensitivityTier: "standard" }),
+    { originEgressClass: "cloud_origin", sourceTrustClass: "trusted", reviewState: "none" },
+  );
+});
+
+test("stamp: cloud_bound caller + restricted → cloud_origin, QUARANTINED (unreviewed)", () => {
+  assert.deepEqual(
+    deriveCaptureStamp({ caller: { readEgressClass: "cloud_bound" }, sensitivityTier: "restricted" }),
+    { originEgressClass: "cloud_origin", sourceTrustClass: "trusted", reviewState: "unreviewed" },
+  );
+});
+
+test("stamp: local_trusted caller + restricted → local_trusted, none (not quarantined)", () => {
+  assert.deepEqual(
+    deriveCaptureStamp({ caller: { readEgressClass: "local_trusted" }, sensitivityTier: "restricted" }),
+    { originEgressClass: "local_trusted", sourceTrustClass: "trusted", reviewState: "none" },
+  );
+});
+
+test("stamp: unknown/absent caller egress → cloud_origin (fail-closed); restricted → quarantined", () => {
+  assert.deepEqual(
+    deriveCaptureStamp({ caller: {}, sensitivityTier: "restricted" }),
+    { originEgressClass: "cloud_origin", sourceTrustClass: "trusted", reviewState: "unreviewed" },
+  );
+  assert.deepEqual(
+    deriveCaptureStamp({ caller: undefined, sensitivityTier: "standard" }),
+    { originEgressClass: "cloud_origin", sourceTrustClass: "trusted", reviewState: "none" },
+  );
+});
 
 // B1: cloud_bound caller reading a restricted-tier row → canMaterialize=false
 // Full shape assertion (all seven output fields must be correct).

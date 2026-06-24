@@ -157,6 +157,51 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
     assert.equal(await deletedAt(resurrected.id), null, "the new row is live");
   });
 
+  // --- egress-boundary stamp (docs/45 §6.8/§6.11, slice 4). The fixture brain
+  //     is private_local (kind 'personal' → 016 default), so restricted captures
+  //     are allowed here; the monotone-conflict cases also exercise the 016
+  //     monotonic-taint trigger (a downgrade must not be attempted/persisted). ---
+  const cap = (extra) => store.captureThought({
+    brainId, content: extra.content ?? "x", embedding: EMB, embeddingModel: "zzt-test-model",
+    metadata: {}, ...extra,
+  });
+
+  it("captureThought persists the egress stamp columns on insert", async () => {
+    const row = await cap({ dedupeKey: "st1", content: "stamped", sensitivityTier: "restricted", originEgressClass: "cloud_origin", sourceTrustClass: "trusted", reviewState: "unreviewed" });
+    assert.equal(row.sensitivity_tier, "restricted");
+    assert.equal(row.origin_egress_class, "cloud_origin");
+    assert.equal(row.source_trust_class, "trusted");
+    assert.equal(row.review_state, "unreviewed");
+  });
+
+  it("captureThought defaults sensitivity_tier to standard when not provided", async () => {
+    const row = await cap({ dedupeKey: "st2", originEgressClass: "local_trusted", sourceTrustClass: "trusted", reviewState: "none" });
+    assert.equal(row.sensitivity_tier, "standard");
+    assert.equal(row.origin_egress_class, "local_trusted");
+  });
+
+  it("re-capture taints origin monotonically: local_trusted then cloud_origin → cloud_origin", async () => {
+    const first = await cap({ dedupeKey: "stmono", content: "v1", originEgressClass: "local_trusted", reviewState: "none" });
+    assert.equal(first.origin_egress_class, "local_trusted");
+    const second = await cap({ dedupeKey: "stmono", content: "v2", originEgressClass: "cloud_origin", reviewState: "none" });
+    assert.equal(second.id, first.id);
+    assert.equal(second.origin_egress_class, "cloud_origin", "cloud taint applied on re-capture");
+  });
+
+  it("re-capture cannot wash cloud_origin back to local_trusted (monotone; trigger-safe)", async () => {
+    const first = await cap({ dedupeKey: "stwash", content: "v1", originEgressClass: "cloud_origin", reviewState: "none" });
+    const second = await cap({ dedupeKey: "stwash", content: "v2", originEgressClass: "local_trusted", reviewState: "none" });
+    assert.equal(second.id, first.id);
+    assert.equal(second.origin_egress_class, "cloud_origin", "cloud_origin sticks despite a local re-capture");
+  });
+
+  it("re-capture does not clear an existing quarantine (review_state)", async () => {
+    const first = await cap({ dedupeKey: "stq", content: "q1", sensitivityTier: "restricted", originEgressClass: "cloud_origin", reviewState: "unreviewed" });
+    assert.equal(first.review_state, "unreviewed");
+    const second = await cap({ dedupeKey: "stq", content: "q2", sensitivityTier: "restricted", originEgressClass: "cloud_origin", reviewState: "none" });
+    assert.equal(second.review_state, "unreviewed", "re-capture must not clear the quarantine");
+  });
+
   // --- soft-delete / restore ---
   it("softDeleteThought sets deleted_at and writes exactly one delete audit row", async () => {
     const row = await capture({ content: "to delete", dedupeKey: "d1" });

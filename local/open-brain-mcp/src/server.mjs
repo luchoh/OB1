@@ -3,6 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
 import { HttpError, authorizeWrite, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
+import { deriveCaptureStamp } from "./access-policy.mjs";
 import { config } from "./config.mjs";
 import { closePool, healthcheckDatabase, query } from "./db.mjs";
 import {
@@ -47,6 +48,7 @@ const captureThoughtSchema = {
   occurred_at: z.string().optional().describe("Optional source timestamp in ISO 8601 format."),
   dedupe_key: z.string().min(1).optional().describe("Optional stable key for idempotent imports."),
   extract_metadata: z.boolean().optional().describe("Whether to run LLM metadata extraction before storing."),
+  sensitivity_tier: z.enum(["standard", "restricted"]).optional().describe("Egress tier at creation (docs/45 §6.8). Defaults to 'standard'. 'restricted' is local-on-box-only and may only be captured into a private_local/quarantine_review brain."),
 };
 const captureThoughtInput = z.object(captureThoughtSchema);
 
@@ -344,6 +346,14 @@ async function handleCaptureThought(args, accessContext) {
       : null,
   });
 
+  // Stamp the egress-boundary columns from the caller's egress class (docs/45
+  // §6.8/§6.11). A cloud-bound (or unknown) writer is cloud_origin; a cloud_origin
+  // restricted capture is quarantined (unreviewed) at creation.
+  const stamp = deriveCaptureStamp({
+    caller: accessContext._policy?.caller,
+    sensitivityTier: args.sensitivity_tier,
+  });
+
   const thought = await captureThought({
     brainId,
     content,
@@ -351,6 +361,10 @@ async function handleCaptureThought(args, accessContext) {
     embeddingModel: config.embeddingModel,
     metadata: normalizedMetadata,
     dedupeKey: args.dedupe_key,
+    sensitivityTier: args.sensitivity_tier,
+    originEgressClass: stamp.originEgressClass,
+    sourceTrustClass: stamp.sourceTrustClass,
+    reviewState: stamp.reviewState,
   });
 
   return {

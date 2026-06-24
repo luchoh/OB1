@@ -55,11 +55,30 @@ export class ThoughtStoreError extends Error {
 // `do update` deliberately never clears `deleted_at`. The embedding vector and
 // its model/dimension are computed by the caller (embedding service is I/O) and
 // passed in; content_hash defaults to sha256(content) in SQL when no dedupe key.
-export async function captureThought({ brainId, content, embedding, embeddingModel, metadata, dedupeKey }) {
+export async function captureThought({
+  brainId,
+  content,
+  embedding,
+  embeddingModel,
+  metadata,
+  dedupeKey,
+  // Egress-boundary stamp (docs/45 §6.8/§6.11), derived by deriveCaptureStamp in
+  // the handler. sensitivityTier defaults to 'standard'; origin/source/review may
+  // be null (= unknown = fail-closed at read time) for non-stamping callers.
+  sensitivityTier = null,
+  originEgressClass = null,
+  sourceTrustClass = null,
+  reviewState = null,
+}) {
   const typeValue = typeof metadata?.type === "string" && metadata.type.trim()
     ? metadata.type.trim()
     : null;
 
+  // On a dedupe re-capture, the security labels move only toward MORE
+  // restrictive (monotone): cloud_origin / untrusted stick, an existing
+  // quarantine is never cleared, and the tier is preserved (a re-capture must
+  // not declassify). The monotonic-taint trigger (016) also backstops origin.
+  // The full "deny a cloud-bound upsert over a restricted row" guard is slice 5.
   const result = await query(
     `
       insert into thoughts (
@@ -70,7 +89,11 @@ export async function captureThought({ brainId, content, embedding, embeddingMod
         embedding_dimension,
         dedupe_key,
         metadata,
-        type
+        type,
+        sensitivity_tier,
+        origin_egress_class,
+        source_trust_class,
+        review_state
       )
       values (
         $1::uuid,
@@ -80,7 +103,11 @@ export async function captureThought({ brainId, content, embedding, embeddingMod
         $5,
         coalesce($6, encode(digest($2, 'sha256'), 'hex')),
         $7::jsonb,
-        $8
+        $8,
+        coalesce($9, 'standard'),
+        $10,
+        $11,
+        $12
       )
       on conflict (brain_id, dedupe_key) where deleted_at is null
       do update set
@@ -90,6 +117,21 @@ export async function captureThought({ brainId, content, embedding, embeddingMod
         embedding_dimension = excluded.embedding_dimension,
         metadata = thoughts.metadata || excluded.metadata,
         type = coalesce(excluded.type, thoughts.type),
+        -- tier preserved (no declassification via re-capture)
+        sensitivity_tier = thoughts.sensitivity_tier,
+        -- origin/source taint = worst-of (monotone; never washes)
+        origin_egress_class = case
+          when thoughts.origin_egress_class = 'cloud_origin'
+            or excluded.origin_egress_class = 'cloud_origin' then 'cloud_origin'
+          else coalesce(excluded.origin_egress_class, thoughts.origin_egress_class)
+        end,
+        source_trust_class = case
+          when thoughts.source_trust_class = 'untrusted'
+            or excluded.source_trust_class = 'untrusted' then 'untrusted'
+          else coalesce(excluded.source_trust_class, thoughts.source_trust_class)
+        end,
+        -- an existing quarantine is never cleared by a re-capture
+        review_state = coalesce(thoughts.review_state, excluded.review_state),
         updated_at = now()
       returning
         id,
@@ -101,6 +143,10 @@ export async function captureThought({ brainId, content, embedding, embeddingMod
         embedding_dimension,
         metadata,
         type,
+        sensitivity_tier,
+        origin_egress_class,
+        source_trust_class,
+        review_state,
         created_at,
         updated_at
     `,
@@ -113,6 +159,10 @@ export async function captureThought({ brainId, content, embedding, embeddingMod
       dedupeKey ?? null,
       JSON.stringify(metadata),
       typeValue,
+      sensitivityTier,
+      originEgressClass,
+      sourceTrustClass,
+      reviewState,
     ],
   );
 

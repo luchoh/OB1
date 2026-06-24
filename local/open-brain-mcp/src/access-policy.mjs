@@ -636,6 +636,33 @@ export function effectiveEgress({ brain, row, caller, sink }) {
 }
 
 // ---------------------------------------------------------------------------
+// Capture stamping (write side)
+// ---------------------------------------------------------------------------
+
+// deriveCaptureStamp — the PURE write-stamping decision for a capture
+// (docs/45 §6.8/§6.11). Derives the trust/quarantine columns a capture writes
+// from the WRITER's egress class (the caller's readEgressClass doubles as writer
+// egress). Fail-closed: an unknown/absent caller egress is cloud_origin. A
+// cloud_origin + restricted capture is QUARANTINED (unreviewed) at creation —
+// the hidden-injection guard. Direct capture is agent-authored, so source is
+// 'trusted' here; external ingest pipelines stamp source_trust_class='untrusted'
+// on their own path (§6.11 F8). Persistence (the SQL insert + monotonic conflict)
+// is the store's job, not this module's.
+export function deriveCaptureStamp({ caller, sensitivityTier } = {}) {
+  const originEgressClass =
+    caller?.readEgressClass === CALLER_EGRESS_CLASS.LOCAL_TRUSTED
+      ? ORIGIN_EGRESS_CLASS.LOCAL_TRUSTED
+      : ORIGIN_EGRESS_CLASS.CLOUD_ORIGIN;
+  const sourceTrustClass = SOURCE_TRUST_CLASS.TRUSTED;
+  const reviewState =
+    originEgressClass === ORIGIN_EGRESS_CLASS.CLOUD_ORIGIN &&
+    sensitivityTier === SENSITIVITY_TIER.RESTRICTED
+      ? REVIEW_STATE.UNREVIEWED
+      : REVIEW_STATE.NONE;
+  return { originEgressClass, sourceTrustClass, reviewState };
+}
+
+// ---------------------------------------------------------------------------
 // Read fanout
 // ---------------------------------------------------------------------------
 
