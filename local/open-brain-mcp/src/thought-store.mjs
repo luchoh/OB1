@@ -130,8 +130,12 @@ export async function captureThought({
             or excluded.source_trust_class = 'untrusted' then 'untrusted'
           else coalesce(excluded.source_trust_class, thoughts.source_trust_class)
         end,
-        -- an existing quarantine is never cleared by a re-capture
-        review_state = coalesce(thoughts.review_state, excluded.review_state),
+        -- an existing quarantine is never cleared by a re-capture (worst-of:
+        -- 'unreviewed' is sticky, so a re-capture can never un-quarantine a row)
+        review_state = case
+          when thoughts.review_state = 'unreviewed' or excluded.review_state = 'unreviewed' then 'unreviewed'
+          else coalesce(thoughts.review_state, excluded.review_state)
+        end,
         updated_at = now()
       returning
         id,

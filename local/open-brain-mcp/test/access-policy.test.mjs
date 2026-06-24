@@ -441,11 +441,40 @@ test("planReadFanout: empty accessible set falls back to effective brain", () =>
 // fallback must NOT re-inject the default/effective brain if that brain was the
 // thing egress excluded — otherwise the private_local default leaks through the
 // unscoped read planes (stats/search/list) that fan out via planReadFanout.
-test("planReadFanout: an egress-excluded effective brain is not used as fallback", () => {
+// Suppression is ENFORCE-only.
+test("planReadFanout: under enforce, an egress-excluded effective brain is not used as fallback", () => {
   const caller = { kind: CALLER_KINDS.SERVICE_KEY, principalId: "p-1", isAdmin: false };
   const scope = { accessible: [], accessibleIds: new Set(), lookup: [], egressExcluded: [BRAIN.ob1] };
-  const out = planReadFanout({ caller, scope, explicitBrain: null, effectiveBrain: BRAIN.ob1 });
-  assert.deepEqual(out, [], "the egress-excluded default brain must not leak back into the fanout");
+  const out = planReadFanout({ caller, scope, explicitBrain: null, effectiveBrain: BRAIN.ob1, egressMode: "enforce" });
+  assert.deepEqual(out, [], "the egress-excluded default brain must not leak back into the fanout under enforce");
+});
+
+// Regression C1 (audit, found by adversarial review): OBSERVE must be a
+// behavioural no-op. egressExcluded is populated in observe (for logging) but
+// planReadFanout must NOT suppress on it — else explicit-brain reads to a
+// private_local brain return [] in the DEFAULT (observe) config. The off/observe
+// fanout must be byte-identical to pre-egress behaviour.
+test("planReadFanout: observe/off does NOT suppress an egress-excluded brain (no-op)", () => {
+  const caller = { kind: CALLER_KINDS.SERVICE_KEY, principalId: "p-1", isAdmin: false };
+  const scope = { accessible: [], accessibleIds: new Set(), lookup: [], egressExcluded: [BRAIN.ob1] };
+  // observe + explicit brain that is "would-be-excluded" → still returned
+  assert.deepEqual(
+    planReadFanout({ caller, scope, explicitBrain: BRAIN.ob1, effectiveBrain: BRAIN.ob1, egressMode: "observe" }),
+    [ref(BRAIN.ob1)],
+    "observe must not suppress an explicit brain",
+  );
+  // observe + empty-accessible fallback to a would-be-excluded brain → still returned
+  assert.deepEqual(
+    planReadFanout({ caller, scope, explicitBrain: null, effectiveBrain: BRAIN.ob1, egressMode: "observe" }),
+    [ref(BRAIN.ob1)],
+    "observe must not suppress the fallback brain",
+  );
+  // off (default) likewise
+  assert.deepEqual(
+    planReadFanout({ caller, scope, explicitBrain: BRAIN.ob1, effectiveBrain: BRAIN.ob1 }),
+    [ref(BRAIN.ob1)],
+    "off must not suppress",
+  );
 });
 
 test("planReadFanout: result does not alias scope.accessible (no shared mutable state)", () => {

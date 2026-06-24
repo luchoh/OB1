@@ -679,13 +679,17 @@ export function deriveCaptureStamp({ caller, sensitivityTier } = {}) {
 //   explicitBrain  : resolved { brainId, brainSlug } | null  (a selector was given)
 //   effectiveBrain : { brainId, brainSlug } | null           (default/L1 brain)
 // Returns: [{ brainId, brainSlug }]
-export function planReadFanout({ caller, scope, explicitBrain = null, effectiveBrain = null }) {
+export function planReadFanout({ caller, scope, explicitBrain = null, effectiveBrain = null, egressMode = "off" }) {
   const ref = (b) => ({ brainId: b.brainId, brainSlug: b.brainSlug ?? null });
-  // An egress-excluded brain (docs/45 §6.13, enforce mode) must never re-enter
-  // the fanout via the default/effective-brain fallback — otherwise the stripped
-  // default brain leaks through the unscoped read planes. egressExcluded is [] in
-  // off/observe and for callers built without it, so this is a no-op there.
-  const egressExcludedIds = new Set((scope.egressExcluded ?? []).map((b) => b.brainId));
+  // An egress-excluded brain (docs/45 §6.13) must never re-enter the fanout via
+  // the default/effective-brain fallback (or an explicit selector) — otherwise
+  // the stripped default brain leaks through the unscoped read planes. This
+  // suppression applies ONLY under enforce: `scope.egressExcluded` is also
+  // populated in OBSERVE (for logging), but observe must be a behavioural no-op,
+  // so off/observe use an empty set and behave identically to pre-egress.
+  const egressExcludedIds = egressMode === "enforce"
+    ? new Set((scope.egressExcluded ?? []).map((b) => b.brainId))
+    : new Set();
   const fallback = (b) => (b && !egressExcludedIds.has(b.brainId) ? [ref(b)] : []);
   if (explicitBrain) {
     return egressExcludedIds.has(explicitBrain.brainId) ? [] : [ref(explicitBrain)];

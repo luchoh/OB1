@@ -318,6 +318,7 @@ async function buildPrincipalContext(
     requestedBrain,
     effectiveBrainId,
     effectiveBrainSlug,
+    egressMode,
   });
 }
 
@@ -332,6 +333,7 @@ function makeContext({
   requestedBrain,
   effectiveBrainId,
   effectiveBrainSlug,
+  egressMode = "off",
 }) {
   const brainMembershipById = new Map(
     brainMemberships.map((m) => [m.brainId, { role: m.role, isDeny: m.isDeny }]),
@@ -353,7 +355,7 @@ function makeContext({
     requestedBrainId: requestedBrain?.brainId ?? null,
     requestedBrainSlug: requestedBrain?.brainSlug ?? null,
     isAdmin: caller.isAdmin,
-    _policy: { caller, scope, brainMembershipById, estateMembershipByEstate, brainEstateById },
+    _policy: { caller, scope, egressMode, brainMembershipById, estateMembershipByEstate, brainEstateById },
   };
 }
 
@@ -505,7 +507,8 @@ async function resolveLegacyAdminContext(requestedBrainSlug) {
     isAdmin: true,
     _policy: {
       caller,
-      scope: { accessible: [], accessibleIds: new Set(), lookup: [] },
+      scope: { accessible: [], accessibleIds: new Set(), lookup: [], egressExcluded: [] },
+      egressMode: config.egressEnforce,
       brainMembershipById: new Map(),
       estateMembershipByEstate: new Map(),
       brainEstateById: new Map(),
@@ -583,7 +586,7 @@ export async function resolveReadBrains(accessContext, brainArg) {
     return [await resolveRequestBrain(accessContext, selector)];
   }
 
-  const { caller, scope } = accessContext._policy;
+  const { caller, scope, egressMode } = accessContext._policy;
   const effectiveBrain = {
     brainId: accessContext.effectiveBrainId,
     brainSlug: accessContext.effectiveBrainSlug ?? null,
@@ -591,6 +594,7 @@ export async function resolveReadBrains(accessContext, brainArg) {
   return planReadFanout({
     caller,
     scope,
+    egressMode,
     // An L1 selector (route/query/header) narrows the read to that one brain.
     explicitBrain: accessContext.requestedBrainId ? effectiveBrain : null,
     effectiveBrain,
