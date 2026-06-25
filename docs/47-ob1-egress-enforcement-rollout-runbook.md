@@ -37,9 +37,10 @@
    # then, deliberately, on prod:
    PGDATABASE=ob1     ./scripts/apply-open-brain-local-migrations.sh
    ```
-   Confirm `016`, `017`, `018` are present:
+   Confirm `016`, `017`, `018` are present (note: Postgres `LIKE` has no `[...]`
+   character class, so use a regex match):
    ```sql
-   select name from open_brain_schema_migrations where name like '01[678]%' order by name;
+   select name from open_brain_schema_migrations where name ~ '^01[678]_' order by name;
    ```
 3. `OB1_EGRESS_ENFORCE` is unset or `observe` (the default) while you provision.
 
