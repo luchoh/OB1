@@ -1,7 +1,42 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { effectiveEgress, deriveCaptureStamp } from "../src/access-policy.mjs";
+import { effectiveEgress, deriveCaptureStamp, isLocalTrustedProcessor } from "../src/access-policy.mjs";
+
+// --------------------------------------------------------------------------
+// isLocalTrustedProcessor — §6.5: restricted/personal content may only be sent
+// to a local-trusted embedding/LLM processor; otherwise the capture is refused
+// BEFORE any content leaves the box. Pure; fail-closed on anything uncertain.
+// --------------------------------------------------------------------------
+
+test("processor: loopback is local-trusted (http/https, even with global TLS off)", () => {
+  assert.equal(isLocalTrustedProcessor("http://127.0.0.1:8080/v1"), true);
+  assert.equal(isLocalTrustedProcessor("http://localhost:8080"), true);
+  assert.equal(isLocalTrustedProcessor("https://[::1]:8443", { globalTlsDisabled: true }), true);
+});
+
+test("processor: a non-loopback host is NOT trusted unless allowlisted (fail-closed)", () => {
+  assert.equal(isLocalTrustedProcessor("http://10.10.10.100:9000"), false);
+  assert.equal(isLocalTrustedProcessor("http://10.10.10.100:9000", { allowlistHosts: ["10.10.10.100"] }), true);
+});
+
+test("processor: global TLS disabled + https + non-loopback is NOT trusted even if allowlisted", () => {
+  assert.equal(
+    isLocalTrustedProcessor("https://10.10.10.100:9000", { allowlistHosts: ["10.10.10.100"], globalTlsDisabled: true }),
+    false,
+  );
+  // but plain http to an allowlisted host with TLS off is fine (no TLS to subvert)
+  assert.equal(
+    isLocalTrustedProcessor("http://10.10.10.100:9000", { allowlistHosts: ["10.10.10.100"], globalTlsDisabled: true }),
+    true,
+  );
+});
+
+test("processor: an unparseable/empty URL fails closed", () => {
+  assert.equal(isLocalTrustedProcessor(""), false);
+  assert.equal(isLocalTrustedProcessor(undefined), false);
+  assert.equal(isLocalTrustedProcessor("not a url"), false);
+});
 
 // --------------------------------------------------------------------------
 // deriveCaptureStamp — the PURE write-stamping decision (docs/45 §6.8/§6.11).

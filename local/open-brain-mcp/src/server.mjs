@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
 import { HttpError, authorizeWrite, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
-import { deriveCaptureStamp } from "./access-policy.mjs";
+import { deriveCaptureStamp, isLocalTrustedProcessor } from "./access-policy.mjs";
 import { config } from "./config.mjs";
 import { closePool, healthcheckDatabase, query } from "./db.mjs";
 import crypto from "node:crypto";
@@ -336,6 +336,20 @@ async function handleCaptureThought(args, accessContext) {
     const brainClass = await peekBrainEgressClass({ brainId });
     if (brainClass !== "private_local" && brainClass !== "quarantine_review") {
       throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, "Cannot capture restricted content into this brain");
+    }
+    // §6.5: restricted content may only be processed by a local-trusted
+    // embedding/LLM endpoint. Refuse BEFORE any processor call, else the content
+    // egresses through OB1 itself. Fail-closed: only loopback (or operator-
+    // allowlisted hosts) qualify; a non-loopback https endpoint with global TLS
+    // verification disabled does not.
+    const procOpts = {
+      allowlistHosts: config.restrictedProcessorHosts,
+      globalTlsDisabled: process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0",
+    };
+    const willExtract = args.extract_metadata ?? true;
+    if (!isLocalTrustedProcessor(config.embeddingBaseUrl, procOpts)
+        || (willExtract && !isLocalTrustedProcessor(config.llmBaseUrl, procOpts))) {
+      throw new HttpError(403, "Restricted-tier capture refused: embedding/LLM processor is not a local-trusted endpoint (docs/45 §6.5)");
     }
   }
 

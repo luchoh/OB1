@@ -671,6 +671,35 @@ export function deriveCaptureStamp({ caller, sensitivityTier } = {}) {
 }
 
 // ---------------------------------------------------------------------------
+// Processor locality (§6.5)
+// ---------------------------------------------------------------------------
+
+// URL.hostname returns IPv6 hosts bracketed ("[::1]"); include both forms.
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "[::1]", "localhost"]);
+
+// isLocalTrustedProcessor — may restricted/personal content be sent to this
+// embedding/LLM endpoint? (docs/45 §6.5). Pure + FAIL-CLOSED: an unparseable URL
+// is not trusted. Loopback is always trusted. A non-loopback host is trusted
+// ONLY if explicitly allowlisted by the operator. And if global TLS verification
+// is disabled (NODE_TLS_REJECT_UNAUTHORIZED=0, e.g. CONSUL_SKIP_TLS_VERIFY), an
+// https non-loopback endpoint's identity cannot be verified, so it is NOT
+// trusted even when allowlisted (the adapter passes globalTlsDisabled).
+export function isLocalTrustedProcessor(urlString, { allowlistHosts = [], globalTlsDisabled = false } = {}) {
+  let url;
+  try {
+    url = new URL(urlString);
+  } catch {
+    return false;
+  }
+  const host = url.hostname;
+  const isLoopback = LOOPBACK_HOSTS.has(host);
+  if (globalTlsDisabled && url.protocol === "https:" && !isLoopback) {
+    return false;
+  }
+  return isLoopback || allowlistHosts.includes(host);
+}
+
+// ---------------------------------------------------------------------------
 // Read fanout
 // ---------------------------------------------------------------------------
 

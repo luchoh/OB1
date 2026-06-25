@@ -376,6 +376,12 @@ async function loadConfig() {
     embeddingModel: envString("EMBEDDING_MODEL", "mlx-community/Qwen3-Embedding-8B-mxfp8"),
     embeddingDimensions: envOptionalNumber("EMBEDDING_DIMENSIONS_PARAMETER", 1536) ?? 1536,
     expectedEmbeddingDimension: envOptionalNumber("EMBEDDING_STORE_DIMENSION", 1536) ?? 1536,
+    // docs/45 §6.5: hosts the operator declares local-trusted for processing
+    // restricted/personal content (loopback is always trusted). When empty, only
+    // loopback processors may handle restricted content — restricted capture is
+    // refused for any non-loopback processor (fail-closed).
+    restrictedProcessorHosts: (envOptionalString("OB1_RESTRICTED_PROCESSOR_HOSTS") ?? "")
+      .split(",").map((h) => h.trim()).filter(Boolean),
     metadataMaxTokens: envOptionalNumber("OPEN_BRAIN_METADATA_MAX_TOKENS", 400) ?? 400,
     answerMaxTokens: envOptionalNumber("OPEN_BRAIN_ANSWER_MAX_TOKENS", 600) ?? 600,
     egressEnforce,
