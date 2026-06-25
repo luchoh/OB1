@@ -44,6 +44,16 @@ export class ThoughtStoreError extends Error {
   }
 }
 
+// The Layer C write-guard predicate (docs/45 §6.10), the single source of the
+// rule used by every mutation path (capture upsert, metadata patch, soft-delete,
+// restore): a cloud_bound caller may mutate a row ONLY when its tier is the
+// literal 'standard'; a restricted/personal (or unknown-tier, fail-closed) row
+// is invisible to it. `paramIndex` is the bind position of the caller's egress
+// class; `column` lets the ON CONFLICT path qualify it as `thoughts.<col>`.
+function tierGuardSql(paramIndex, column = "sensitivity_tier") {
+  return `(${column} is not distinct from 'standard' or $${paramIndex} = 'local_trusted')`;
+}
+
 // ---------------------------------------------------------------------------
 // Capture / upsert
 // ---------------------------------------------------------------------------
@@ -142,7 +152,7 @@ export async function captureThought({
           else coalesce(thoughts.review_state, excluded.review_state)
         end,
         updated_at = now()
-      where (thoughts.sensitivity_tier is not distinct from 'standard' or $13 = 'local_trusted')
+      where ${tierGuardSql(13, "thoughts.sensitivity_tier")}
       returning
         id,
         brain_id,
@@ -299,7 +309,7 @@ export async function patchThoughtMetadata({
         and deleted_at is null
         -- §6.10 Layer C: a cloud_bound caller mutates only a 'standard' row;
         -- a restricted (or unknown-tier, fail-closed) row matches 0 rows → NOT_FOUND
-        and (sensitivity_tier is not distinct from 'standard' or $${egressIdx} = 'local_trusted')
+        and ${tierGuardSql(egressIdx)}
       returning
         id,
         metadata,
@@ -340,12 +350,12 @@ export async function softDeleteThought({ brainId, thoughtId, actor, callerReadE
       with target as (
         select id, deleted_at from thoughts
         where id = $1::uuid and brain_id = $2::uuid
-          and (sensitivity_tier is not distinct from 'standard' or $4 = 'local_trusted')
+          and ${tierGuardSql(4)}
       ),
       upd as (
         update thoughts set deleted_at = now(), updated_at = now()
         where id = $1::uuid and brain_id = $2::uuid and deleted_at is null
-          and (sensitivity_tier is not distinct from 'standard' or $4 = 'local_trusted')
+          and ${tierGuardSql(4)}
         returning id
       ),
       aud as (
@@ -389,12 +399,12 @@ export async function restoreThought({ brainId, thoughtId, actor, callerReadEgre
       with target as (
         select id, deleted_at from thoughts
         where id = $1::uuid and brain_id = $2::uuid
-          and (sensitivity_tier is not distinct from 'standard' or $4 = 'local_trusted')
+          and ${tierGuardSql(4)}
       ),
       upd as (
         update thoughts set deleted_at = null, updated_at = now()
         where id = $1::uuid and brain_id = $2::uuid and deleted_at is not null
-          and (sensitivity_tier is not distinct from 'standard' or $4 = 'local_trusted')
+          and ${tierGuardSql(4)}
         returning id
       ),
       aud as (

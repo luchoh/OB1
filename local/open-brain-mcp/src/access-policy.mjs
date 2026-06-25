@@ -274,11 +274,19 @@ export function deriveScope({ caller, brainMemberships = [], estateMemberships =
   const lookup = [];
   const seen = new Set();
 
+  // Index memberships by brain once (was a filter per catalog brain = O(N*M)).
+  const membershipsByBrain = new Map();
+  for (const m of brainMemberships) {
+    const list = membershipsByBrain.get(m.brainId);
+    if (list) list.push(m);
+    else membershipsByBrain.set(m.brainId, [m]);
+  }
+
   for (const brain of catalog) {
     if (seen.has(brain.brainId)) continue; // dedupe a catalog with repeats
     seen.add(brain.brainId);
 
-    const rows = brainMemberships.filter((m) => m.brainId === brain.brainId);
+    const rows = membershipsByBrain.get(brain.brainId) ?? [];
     const hasDenyBrain = rows.some((m) => m.isDeny);
     const hasGrantBrain = rows.some((m) => !m.isDeny);
     const estateOk = estateAllowed.has(brain.estateId);
@@ -330,12 +338,12 @@ export function deriveScope({ caller, brainMemberships = [], estateMemberships =
   // local-only brain resolves NOT_FOUND, never a denied/exists leak').
   const egressExcluded = [];
   const seenEgress = new Set();
+  // Index catalog egress classes once (was a find per lookup entry = O(N^2)).
+  const egressClassByBrain = new Map(catalog.map((b) => [b.brainId, b.egressClass]));
   for (const ref of lookup) {
     if (seenEgress.has(ref.brainId)) continue;
     seenEgress.add(ref.brainId);
-    // Find the catalog entry to check egressClass.
-    const entry = catalog.find((b) => b.brainId === ref.brainId);
-    const ec = entry?.egressClass;
+    const ec = egressClassByBrain.get(ref.brainId);
     const localOnly =
       ec !== BRAIN_EGRESS_CLASS.PUBLIC && ec !== BRAIN_EGRESS_CLASS.REPO;
     if (localOnly) {
