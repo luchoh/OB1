@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
 import { HttpError, authorizeWrite, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
-import { deriveCaptureStamp, isLocalTrustedProcessor } from "./access-policy.mjs";
+import { deriveCaptureStamp, isLocalTrustedProcessor, CALLER_EGRESS_CLASS } from "./access-policy.mjs";
 import { config } from "./config.mjs";
 import { closePool, healthcheckDatabase, query } from "./db.mjs";
 import crypto from "node:crypto";
@@ -798,6 +798,20 @@ function ensureGraphAdmin(accessContext) {
   }
 }
 
+// docs/45 §8.3 (runbook §10 graph-plane gap): the graph reads traverse all of
+// Neo4j and are not brain-scoped, so admin alone is not an egress decision —
+// `read_egress_class` is a read attribute independent of authority, and a
+// cloud_bound admin (e.g. the legacy key) must not pull local-only/restricted
+// nodes. This descriptor lets the scrub clamp such a caller's result to readable
+// nodes; local_trusted or non-enforce callers get the full graph.
+function callerReadEgress(accessContext) {
+  const { caller, egressMode } = accessContext._policy;
+  return {
+    enforce: egressMode === "enforce",
+    cloudBound: caller.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED,
+  };
+}
+
 async function handleGraphNeighbors(args, accessContext) {
   ensureGraphAdmin(accessContext);
   if (!args.thought_id && !args.canonical_id) {
@@ -808,6 +822,7 @@ async function handleGraphNeighbors(args, accessContext) {
     canonicalId: args.canonical_id,
     maxHops: args.max_hops ?? 2,
     limit: args.limit ?? 10,
+    readEgress: callerReadEgress(accessContext),
   });
 }
 
@@ -821,6 +836,7 @@ async function handleSourceLineage(args, accessContext) {
     canonicalId: args.canonical_id,
     maxDepth: args.max_depth ?? 4,
     limit: args.limit ?? 12,
+    readEgress: callerReadEgress(accessContext),
   });
 }
 
@@ -839,6 +855,7 @@ async function handleWhyConnected(args, accessContext) {
     toCanonicalId: args.to_canonical_id,
     maxHops: args.max_hops ?? 4,
     limit: args.limit ?? 3,
+    readEgress: callerReadEgress(accessContext),
   });
 }
 

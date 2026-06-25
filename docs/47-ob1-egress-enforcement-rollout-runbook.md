@@ -238,10 +238,15 @@ Be explicit about the boundary's edges before relying on `enforce`:
   `restricted` content out of any cloud-readable brain entirely (the 016/018
   invariants), so under correct provisioning a cloud caller never reaches a brain
   that holds restricted rows.
-- **Graph plane** (`graph_neighbors` / `source_lineage` / `why_connected`,
-  projection) is kept admin-only; it is not independently egress-checked. Keep
-  graph admin keys off cloud harnesses and Neo4j creds out of harness envs
-  (docs/45 §8.3 four conditions).
+- **Graph plane** (`graph_neighbors` / `source_lineage` / `why_connected`) is
+  admin-only and, **under `enforce`, now egress-checked** (docs/45 §8.3): a
+  cloud_bound caller's traversal result is scrubbed of every node whose owning
+  brain is local-only or whose tier is `restricted` — same Postgres-validation
+  seam as the soft-delete scrub (`fetchReadableThoughtUuids`). The reads are not
+  brain-scoped, so this clamp is what stops a cloud_bound admin (e.g. the legacy
+  key) pulling private content via neighbors. Still required operationally: keep
+  Neo4j creds out of cloud-harness envs (the **projection** plane and direct Bolt
+  access are not gated by this) — docs/45 §8.3 four conditions.
 - **Telemetry / audit / backups** retention-redaction for private-derived data is
   a separate hardening (docs/45 §6.14).
 - The **full §6.13 protected tier/brain-class transition** (capability + human

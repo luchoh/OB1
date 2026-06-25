@@ -125,6 +125,34 @@ export async function fetchLiveThoughtUuids(uuids) {
   return new Set(rows.map((row) => String(row.id).toLowerCase()));
 }
 
+// Resolve which of the given Thought uuids a caller may READ (docs/45 §8.3,
+// runbook §10 graph-plane gap). Always liveness-filtered. When `confine` is set
+// (a cloud_bound caller under enforce), additionally require the owning brain to
+// be cloud-readable (egress_class in public/repo) AND the row to be standard
+// tier — fail-closed: an unknown/NULL egress_class or NULL tier is excluded.
+// The graph tools are not brain-scoped, so this is the only place a cloud_bound
+// caller's cross-brain traversal is clamped to readable nodes. NOT used by the
+// projector reconcile (which wants pure liveness, hence the separate function).
+export async function fetchReadableThoughtUuids(uuids, { confine = false } = {}) {
+  if (uuids.size === 0) {
+    return new Set();
+  }
+  const { rows } = await query(
+    `select t.id
+       from thoughts t
+       join brains b on b.id = t.brain_id
+      where t.id = any($1::uuid[])
+        and t.deleted_at is null
+        and (
+          $2::bool = false
+          or (b.egress_class in ('public', 'repo')
+              and t.sensitivity_tier is not distinct from 'standard')
+        )`,
+    [[...uuids], confine],
+  );
+  return new Set(rows.map((row) => String(row.id).toLowerCase()));
+}
+
 // Returns true when the given canonical_id is a Thought that is NOT live (i.e.
 // soft-deleted or absent from Postgres). Non-Thought nodes are always kept.
 function thoughtIsDead(canonicalId, labels, liveUuids) {
@@ -154,7 +182,7 @@ function relationshipRoutesThroughDeadThought(relationships, liveUuids) {
 
 // Re-validate Thought nodes in a graph result against Postgres deleted_at and
 // remove the dead ones. Mutates and returns a (new) sanitized result object.
-async function scrubSoftDeletedThoughts(result) {
+async function scrubSoftDeletedThoughts(result, readEgress) {
   if (!result || typeof result !== "object") {
     return result;
   }
@@ -165,7 +193,12 @@ async function scrubSoftDeletedThoughts(result) {
     return result;
   }
 
-  const liveUuids = await fetchLiveThoughtUuids(uuids);
+  // The "readable" set drives every drop below: a Thought node not in it is
+  // treated exactly like a soft-deleted one. Under enforce, a cloud_bound caller
+  // gets the egress-clamped set (local-only / restricted nodes excluded); every
+  // other caller gets the plain live set.
+  const confine = Boolean(readEgress?.enforce && readEgress?.cloudBound);
+  const liveUuids = await fetchReadableThoughtUuids(uuids, { confine });
 
   // 1. If the queried/center thought itself is soft-deleted, the whole result is
   //    not-found. Covers graph_neighbors / source_lineage (center) and
@@ -244,8 +277,11 @@ async function scrubSoftDeletedThoughts(result) {
 // every exported read below is built with it, so reads are scrubbed by
 // construction (an unscrubbed early-return inside a producer is still scrubbed
 // here, harmlessly: a result with no Thought ids returns unchanged).
+// The first arg to every produce() is the read's options object; it may carry a
+// `readEgress: {enforce, cloudBound}` descriptor (the producers ignore it for
+// the Neo4j query) which the scrub uses to clamp a cloud_bound caller's result.
 function scrubbedRead(produce) {
-  return async (...args) => scrubSoftDeletedThoughts(await produce(...args));
+  return async (...args) => scrubSoftDeletedThoughts(await produce(...args), args[0]?.readEgress);
 }
 
 async function fetchGraphNode(canonicalId, database = config.graph.database) {
