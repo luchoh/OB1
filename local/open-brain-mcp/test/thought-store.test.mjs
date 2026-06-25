@@ -258,6 +258,13 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
     assert.equal(second.content, "s2");
   });
 
+  // peekBrainEgressClass backs the capture preflight (review #5): a restricted
+  // capture into a non-private brain is rejected BEFORE the processors run.
+  it("peekBrainEgressClass returns the brain class (private_local fixture); null for a missing brain", async () => {
+    assert.equal(await store.peekBrainEgressClass({ brainId }), "private_local");
+    assert.equal(await store.peekBrainEgressClass({ brainId: "00000000-0000-4000-8000-000000000000" }), null);
+  });
+
   // --- soft-delete / restore ---
   it("softDeleteThought sets deleted_at and writes exactly one delete audit row", async () => {
     const row = await capture({ content: "to delete", dedupeKey: "d1" });

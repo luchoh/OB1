@@ -6,9 +6,11 @@ import { HttpError, authorizeWrite, authorizeDestructive, authorizePurge, resolv
 import { deriveCaptureStamp } from "./access-policy.mjs";
 import { config } from "./config.mjs";
 import { closePool, healthcheckDatabase, query } from "./db.mjs";
+import crypto from "node:crypto";
 import {
   captureThought,
   peekCaptureConflictTier,
+  peekBrainEgressClass,
   patchThoughtMetadata,
   softDeleteThought,
   restoreThought,
@@ -319,19 +321,35 @@ async function handleCaptureThought(args, accessContext) {
   // writable; this is the call site that enforcement was missing.)
   await authorizeWrite(accessContext, brainId);
   const callerReadEgressClass = accessContext._policy.caller.readEgressClass;
+  const content = args.content.trim();
+  const requestedTier = args.sensitivity_tier ?? "standard";
 
-  // §6.10/§6.5 PREFLIGHT (before any processor call): a cloud_bound caller may
-  // not upsert OVER an existing restricted row. Deny here so the content never
-  // reaches the embedding/LLM processors. The captureThought ON CONFLICT guard
-  // is the atomic backstop; this is the egress-safe early exit.
-  if (args.dedupe_key) {
-    const existingTier = await peekCaptureConflictTier({ brainId, dedupeKey: args.dedupe_key });
-    if (existingTier !== undefined && existingTier !== "standard" && callerReadEgressClass !== "local_trusted") {
-      throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, `Thought not found: ${args.dedupe_key}`);
+  // PREFLIGHT — runs BEFORE any embedding/LLM processor call so restricted
+  // content never reaches an external processor on a path that will be rejected
+  // (docs/45 §6.5/§6.10; Codex v4 F3; review #5/#6).
+  //
+  // (a) A restricted capture must target a brain that can hold restricted
+  //     content (private_local / quarantine_review). The
+  //     enforce_restricted_brain_isolation trigger also rejects a mismatch, but
+  //     only AFTER createEmbedding/extractMetadata have seen the content.
+  if (requestedTier !== "standard") {
+    const brainClass = await peekBrainEgressClass({ brainId });
+    if (brainClass !== "private_local" && brainClass !== "quarantine_review") {
+      throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, "Cannot capture restricted content into this brain");
     }
   }
 
-  const content = args.content.trim();
+  // (b) A cloud_bound caller may not upsert OVER an existing restricted row.
+  //     dedupe_key defaults to sha256(content) in SQL, so the EFFECTIVE key
+  //     (explicit OR content-hash) is what the upsert conflicts on — peeking with
+  //     only an explicit key would miss an implicit-dedupe collision and let the
+  //     content reach the processors before the conflict guard denies it.
+  const effectiveDedupeKey = args.dedupe_key ?? crypto.createHash("sha256").update(content, "utf8").digest("hex");
+  const existingTier = await peekCaptureConflictTier({ brainId, dedupeKey: effectiveDedupeKey });
+  if (existingTier !== undefined && existingTier !== "standard" && callerReadEgressClass !== "local_trusted") {
+    throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, "Thought not found");
+  }
+
   const metadata = args.metadata ?? {};
   const shouldExtractMetadata = args.extract_metadata ?? true;
   const extractionPromise = shouldExtractMetadata
@@ -430,7 +448,9 @@ export async function handleSearchThoughts(args, accessContext) {
       success: true,
       query: args.query,
       brains_searched: brains.length,
-      retrieval_strategy: multi ? "multi-brain-merge" : perBrain[0].retrieval.retrieval_strategy,
+      // brains can be EMPTY (a cloud_bound caller whose every brain is
+      // egress-excluded under enforce): return an empty result, never deref [0].
+      retrieval_strategy: multi ? "multi-brain-merge" : (perBrain[0]?.retrieval.retrieval_strategy ?? "none"),
       fallback_used: perBrain.some((p) => p.retrieval.fallback_used),
       recency_weight: recencyWeight,
       half_life_days: recencyWeight > 0 ? halfLifeDays : null,

@@ -207,6 +207,17 @@ export async function peekCaptureConflictTier({ brainId, dedupeKey }) {
   return r.rowCount === 0 ? undefined : (r.rows[0].sensitivity_tier ?? null);
 }
 
+// The egress_class of a brain, or `null` if unknown (fail-closed). The capture
+// handler calls this BEFORE the processors so a restricted capture into a brain
+// that cannot hold restricted content (anything but private_local /
+// quarantine_review) is rejected before any content reaches the embedding/LLM
+// services (docs/45 §6.5; the enforce_restricted_brain_isolation trigger would
+// also reject it, but only AFTER the content egressed).
+export async function peekBrainEgressClass({ brainId }) {
+  const r = await query(`select egress_class from brains where id = $1::uuid`, [brainId]);
+  return r.rowCount === 0 ? null : (r.rows[0].egress_class ?? null);
+}
+
 // ---------------------------------------------------------------------------
 // Metadata patch (a WRITE)
 // ---------------------------------------------------------------------------

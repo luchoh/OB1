@@ -33,6 +33,12 @@ begin
   if not exists (
     select 1 from pg_constraint where conname = 'thoughts_sensitivity_tier_check'
   ) then
+    -- A prior build's metadata-patch route accepted sensitivity_tier='personal'
+    -- (z.enum standard|personal|restricted). 'personal' was dropped for v1
+    -- (docs/45 §17.2). Map any legacy 'personal' row to 'restricted' (the
+    -- most-restrictive equivalent) BEFORE validating the CHECK — otherwise the
+    -- full-table validation aborts the whole migration. No-op where none exist.
+    update thoughts set sensitivity_tier = 'restricted' where sensitivity_tier = 'personal';
     alter table thoughts
       add constraint thoughts_sensitivity_tier_check
       check (sensitivity_tier in ('standard', 'restricted'));
