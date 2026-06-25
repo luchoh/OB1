@@ -265,6 +265,16 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
     assert.equal(await store.peekBrainEgressClass({ brainId: "00000000-0000-4000-8000-000000000000" }), null);
   });
 
+  // migration 018 (review #12): a brain cannot be opened to a cloud-readable
+  // class while it holds a restricted thought (a one-column declassification).
+  it("brain egress guard: cannot open a brain to public/repo while it holds a restricted thought", async () => {
+    await cap({ dedupeKey: "bd1", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none", callerReadEgressClass: "local_trusted" });
+    await assert.rejects(() => query("update brains set egress_class = 'public' where id = $1::uuid", [brainId]), /restricted/i);
+    await assert.rejects(() => query("update brains set egress_class = 'repo' where id = $1::uuid", [brainId]), /restricted/i);
+    const r = await query("select egress_class from brains where id = $1::uuid", [brainId]);
+    assert.equal(r.rows[0].egress_class, "private_local", "rejected update must not have changed the brain");
+  });
+
   // --- soft-delete / restore ---
   it("softDeleteThought sets deleted_at and writes exactly one delete audit row", async () => {
     const row = await capture({ content: "to delete", dedupeKey: "d1" });
