@@ -151,9 +151,12 @@ This is operational, not enforced by the runtime. Verify, on every host a
   `OB1_REPO_KEY`). **No** `PGPASSWORD` / `DATABASE_URL` / `NEO4J_*` / `MINIO_*` /
   `CONSUL_*` / `IMAP_*` / `MCP_ACCESS_KEY`, and no path that triggers
   `config.mjs`'s repo-dotenv autoload.
-- The bare legacy `MCP_ACCESS_KEY` lives only on the operator/server side. **Known
-  gap (review #3/#7):** the legacy key is *not* egress-confined under `enforce`; a
-  cloud harness holding it would bypass Layer A. Keep it off all cloud harnesses.
+- The bare legacy `MCP_ACCESS_KEY` lives only on the operator/server side. It is
+  hardcoded `cloud_bound`, and **under `enforce` it is now egress-confined**
+  (review #3): naming or defaulting to a `private_local`/`quarantine_review` brain
+  returns `404 "Brain not found"` for read *and* write (`resolveRequestBrain`).
+  It still holds global admin authority over `repo`/`public` brains, so keep it
+  off all cloud harnesses and retire it (docs/45 §6.3 / ADR-0003).
 
 (Service-secrets-out-of-repo + the allowlist startup guard from §6.1 are a
 separate v0 hardening, tracked outside this runbook.)
@@ -225,8 +228,10 @@ non-blocking on the current corpus, which has zero `restricted` rows).
 
 Be explicit about the boundary's edges before relying on `enforce`:
 
-- **Legacy admin (`MCP_ACCESS_KEY`)** is not egress-confined under enforce
-  (review #3/#7). Mitigation: keep it off cloud harnesses (Phase D); retire it
+- **Legacy admin (`MCP_ACCESS_KEY`)** is now read/write egress-confined under
+  enforce (review #3 — closed): it cannot name or default to a local-only brain.
+  But it is still a global admin over `repo`/`public` brains and is not scope-
+  bound, so keep it off cloud harnesses (Phase D) and retire it
   (docs/45 §6.3 / ADR-0003).
 - **`ask_brain` over a *mixed-tier* brain** is not row-clamped — that is the
   Layer-B/v2 per-row clamp (`effectiveEgress` is built but unwired). v1 keeps

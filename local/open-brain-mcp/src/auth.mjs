@@ -548,8 +548,22 @@ export async function resolveAccessContext(c, { routeBrainSlug = null } = {}) {
 // Resolve a body/tool-arg `brain` selector for an authenticated request. Absent
 // -> the effective (default/L1) brain. A body selector that disagrees with an
 // explicit L1 selector is a conflict (400), not a silent override (v24 D3).
+// A brain is "local-only" (not cloud-readable) unless its egress_class is
+// public/repo. Fail-closed: an unknown/missing class is local-only. Used to
+// confine the legacy global-admin path under enforce — it bypasses deriveScope
+// (no scope/catalog), so the egressExcluded mechanism never reaches it.
+async function brainIsLocalOnly(brainId) {
+  const r = await query("select egress_class from brains where id = $1::uuid", [brainId]);
+  const ec = r.rows[0]?.egress_class;
+  return ec !== "public" && ec !== "repo";
+}
+
 export async function resolveRequestBrain(accessContext, brainArg) {
   const selector = typeof brainArg === "string" ? brainArg.trim() : brainArg;
+  const { caller, scope, egressMode } = accessContext._policy;
+  const enforce = egressMode === "enforce";
+  const callerCloudBound = caller.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED;
+
   if (selector == null || selector === "") {
     const brainId = accessContext.effectiveBrainId;
     // §6.13 (audit H1): an EXPLICIT selector for an egress-excluded brain already
@@ -561,9 +575,15 @@ export async function resolveRequestBrain(accessContext, brainArg) {
     // write-path question: enforce excludes such a brain for BOTH read and write,
     // which is fail-safe — a properly-provisioned cloud principal never holds a
     // private_local membership in the first place.)
-    const { scope, egressMode } = accessContext._policy;
-    if (egressMode === "enforce" && brainId
-        && scope.egressExcluded?.some((b) => b.brainId === brainId)) {
+    if (enforce && brainId && scope.egressExcluded?.some((b) => b.brainId === brainId)) {
+      throw new HttpError(404, "Brain not found");
+    }
+    // §6.3 (review #3): the legacy global-admin path has no scope/egressExcluded,
+    // so confine its DEFAULT brain by egress_class — a cloud_bound legacy key must
+    // not reach a local-only brain under enforce.
+    if (enforce && callerCloudBound && brainId
+        && caller.kind === CALLER_KINDS.LEGACY_ADMIN_KEY
+        && await brainIsLocalOnly(brainId)) {
       throw new HttpError(404, "Brain not found");
     }
     return {
@@ -572,11 +592,15 @@ export async function resolveRequestBrain(accessContext, brainArg) {
     };
   }
 
-  const { caller, scope } = accessContext._policy;
   let resolved;
   if (caller.kind === CALLER_KINDS.LEGACY_ADMIN_KEY) {
     const r = await resolveGlobalSelector(selector);
     resolved = { brainId: r.brainId, brainSlug: r.brainSlug };
+    // §6.3 (review #3): the legacy global resolution names brains across every
+    // estate with no scope/egress check; confine it under enforce.
+    if (enforce && callerCloudBound && resolved.brainId && await brainIsLocalOnly(resolved.brainId)) {
+      throw new HttpError(404, `Brain not found: ${selector}`);
+    }
   } else {
     resolved = await resolveScopedSelector(selector, scope);
   }
