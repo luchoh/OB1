@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
 import { HttpError, authorizeWrite, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
-import { deriveCaptureStamp, isLocalTrustedProcessor, CALLER_EGRESS_CLASS } from "./access-policy.mjs";
+import { deriveCaptureStamp, isLocalTrustedProcessor, CALLER_EGRESS_CLASS, effectiveEgress } from "./access-policy.mjs";
 import { config } from "./config.mjs";
 import { closePool, healthcheckDatabase, query } from "./db.mjs";
 import crypto from "node:crypto";
@@ -11,6 +11,7 @@ import {
   captureThought,
   peekCaptureConflictTier,
   peekBrainEgressClass,
+  fetchRowEgressById,
   patchThoughtMetadata,
   softDeleteThought,
   restoreThought,
@@ -451,9 +452,13 @@ export async function handleSearchThoughts(args, accessContext) {
       })),
     );
 
-    const results = perBrain
+    const tagged = perBrain
       .flatMap(({ brain, retrieval }) =>
-        retrieval.results.map((row) => ({ ...row, brain_id: brain.brainId, brain_slug: brain.brainSlug })))
+        retrieval.results.map((row) => ({ ...row, brain_id: brain.brainId, brain_slug: brain.brainSlug })));
+    // Layer-B per-row clamp before ranking/truncation so a dropped row never
+    // consumes a result slot (no-op off the enforce + cloud_bound path).
+    const clamped = await clampReadRowsByEgress(tagged, accessContext);
+    const results = clamped
       .sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0))
       .slice(0, matchCount);
 
@@ -545,6 +550,9 @@ async function handleAskBrain(args, accessContext) {
       graphMaxHops: args.graph_max_hops ?? 2,
       graphNeighborLimit: args.graph_neighbor_limit ?? matchCount,
     }));
+    // Layer-B per-row clamp on the evidence set (incl. graph-expanded rows)
+    // before it is cited or fed to the answerer (no-op off enforce + cloud_bound).
+    evidenceRows = await clampReadRowsByEgress(evidenceRows, accessContext);
     const evidence = evidenceRows.map(evidenceCitation);
 
     if (evidence.length === 0) {
@@ -712,8 +720,9 @@ export async function handleListThoughts(args, accessContext) {
     }),
   );
 
-  const thoughts = perBrain
-    .flat()
+  // Layer-B per-row clamp before merge/truncate (no-op off enforce + cloud_bound).
+  const clamped = await clampReadRowsByEgress(perBrain.flat(), accessContext);
+  const thoughts = clamped
     .sort((a, b) => {
       const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
       const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
@@ -810,6 +819,46 @@ function callerReadEgress(accessContext) {
     enforce: egressMode === "enforce",
     cloudBound: caller.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED,
   };
+}
+
+// docs/45 Layer-B per-row clamp (runbook §10): a defense-in-depth row filter for
+// the materialized read surface (search / list / ask_brain evidence). Brain-level
+// confinement already removes local-only brains from a cloud_bound caller's scope,
+// and the 016/018 triggers keep restricted rows out of cloud-readable brains — so
+// under correct provisioning this NEVER drops a row. It exists for the case those
+// invariants are bypassed (e.g. a restricted row injected by direct SQL into a
+// repo brain): each row is run through `effectiveEgress` and dropped unless it may
+// materialize for the caller. Gated to the confined path (enforce + cloud_bound):
+// every other caller returns unchanged with zero extra DB work, so observe / off /
+// local_trusted reads are byte-identical.
+async function clampReadRowsByEgress(rows, accessContext) {
+  const { caller, egressMode } = accessContext._policy;
+  if (
+    egressMode !== "enforce" ||
+    caller.readEgressClass === CALLER_EGRESS_CLASS.LOCAL_TRUSTED ||
+    !Array.isArray(rows) ||
+    rows.length === 0
+  ) {
+    return rows;
+  }
+  const egressById = await fetchRowEgressById(rows.map((r) => r?.id));
+  return rows.filter((row) => {
+    const e = egressById.get(String(row?.id).toLowerCase());
+    if (!e) {
+      return false; // vanished between retrieval and clamp → fail-closed drop
+    }
+    return effectiveEgress({
+      brain: { egressClass: e.brain_egress_class },
+      row: {
+        sensitivityTier: e.sensitivity_tier,
+        reviewState: e.review_state,
+        originEgressClass: e.origin_egress_class,
+        sourceTrustClass: e.source_trust_class,
+      },
+      caller: { readEgressClass: caller.readEgressClass },
+      sink: null,
+    }).canMaterialize;
+  });
 }
 
 async function handleGraphNeighbors(args, accessContext) {

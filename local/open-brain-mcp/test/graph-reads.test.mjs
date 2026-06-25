@@ -17,6 +17,7 @@ const EST = "zzt-gr-est";
 let query;
 let closePool;
 let graphReads;
+let store;
 let repoBrainId;
 let privBrainId;
 let skipReason = false;
@@ -31,6 +32,7 @@ try {
     closePool = db.closePool;
     await query("select 1");
     graphReads = await import("../src/graph-reads.mjs");
+    store = await import("../src/thought-store.mjs");
   }
 } catch (error) {
   skipReason = `dev database unreachable (run via 'direnv exec .' from the repo root): ${error.message}`;
@@ -116,5 +118,31 @@ describe("graph-reads egress scrub (DB-backed)", { skip: skipReason }, () => {
   it("empty input short-circuits to an empty set", async () => {
     const readable = await graphReads.fetchReadableThoughtUuids(new Set(), { confine: true });
     assert.equal(readable.size, 0);
+  });
+
+  // Layer-B per-row clamp source data (server.mjs clampReadRowsByEgress feeds
+  // these fields to effectiveEgress). Verify the row's tier/taint columns AND the
+  // owning brain's egress_class come back keyed by lowercased id; soft-deleted and
+  // absent ids are omitted (the handler treats a miss as a fail-closed drop).
+  it("fetchRowEgressById returns per-row egress facts incl. brain_egress_class", async () => {
+    const m = await store.fetchRowEgressById([
+      ids["repo-std"],
+      ids["priv-restr"],
+      ids["repo-deleted"],
+      "00000000-0000-0000-0000-000000000000",
+    ]);
+    const repo = m.get(ids["repo-std"]);
+    assert.equal(repo?.brain_egress_class, "repo");
+    assert.equal(repo?.sensitivity_tier, "standard");
+    const priv = m.get(ids["priv-restr"]);
+    assert.equal(priv?.brain_egress_class, "private_local");
+    assert.equal(priv?.sensitivity_tier, "restricted");
+    assert.equal(m.has(ids["repo-deleted"]), false, "soft-deleted row omitted");
+    assert.equal(m.has("00000000-0000-0000-0000-000000000000"), false, "absent id omitted");
+  });
+
+  it("fetchRowEgressById on empty/blank input returns an empty map", async () => {
+    assert.equal((await store.fetchRowEgressById([])).size, 0);
+    assert.equal((await store.fetchRowEgressById([null, undefined])).size, 0);
   });
 });

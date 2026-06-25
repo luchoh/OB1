@@ -233,11 +233,18 @@ Be explicit about the boundary's edges before relying on `enforce`:
   But it is still a global admin over `repo`/`public` brains and is not scope-
   bound, so keep it off cloud harnesses (Phase D) and retire it
   (docs/45 §6.3 / ADR-0003).
-- **`ask_brain` over a *mixed-tier* brain** is not row-clamped — that is the
-  Layer-B/v2 per-row clamp (`effectiveEgress` is built but unwired). v1 keeps
-  `restricted` content out of any cloud-readable brain entirely (the 016/018
-  invariants), so under correct provisioning a cloud caller never reaches a brain
-  that holds restricted rows.
+- **Per-row (Layer-B) clamp** — now **wired** across the materialized read surface
+  (`search_thoughts` / `list_thoughts` / `ask_brain` evidence): under `enforce` a
+  cloud_bound caller's rows are run through `effectiveEgress` and any that may not
+  materialize (restricted tier / quarantined / local-only brain) are dropped
+  before ranking, citation, or answering. It is **defense-in-depth**: the 016/018
+  invariants already keep `restricted` content out of any cloud-readable brain, so
+  under correct provisioning this drops nothing — it only bites if a row is
+  injected past the triggers (e.g. direct SQL). Costs one indexed lookup on the
+  confined path only; observe / off / local_trusted reads are byte-identical.
+  Still v2: the clamp **drops** rather than **redacts** rows, and the
+  `effectiveEgress` redaction-level / provenance-field outputs are not yet
+  surfaced (metadata-only materialization for local_trusted audiences).
 - **Graph plane** (`graph_neighbors` / `source_lineage` / `why_connected`) is
   admin-only and, **under `enforce`, now egress-checked** (docs/45 §8.3): a
   cloud_bound caller's traversal result is scrubbed of every node whose owning

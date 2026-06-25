@@ -228,6 +228,35 @@ export async function peekBrainEgressClass({ brainId }) {
   return r.rowCount === 0 ? null : (r.rows[0].egress_class ?? null);
 }
 
+// docs/45 Layer-B (runbook §10 per-row clamp): resolve the per-row egress facts a
+// read handler needs to run `effectiveEgress` over retrieved rows — the row's
+// tier/taint columns plus its owning brain's egress_class, keyed by id. Returns a
+// Map<lowercased-uuid, {sensitivity_tier, origin_egress_class, source_trust_class,
+// review_state, brain_egress_class}>. A row absent from the map (vanished between
+// retrieval and this lookup) is the caller's cue to drop it fail-closed. Only the
+// confined read path (enforce + cloud_bound) calls this, so it costs one indexed
+// round-trip and nothing on the unconfined path.
+export async function fetchRowEgressById(ids) {
+  const list = [...new Set((ids ?? []).filter(Boolean).map((x) => String(x)))];
+  if (list.length === 0) {
+    return new Map();
+  }
+  const { rows } = await query(
+    `select t.id,
+            t.sensitivity_tier,
+            t.origin_egress_class,
+            t.source_trust_class,
+            t.review_state,
+            b.egress_class as brain_egress_class
+       from thoughts t
+       join brains b on b.id = t.brain_id
+      where t.id = any($1::uuid[])
+        and t.deleted_at is null`,
+    [list],
+  );
+  return new Map(rows.map((r) => [String(r.id).toLowerCase(), r]));
+}
+
 // ---------------------------------------------------------------------------
 // Metadata patch (a WRITE)
 // ---------------------------------------------------------------------------
