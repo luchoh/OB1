@@ -83,6 +83,30 @@ test("stamp: unknown/absent caller egress → cloud_origin (fail-closed); restri
   );
 });
 
+// §6.11 F8: external-ingest content is untrusted + cloud_origin even when the
+// on-box writer presenting it is local_trusted (the pipeline is trusted to write;
+// the content is not trusted as content). Agent-authored captures are unaffected.
+test("stamp: externalIngest forces cloud_origin + untrusted even for a local_trusted writer", () => {
+  assert.deepEqual(
+    deriveCaptureStamp({ caller: { readEgressClass: "local_trusted" }, sensitivityTier: "standard", externalIngest: true }),
+    { originEgressClass: "cloud_origin", sourceTrustClass: "untrusted", reviewState: "none" },
+  );
+});
+
+test("stamp: externalIngest + restricted → quarantined (cloud_origin + restricted ⇒ unreviewed)", () => {
+  assert.deepEqual(
+    deriveCaptureStamp({ caller: { readEgressClass: "local_trusted" }, sensitivityTier: "restricted", externalIngest: true }),
+    { originEgressClass: "cloud_origin", sourceTrustClass: "untrusted", reviewState: "unreviewed" },
+  );
+});
+
+test("stamp: externalIngest=false keeps caller-derived trusted stamping (agent capture unchanged)", () => {
+  assert.deepEqual(
+    deriveCaptureStamp({ caller: { readEgressClass: "local_trusted" }, sensitivityTier: "standard", externalIngest: false }),
+    { originEgressClass: "local_trusted", sourceTrustClass: "trusted", reviewState: "none" },
+  );
+});
+
 // B1: cloud_bound caller reading a restricted-tier row → canMaterialize=false
 // Full shape assertion (all seven output fields must be correct).
 test("B1: cloud_bound caller + restricted row → canMaterialize=false (full shape)", () => {

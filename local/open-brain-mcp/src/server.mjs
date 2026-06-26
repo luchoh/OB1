@@ -315,7 +315,7 @@ function hasExplicitSearchRole(filter) {
       || Object.prototype.hasOwnProperty.call(filter, "retrieval_role"));
 }
 
-async function handleCaptureThought(args, accessContext) {
+async function handleCaptureThought(args, accessContext, { externalIngest = false } = {}) {
   const { brainId } = await resolveRequestBrain(accessContext, args.brain);
   // ADR-0002 write ladder: capture is a WRITE. Authorize before doing any work.
   // (Pre-ADR-0002 the runtime had no write gate — any reachable brain was
@@ -401,6 +401,7 @@ async function handleCaptureThought(args, accessContext) {
   const stamp = deriveCaptureStamp({
     caller: accessContext._policy?.caller,
     sensitivityTier: args.sensitivity_tier,
+    externalIngest,
   });
 
   const thought = await captureThought({
@@ -1156,7 +1157,7 @@ app.post("/ingest/thought", async (c) => {
   try {
     const accessContext = await resolveAccessContext(c);
     const payload = captureThoughtInput.parse(await c.req.json());
-    const result = await handleCaptureThought(payload, accessContext);
+    const result = await handleCaptureThought(payload, accessContext, { externalIngest: true });
     return c.json(result, 201);
   } catch (error) {
     return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));

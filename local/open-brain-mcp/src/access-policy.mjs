@@ -656,12 +656,20 @@ export function effectiveEgress({ brain, row, caller, sink }) {
 // 'trusted' here; external ingest pipelines stamp source_trust_class='untrusted'
 // on their own path (§6.11 F8). Persistence (the SQL insert + monotonic conflict)
 // is the store's job, not this module's.
-export function deriveCaptureStamp({ caller, sensitivityTier } = {}) {
+export function deriveCaptureStamp({ caller, sensitivityTier, externalIngest = false } = {}) {
+  // §6.11 F8: content arriving via an external-ingest pipeline (mail / telegram /
+  // import) is EXTERNALLY-AUTHORED — stamp it cloud_origin + untrusted regardless
+  // of the (possibly local_trusted) on-box writer presenting it, so an injected
+  // email cannot act as a trusted instruction to the local agent. "The pipeline
+  // is trusted to WRITE" is separate from "the content is trusted as CONTENT".
+  // Caller-derived stamping applies only to agent-authored captures (MCP tool).
   const originEgressClass =
-    caller?.readEgressClass === CALLER_EGRESS_CLASS.LOCAL_TRUSTED
-      ? ORIGIN_EGRESS_CLASS.LOCAL_TRUSTED
-      : ORIGIN_EGRESS_CLASS.CLOUD_ORIGIN;
-  const sourceTrustClass = SOURCE_TRUST_CLASS.TRUSTED;
+    externalIngest || caller?.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED
+      ? ORIGIN_EGRESS_CLASS.CLOUD_ORIGIN
+      : ORIGIN_EGRESS_CLASS.LOCAL_TRUSTED;
+  const sourceTrustClass = externalIngest
+    ? SOURCE_TRUST_CLASS.UNTRUSTED
+    : SOURCE_TRUST_CLASS.TRUSTED;
   const reviewState =
     originEgressClass === ORIGIN_EGRESS_CLASS.CLOUD_ORIGIN &&
     sensitivityTier === SENSITIVITY_TIER.RESTRICTED
