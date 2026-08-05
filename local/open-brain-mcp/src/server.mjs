@@ -36,6 +36,7 @@ import {
   healthcheckUpstreams,
   normalizeMetadata,
 } from "./models.mjs";
+import { handleMintRepoKey, handleRotateRepoKey } from "./repo-key-minting.mjs";
 import { appendRetrievalTelemetry } from "./observability.mjs";
 import {
   expandContextRows,
@@ -186,6 +187,18 @@ const expandContextSchema = {
   filter: z.record(z.any()).optional().describe("Optional JSONB containment filter applied to expanded thought rows."),
   max_hops: z.number().int().min(1).max(3).optional().describe("Maximum graph hop count."),
   limit: z.number().int().min(1).max(24).optional().describe("Maximum number of expanded thought rows to return."),
+};
+
+// docs/53. Note what is NOT here: no is_admin, no egress_class, no brain kind, no
+// capability flag. Those are literals in repo-key-minting.mjs. A minting caller
+// chooses a repo name and a label, nothing that affects authority.
+const mintRepoKeySchema = {
+  repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier (lowercase letters, digits, hyphens). Becomes brain slug 'repo:<repo_slug>'."),
+  display_name: z.string().min(1).optional().describe("Optional human-readable brain name. Defaults to 'Repo brain: <repo_slug>'."),
+};
+
+const rotateRepoKeySchema = {
+  repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier whose key should be revoked and replaced."),
 };
 
 function jsonToolResult(value) {
@@ -1096,6 +1109,37 @@ function buildMcpServer(accessContext) {
     async (args) => {
       try {
         return jsonToolResult(await handleExpandContext(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  // docs/53: minting tools. Gated server-side by the can_mint_repo_keys
+  // capability, which only the operator-provisioned minter key holds — every
+  // other caller, including the legacy admin secret, gets a 403 from the handler.
+  // system-config deliberately keeps these OFF every harness allowlist; that is
+  // ergonomics, the capability check is the actual control.
+  server.tool(
+    "mint_repo_key",
+    "Provision a per-repo brain and issue its cloud-bound repo access key. Create-only; returns the key once.",
+    mintRepoKeySchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleMintRepoKey(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "rotate_repo_key",
+    "Revoke every active key for a repo brain and issue a replacement. Returns the new key once.",
+    rotateRepoKeySchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleRotateRepoKey(args, accessContext));
       } catch (error) {
         return errorToolResult(error);
       }

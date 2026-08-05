@@ -54,7 +54,10 @@ function humanToken(c) {
   return match?.[1]?.trim() || null;
 }
 
-function hashAccessKey(value) {
+// Exported: repo-key-minting.mjs and scripts/mint-authority-init.mjs both store
+// keys hash-only and must hash them exactly the way the auth path does. One
+// definition, or the two drift and a minted key never authenticates.
+export function hashAccessKey(value) {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
@@ -248,7 +251,14 @@ async function slugForBrain(brainId, scope) {
 // key's brain_id hint when present (ADR-0003: a default hint, never a clamp).
 async function buildPrincipalContext(
   principalId,
-  { authSource, isAdmin, defaultBrainOverride = null, requireUsableBrain, readEgressClass = CALLER_EGRESS_CLASS.CLOUD_BOUND },
+  {
+    authSource,
+    isAdmin,
+    defaultBrainOverride = null,
+    requireUsableBrain,
+    readEgressClass = CALLER_EGRESS_CLASS.CLOUD_BOUND,
+    canMintRepoKeys = false,
+  },
   requestedBrainSlug,
 ) {
   const base = await query(
@@ -270,6 +280,11 @@ async function buildPrincipalContext(
     // Layer-A egress audience (docs/45 §6.2). Only a stored key explicitly marked
     // local_trusted is trusted; every other shape is cloud_bound (fail-closed).
     readEgressClass,
+    // docs/53: least-privilege repo-key minting. Defaulted false HERE, so every
+    // caller shape that does not explicitly pass it — human token, and the legacy
+    // admin path, which never calls this function at all — is false. The admin
+    // secret can therefore never mint through the tool.
+    canMintRepoKeys: Boolean(canMintRepoKeys),
   };
 
   const [brainMemberships, estateMemberships, catalog] = await Promise.all([
@@ -419,7 +434,8 @@ async function resolveHumanAccessContext(c, requestedBrainSlug) {
 async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
   const result = await query(
     `
-      select k.brain_id as key_brain_id, k.is_admin, k.read_egress_class, p.id as principal_id
+      select k.brain_id as key_brain_id, k.is_admin, k.read_egress_class,
+             k.can_mint_repo_keys, p.id as principal_id
       from brain_access_keys k
       join brain_principals p on p.id = k.principal_id
       where k.key_hash = $1 and k.is_active = true
@@ -446,14 +462,22 @@ async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
     ? CALLER_EGRESS_CLASS.LOCAL_TRUSTED
     : CALLER_EGRESS_CLASS.CLOUD_BOUND;
 
+  // docs/53: the minter is deliberately brain-less (brain_id null, no
+  // memberships), so the usual "key must land on a usable brain" 403 would reject
+  // it before any tool ran. Relax that ONE precondition for a minting key only —
+  // it buys no reach: with an empty scope every content tool still has no brain
+  // to act on, and mint/rotate resolve their own brain inside a transaction.
+  const canMintRepoKeys = Boolean(row.can_mint_repo_keys);
+
   return buildPrincipalContext(
     row.principal_id,
     {
       authSource: CALLER_KINDS.SERVICE_KEY,
       isAdmin: Boolean(row.is_admin),
       defaultBrainOverride: row.key_brain_id,
-      requireUsableBrain: true,
+      requireUsableBrain: !canMintRepoKeys,
       readEgressClass,
+      canMintRepoKeys,
     },
     requestedBrainSlug,
   );

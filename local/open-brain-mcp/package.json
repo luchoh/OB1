@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/index.mjs",
     "dev": "node --watch src/index.mjs",
-    "check": "node --check src/index.mjs && node --check src/server.mjs && node --check src/auth.mjs && node --check src/models.mjs && node --check src/db.mjs && node --check src/config.mjs && node --check src/graph.mjs && node --check src/graph-projector.mjs && node --check src/graph-retrieval-policy.mjs && node --check src/observability.mjs && node --check src/retrieval.mjs && node --check src/access-policy.mjs && node --check src/thought-store.mjs && node --check src/projection-planner.mjs && node --check src/graph-driver.mjs && node --check src/graph-reads.mjs && node --check src/graph-projection.mjs",
+    "check": "node --check src/index.mjs && node --check src/server.mjs && node --check src/auth.mjs && node --check src/models.mjs && node --check src/db.mjs && node --check src/config.mjs && node --check src/graph.mjs && node --check src/graph-projector.mjs && node --check src/graph-retrieval-policy.mjs && node --check src/observability.mjs && node --check src/retrieval.mjs && node --check src/access-policy.mjs && node --check src/thought-store.mjs && node --check src/projection-planner.mjs && node --check src/graph-driver.mjs && node --check src/graph-reads.mjs && node --check src/graph-projection.mjs && node --check src/repo-key-minting.mjs && node --check scripts/mint-authority-init.mjs",
     "test": "node --test 'test/**/*.test.mjs'",
     "project-graph": "OPEN_BRAIN_RUNTIME_ROLE=graph-projector node src/graph-projector.mjs"
   },
