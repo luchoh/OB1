@@ -258,6 +258,12 @@ async function buildPrincipalContext(
     requireUsableBrain,
     readEgressClass = CALLER_EGRESS_CLASS.CLOUD_BOUND,
     canMintRepoKeys = false,
+    // Writer attribution (0.8.0): WHICH credential is speaking, not what it may
+    // do. Both default to null so a caller shape that cannot supply them (human
+    // token today, legacy admin — which never calls this function) attributes as
+    // "unknown" rather than failing. Never an authorization input.
+    accessKeyId = null,
+    principalType = null,
   },
   requestedBrainSlug,
 ) {
@@ -285,6 +291,11 @@ async function buildPrincipalContext(
     // admin path, which never calls this function at all — is false. The admin
     // secret can therefore never mint through the tool.
     canMintRepoKeys: Boolean(canMintRepoKeys),
+    // Attribution only (see above): the key row that authenticated this request
+    // and the principal's type. Carried on the caller so any write path can stamp
+    // "who wrote this" without re-querying the credential.
+    accessKeyId: accessKeyId ?? null,
+    principalType: principalType ?? null,
   };
 
   const [brainMemberships, estateMemberships, catalog] = await Promise.all([
@@ -361,6 +372,9 @@ function makeContext({
   return {
     authSource: caller.kind,
     principalId: caller.principalId,
+    // Writer attribution (0.8.0). Null for any caller that is not a stored key.
+    accessKeyId: caller.accessKeyId ?? null,
+    principalType: caller.principalType ?? null,
     householdId: caller.homeEstateId,
     defaultBrainId: caller.defaultBrainId,
     allowedBrainIds: brainMemberships.filter((m) => !m.isDeny).map((m) => m.brainId),
@@ -434,8 +448,9 @@ async function resolveHumanAccessContext(c, requestedBrainSlug) {
 async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
   const result = await query(
     `
-      select k.brain_id as key_brain_id, k.is_admin, k.read_egress_class,
-             k.can_mint_repo_keys, p.id as principal_id
+      select k.id as key_id, k.brain_id as key_brain_id, k.is_admin,
+             k.read_egress_class, k.can_mint_repo_keys,
+             p.id as principal_id, p.principal_type
       from brain_access_keys k
       join brain_principals p on p.id = k.principal_id
       where k.key_hash = $1 and k.is_active = true
@@ -478,6 +493,10 @@ async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
       requireUsableBrain: !canMintRepoKeys,
       readEgressClass,
       canMintRepoKeys,
+      // Attribution: the exact credential row behind this request, so a write can
+      // be traced back to ONE key (a principal may hold several) after the fact.
+      accessKeyId: row.key_id,
+      principalType: row.principal_type ?? null,
     },
     requestedBrainSlug,
   );
@@ -493,6 +512,10 @@ async function resolveLegacyAdminContext(requestedBrainSlug) {
     homeEstateId: null,
     isAdmin: true,
     defaultBrainId: null,
+    // Unattributable by construction: the bare env key is not a stored row and
+    // has no principal, so its writes stamp NULL writer columns.
+    accessKeyId: null,
+    principalType: null,
     // The bare legacy key is an unattributable, cloud-bound audience (docs/45
     // §6.2). It does not fan out (no accessible set), so egress filtering on the
     // legacy path is moot, but the field is set for shape consistency / fail-safe.
@@ -518,6 +541,8 @@ async function resolveLegacyAdminContext(requestedBrainSlug) {
   return {
     authSource: caller.kind,
     principalId: null,
+    accessKeyId: null,
+    principalType: null,
     householdId,
     defaultBrainId: effectiveBrainId,
     allowedBrainIds: effectiveBrainId ? [effectiveBrainId] : [],

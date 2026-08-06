@@ -36,7 +36,12 @@ import {
   healthcheckUpstreams,
   normalizeMetadata,
 } from "./models.mjs";
-import { handleMintRepoKey, handleRotateRepoKey } from "./repo-key-minting.mjs";
+import {
+  handleMintAgentKey,
+  handleMintRepoKey,
+  handleRotateAgentKey,
+  handleRotateRepoKey,
+} from "./repo-key-minting.mjs";
 import { appendRetrievalTelemetry } from "./observability.mjs";
 import {
   expandContextRows,
@@ -201,6 +206,21 @@ const rotateRepoKeySchema = {
   repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier whose key should be revoked and replaced."),
 };
 
+// The agent-key pair mints a SECOND, wider credential for the same repo: the
+// caged agent's principal is a member of the repo brain AND of the shared
+// cross-repo agent brain. Same rule as above — the caller picks a repo name and
+// nothing that affects authority; the brains, roles and principal_type are
+// literals in repo-key-minting.mjs. No display_name, unlike mint_repo_key:
+// neither brain is created here — the repo brain must already exist and the
+// shared agent brain is an operator decision.
+const mintAgentKeySchema = {
+  repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier (lowercase letters, digits, hyphens) the caged agent works in. Grants brain 'repo:<repo_slug>' plus the shared agent brain."),
+};
+
+const rotateAgentKeySchema = {
+  repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier whose caged-agent key should be revoked and replaced."),
+};
+
 function jsonToolResult(value) {
   return {
     content: [
@@ -335,6 +355,7 @@ async function handleCaptureThought(args, accessContext, { externalIngest = fals
   // writable; this is the call site that enforcement was missing.)
   await authorizeWrite(accessContext, brainId);
   const callerReadEgressClass = accessContext._policy.caller.readEgressClass;
+  const caller = accessContext._policy?.caller;
   const content = args.content.trim();
   const requestedTier = args.sensitivity_tier ?? "standard";
 
@@ -373,7 +394,16 @@ async function handleCaptureThought(args, accessContext, { externalIngest = fals
   //     only an explicit key would miss an implicit-dedupe collision and let the
   //     content reach the processors before the conflict guard denies it.
   const effectiveDedupeKey = args.dedupe_key ?? crypto.createHash("sha256").update(content, "utf8").digest("hex");
-  const existingTier = await peekCaptureConflictTier({ brainId, dedupeKey: effectiveDedupeKey });
+  // The peek MUST use the same principal the capture will, or on a shared agent
+  // brain it looks up the bare key while the capture conflicts on the namespaced
+  // one — leaving the §6.10 restricted-tier preflight blind on exactly the brain
+  // where two principals collide.
+  const writerPrincipalId = accessContext.principalId ?? accessContext._policy?.caller?.principalId ?? null;
+  const existingTier = await peekCaptureConflictTier({
+    brainId,
+    dedupeKey: effectiveDedupeKey,
+    writtenByPrincipalId: writerPrincipalId,
+  });
   if (existingTier !== undefined && existingTier !== "standard" && callerReadEgressClass !== "local_trusted") {
     throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, "Thought not found");
   }
@@ -412,7 +442,7 @@ async function handleCaptureThought(args, accessContext, { externalIngest = fals
   // §6.8/§6.11). A cloud-bound (or unknown) writer is cloud_origin; a cloud_origin
   // restricted capture is quarantined (unreviewed) at creation.
   const stamp = deriveCaptureStamp({
-    caller: accessContext._policy?.caller,
+    caller,
     sensitivityTier: args.sensitivity_tier,
     externalIngest,
   });
@@ -429,13 +459,25 @@ async function handleCaptureThought(args, accessContext, { externalIngest = fals
     sourceTrustClass: stamp.sourceTrustClass,
     reviewState: stamp.reviewState,
     callerReadEgressClass,
+    // Writer attribution (migration 021). Without it a bad write on a SHARED
+    // brain is unattributable after the fact — the row says which brain, never
+    // which principal. Both may be null (legacy admin secret): the store records
+    // unattributed rather than guessing, and its shared-brain overwrite guard
+    // reads NULL as "not the same writer".
+    writtenByPrincipalId: accessContext.principalId ?? caller?.principalId ?? null,
+    writtenByKeyId: accessContext.accessKeyId ?? caller?.accessKeyId ?? null,
   });
 
+  // Never hand back the internal namespaced dedupe key. On a shared agent brain
+  // the stored key is `<principal>:<key>`, and a client following the documented
+  // idempotent-import pattern — feed the returned dedupe_key back in — would get
+  // it prefixed again on every round, inserting a fresh duplicate each time.
+  // Echo what the caller actually supplied.
   return {
     success: true,
     message: "Thought captured",
     metadata_extraction_enabled: shouldExtractMetadata,
-    thought,
+    thought: { ...thought, dedupe_key: args.dedupe_key ?? null },
   };
 }
 
@@ -1135,11 +1177,41 @@ function buildMcpServer(accessContext) {
 
   server.tool(
     "rotate_repo_key",
-    "Revoke every active key for a repo brain and issue a replacement. Returns the new key once.",
+    "Revoke the repo brain's active REPO key and issue a replacement. Leaves any agent key on the same brain untouched. Returns the new key once.",
     rotateRepoKeySchema,
     async (args) => {
       try {
         return jsonToolResult(await handleRotateRepoKey(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  // An agent key is STRICTLY MORE REACH than a repo key: same repo brain, plus
+  // write access to the shared agent brain that spans every repo. It exists for
+  // the caged agent, which is injection-exposed, so the extra reach is stated in
+  // the tool description rather than left for an operator to infer from the name.
+  server.tool(
+    "mint_agent_key",
+    "Issue a caged-agent access key for a repo whose brain already exists (run mint_repo_key first). WIDER THAN mint_repo_key: the key's own principal is a member of BOTH the repo brain and the shared cross-repo agent brain, so what it writes is readable from every other repo. Create-only; returns the key once.",
+    mintAgentKeySchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleMintAgentKey(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "rotate_agent_key",
+    "Revoke every active caged-agent key for a repo and issue a replacement with the same two-brain reach (repo brain + shared agent brain). Returns the new key once. Does not touch the repo key issued by mint_repo_key.",
+    rotateAgentKeySchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleRotateAgentKey(args, accessContext));
       } catch (error) {
         return errorToolResult(error);
       }
