@@ -203,8 +203,20 @@ async function pgConfig(consul) {
   const connectionString =
     process.env.OPEN_BRAIN_DATABASE_URL ?? process.env.DATABASE_URL ?? undefined;
 
+  // pool.connect() waits FOREVER by default. One caller holding every connection
+  // therefore hangs every tool for every other caller with no error and no log —
+  // a burst of minting calls stretched an unrelated stats call from ~1s to 29s.
+  // A bounded acquire turns that indefinite hang into a fast, visible failure.
+  function poolLimits() {
+    return {
+      max: envNumber("PG_POOL_MAX", 20),
+      connectionTimeoutMillis: envNumber("PG_POOL_CONNECTION_TIMEOUT_MS", 5000),
+      idleTimeoutMillis: envNumber("PG_POOL_IDLE_TIMEOUT_MS", 30000),
+    };
+  }
+
   if (connectionString) {
-    return { connectionString };
+    return { connectionString, ...poolLimits() };
   }
 
   let host = envOptionalString("PGHOST");
@@ -217,6 +229,7 @@ async function pgConfig(consul) {
       database: envString("PGDATABASE", process.env.POSTGRES_DB ?? "ob1"),
       user: envString("PGUSER", process.env.POSTGRES_USER ?? "ob1"),
       password: envString("PGPASSWORD", process.env.POSTGRES_PASSWORD),
+      ...poolLimits(),
     };
   }
 
@@ -232,6 +245,7 @@ async function pgConfig(consul) {
     database: envString("PGDATABASE", process.env.POSTGRES_DB ?? "ob1"),
     user: envString("PGUSER", process.env.POSTGRES_USER ?? "ob1"),
     password: envString("PGPASSWORD", process.env.POSTGRES_PASSWORD),
+    ...poolLimits(),
   };
 }
 

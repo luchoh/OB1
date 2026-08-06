@@ -21,3 +21,7 @@ local/open-brain-mcp/.runtime/*
 # Provisioned agent access keys (plaintext, local only)
 .agent-estate-keys/
 .env.local
+
+# Minted per-repo OB1 keys (docs/53). The rollout writes a live plaintext
+# credential to <repo>/.ob1/repo-key; committing it would publish that key.
+.ob1/

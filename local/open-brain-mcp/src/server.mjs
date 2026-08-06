@@ -194,7 +194,7 @@ const expandContextSchema = {
 // chooses a repo name and a label, nothing that affects authority.
 const mintRepoKeySchema = {
   repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier (lowercase letters, digits, hyphens). Becomes brain slug 'repo:<repo_slug>'."),
-  display_name: z.string().min(1).optional().describe("Optional human-readable brain name. Defaults to 'Repo brain: <repo_slug>'."),
+  display_name: z.string().min(1).max(128).optional().describe("Optional human-readable brain name, max 128 chars. Defaults to 'Repo brain: <repo_slug>'."),
 };
 
 const rotateRepoKeySchema = {

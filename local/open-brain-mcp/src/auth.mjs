@@ -559,6 +559,11 @@ export async function resolveAccessContext(c, { routeBrainSlug = null } = {}) {
 
   const storedContext = await resolveStoredAccessKeyContext(hashAccessKey(key), requestedBrainSlug);
   if (!storedContext) {
+    // Rejections were entirely silent, so probing for the minting capability with
+    // a stolen or guessed key left no trace at all. Log the FACT only — never the
+    // presented key, its hash, or any prefix of either, since this line is written
+    // for every failed attempt and would otherwise become a credential oracle.
+    console.warn(JSON.stringify({ event: "auth.key_rejected", authSource: "access_key" }));
     throw new HttpError(401, "Unauthorized");
   }
 
