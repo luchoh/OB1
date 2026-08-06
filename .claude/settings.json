@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "handover-check --mode session-start --repo ob1",
+            "timeout": 15
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "handover-check --mode prompt --repo ob1",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

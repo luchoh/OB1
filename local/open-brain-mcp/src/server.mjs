@@ -3,16 +3,22 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
 import { HttpError, authorizeWrite, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
+import { deriveCaptureStamp, isLocalTrustedProcessor, CALLER_EGRESS_CLASS, effectiveEgress } from "./access-policy.mjs";
 import { config } from "./config.mjs";
 import { closePool, healthcheckDatabase, query } from "./db.mjs";
+import crypto from "node:crypto";
 import {
   captureThought,
+  peekCaptureConflictTier,
+  peekBrainEgressClass,
+  fetchRowEgressById,
   patchThoughtMetadata,
   softDeleteThought,
   restoreThought,
   purgeThought,
   brainStats,
   ThoughtStoreError,
+  STORE_ERROR,
 } from "./thought-store.mjs";
 import {
   graphNeighbors,
@@ -30,6 +36,7 @@ import {
   healthcheckUpstreams,
   normalizeMetadata,
 } from "./models.mjs";
+import { handleMintRepoKey, handleRotateRepoKey } from "./repo-key-minting.mjs";
 import { appendRetrievalTelemetry } from "./observability.mjs";
 import {
   expandContextRows,
@@ -47,6 +54,7 @@ const captureThoughtSchema = {
   occurred_at: z.string().optional().describe("Optional source timestamp in ISO 8601 format."),
   dedupe_key: z.string().min(1).optional().describe("Optional stable key for idempotent imports."),
   extract_metadata: z.boolean().optional().describe("Whether to run LLM metadata extraction before storing."),
+  sensitivity_tier: z.enum(["standard", "restricted"]).optional().describe("Egress tier at creation (docs/45 §6.8). Defaults to 'standard'. 'restricted' is local-on-box-only and may only be captured into a private_local/quarantine_review brain."),
 };
 const captureThoughtInput = z.object(captureThoughtSchema);
 
@@ -84,7 +92,9 @@ const updateThoughtMetadataSchema = {
   metadata_patch: z.record(z.any()).optional().describe("Metadata patch merged into the thought metadata without changing content or embeddings."),
   type: z.string().min(1).max(64).optional().describe("Structured type column. Free-form; consumers may constrain to a known taxonomy."),
   source_type: z.string().min(1).max(64).optional().describe("Structured source_type column."),
-  sensitivity_tier: z.enum(["standard", "personal", "restricted"]).optional().describe("Structured sensitivity_tier column."),
+  // sensitivity_tier is intentionally NOT patchable here (docs/45 §6.7): this
+  // generic route must not be a declassification path. Tier transitions go
+  // through a dedicated local-trusted capability (a later slice).
   importance: z.number().int().min(0).max(100).optional().describe("Structured importance column (0-100)."),
   quality_score: z.number().min(0).max(100).optional().describe("Structured quality_score column (0-100)."),
   enriched: z.boolean().optional().describe("Mark the thought as enriched (or not)."),
@@ -97,7 +107,6 @@ const updateThoughtMetadataInput = z
       v.metadata_patch !== undefined
       || v.type !== undefined
       || v.source_type !== undefined
-      || v.sensitivity_tier !== undefined
       || v.importance !== undefined
       || v.quality_score !== undefined
       || v.enriched !== undefined
@@ -178,6 +187,18 @@ const expandContextSchema = {
   filter: z.record(z.any()).optional().describe("Optional JSONB containment filter applied to expanded thought rows."),
   max_hops: z.number().int().min(1).max(3).optional().describe("Maximum graph hop count."),
   limit: z.number().int().min(1).max(24).optional().describe("Maximum number of expanded thought rows to return."),
+};
+
+// docs/53. Note what is NOT here: no is_admin, no egress_class, no brain kind, no
+// capability flag. Those are literals in repo-key-minting.mjs. A minting caller
+// chooses a repo name and a label, nothing that affects authority.
+const mintRepoKeySchema = {
+  repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier (lowercase letters, digits, hyphens). Becomes brain slug 'repo:<repo_slug>'."),
+  display_name: z.string().min(1).max(128).optional().describe("Optional human-readable brain name, max 128 chars. Defaults to 'Repo brain: <repo_slug>'."),
+};
+
+const rotateRepoKeySchema = {
+  repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier whose key should be revoked and replaced."),
 };
 
 function jsonToolResult(value) {
@@ -307,13 +328,56 @@ function hasExplicitSearchRole(filter) {
       || Object.prototype.hasOwnProperty.call(filter, "retrieval_role"));
 }
 
-async function handleCaptureThought(args, accessContext) {
+async function handleCaptureThought(args, accessContext, { externalIngest = false } = {}) {
   const { brainId } = await resolveRequestBrain(accessContext, args.brain);
   // ADR-0002 write ladder: capture is a WRITE. Authorize before doing any work.
   // (Pre-ADR-0002 the runtime had no write gate — any reachable brain was
   // writable; this is the call site that enforcement was missing.)
   await authorizeWrite(accessContext, brainId);
+  const callerReadEgressClass = accessContext._policy.caller.readEgressClass;
   const content = args.content.trim();
+  const requestedTier = args.sensitivity_tier ?? "standard";
+
+  // PREFLIGHT — runs BEFORE any embedding/LLM processor call so restricted
+  // content never reaches an external processor on a path that will be rejected
+  // (docs/45 §6.5/§6.10; Codex v4 F3; review #5/#6).
+  //
+  // (a) A restricted capture must target a brain that can hold restricted
+  //     content (private_local / quarantine_review). The
+  //     enforce_restricted_brain_isolation trigger also rejects a mismatch, but
+  //     only AFTER createEmbedding/extractMetadata have seen the content.
+  if (requestedTier !== "standard") {
+    const brainClass = await peekBrainEgressClass({ brainId });
+    if (brainClass !== "private_local" && brainClass !== "quarantine_review") {
+      throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, "Cannot capture restricted content into this brain");
+    }
+    // §6.5: restricted content may only be processed by a local-trusted
+    // embedding/LLM endpoint. Refuse BEFORE any processor call, else the content
+    // egresses through OB1 itself. Fail-closed: only loopback (or operator-
+    // allowlisted hosts) qualify; a non-loopback https endpoint with global TLS
+    // verification disabled does not.
+    const procOpts = {
+      allowlistHosts: config.restrictedProcessorHosts,
+      globalTlsDisabled: process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0",
+    };
+    const willExtract = args.extract_metadata ?? true;
+    if (!isLocalTrustedProcessor(config.embeddingBaseUrl, procOpts)
+        || (willExtract && !isLocalTrustedProcessor(config.llmBaseUrl, procOpts))) {
+      throw new HttpError(403, "Restricted-tier capture refused: embedding/LLM processor is not a local-trusted endpoint (docs/45 §6.5)");
+    }
+  }
+
+  // (b) A cloud_bound caller may not upsert OVER an existing restricted row.
+  //     dedupe_key defaults to sha256(content) in SQL, so the EFFECTIVE key
+  //     (explicit OR content-hash) is what the upsert conflicts on — peeking with
+  //     only an explicit key would miss an implicit-dedupe collision and let the
+  //     content reach the processors before the conflict guard denies it.
+  const effectiveDedupeKey = args.dedupe_key ?? crypto.createHash("sha256").update(content, "utf8").digest("hex");
+  const existingTier = await peekCaptureConflictTier({ brainId, dedupeKey: effectiveDedupeKey });
+  if (existingTier !== undefined && existingTier !== "standard" && callerReadEgressClass !== "local_trusted") {
+    throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, "Thought not found");
+  }
+
   const metadata = args.metadata ?? {};
   const shouldExtractMetadata = args.extract_metadata ?? true;
   const extractionPromise = shouldExtractMetadata
@@ -344,6 +408,15 @@ async function handleCaptureThought(args, accessContext) {
       : null,
   });
 
+  // Stamp the egress-boundary columns from the caller's egress class (docs/45
+  // §6.8/§6.11). A cloud-bound (or unknown) writer is cloud_origin; a cloud_origin
+  // restricted capture is quarantined (unreviewed) at creation.
+  const stamp = deriveCaptureStamp({
+    caller: accessContext._policy?.caller,
+    sensitivityTier: args.sensitivity_tier,
+    externalIngest,
+  });
+
   const thought = await captureThought({
     brainId,
     content,
@@ -351,6 +424,11 @@ async function handleCaptureThought(args, accessContext) {
     embeddingModel: config.embeddingModel,
     metadata: normalizedMetadata,
     dedupeKey: args.dedupe_key,
+    sensitivityTier: args.sensitivity_tier,
+    originEgressClass: stamp.originEgressClass,
+    sourceTrustClass: stamp.sourceTrustClass,
+    reviewState: stamp.reviewState,
+    callerReadEgressClass,
   });
 
   return {
@@ -388,9 +466,13 @@ export async function handleSearchThoughts(args, accessContext) {
       })),
     );
 
-    const results = perBrain
+    const tagged = perBrain
       .flatMap(({ brain, retrieval }) =>
-        retrieval.results.map((row) => ({ ...row, brain_id: brain.brainId, brain_slug: brain.brainSlug })))
+        retrieval.results.map((row) => ({ ...row, brain_id: brain.brainId, brain_slug: brain.brainSlug })));
+    // Layer-B per-row clamp before ranking/truncation so a dropped row never
+    // consumes a result slot (no-op off the enforce + cloud_bound path).
+    const clamped = await clampReadRowsByEgress(tagged, accessContext);
+    const results = clamped
       .sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0))
       .slice(0, matchCount);
 
@@ -399,7 +481,9 @@ export async function handleSearchThoughts(args, accessContext) {
       success: true,
       query: args.query,
       brains_searched: brains.length,
-      retrieval_strategy: multi ? "multi-brain-merge" : perBrain[0].retrieval.retrieval_strategy,
+      // brains can be EMPTY (a cloud_bound caller whose every brain is
+      // egress-excluded under enforce): return an empty result, never deref [0].
+      retrieval_strategy: multi ? "multi-brain-merge" : (perBrain[0]?.retrieval.retrieval_strategy ?? "none"),
       fallback_used: perBrain.some((p) => p.retrieval.fallback_used),
       recency_weight: recencyWeight,
       half_life_days: recencyWeight > 0 ? halfLifeDays : null,
@@ -480,6 +564,9 @@ async function handleAskBrain(args, accessContext) {
       graphMaxHops: args.graph_max_hops ?? 2,
       graphNeighborLimit: args.graph_neighbor_limit ?? matchCount,
     }));
+    // Layer-B per-row clamp on the evidence set (incl. graph-expanded rows)
+    // before it is cited or fed to the answerer (no-op off enforce + cloud_bound).
+    evidenceRows = await clampReadRowsByEgress(evidenceRows, accessContext);
     const evidence = evidenceRows.map(evidenceCitation);
 
     if (evidence.length === 0) {
@@ -647,8 +734,9 @@ export async function handleListThoughts(args, accessContext) {
     }),
   );
 
-  const thoughts = perBrain
-    .flat()
+  // Layer-B per-row clamp before merge/truncate (no-op off enforce + cloud_bound).
+  const clamped = await clampReadRowsByEgress(perBrain.flat(), accessContext);
+  const thoughts = clamped
     .sort((a, b) => {
       const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
       const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
@@ -733,6 +821,60 @@ function ensureGraphAdmin(accessContext) {
   }
 }
 
+// docs/45 §8.3 (runbook §10 graph-plane gap): the graph reads traverse all of
+// Neo4j and are not brain-scoped, so admin alone is not an egress decision —
+// `read_egress_class` is a read attribute independent of authority, and a
+// cloud_bound admin (e.g. the legacy key) must not pull local-only/restricted
+// nodes. This descriptor lets the scrub clamp such a caller's result to readable
+// nodes; local_trusted or non-enforce callers get the full graph.
+function callerReadEgress(accessContext) {
+  const { caller, egressMode } = accessContext._policy;
+  return {
+    enforce: egressMode === "enforce",
+    cloudBound: caller.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED,
+  };
+}
+
+// docs/45 Layer-B per-row clamp (runbook §10): a defense-in-depth row filter for
+// the materialized read surface (search / list / ask_brain evidence). Brain-level
+// confinement already removes local-only brains from a cloud_bound caller's scope,
+// and the 016/018 triggers keep restricted rows out of cloud-readable brains — so
+// under correct provisioning this NEVER drops a row. It exists for the case those
+// invariants are bypassed (e.g. a restricted row injected by direct SQL into a
+// repo brain): each row is run through `effectiveEgress` and dropped unless it may
+// materialize for the caller. Gated to the confined path (enforce + cloud_bound):
+// every other caller returns unchanged with zero extra DB work, so observe / off /
+// local_trusted reads are byte-identical.
+async function clampReadRowsByEgress(rows, accessContext) {
+  const { caller, egressMode } = accessContext._policy;
+  if (
+    egressMode !== "enforce" ||
+    caller.readEgressClass === CALLER_EGRESS_CLASS.LOCAL_TRUSTED ||
+    !Array.isArray(rows) ||
+    rows.length === 0
+  ) {
+    return rows;
+  }
+  const egressById = await fetchRowEgressById(rows.map((r) => r?.id));
+  return rows.filter((row) => {
+    const e = egressById.get(String(row?.id).toLowerCase());
+    if (!e) {
+      return false; // vanished between retrieval and clamp → fail-closed drop
+    }
+    return effectiveEgress({
+      brain: { egressClass: e.brain_egress_class },
+      row: {
+        sensitivityTier: e.sensitivity_tier,
+        reviewState: e.review_state,
+        originEgressClass: e.origin_egress_class,
+        sourceTrustClass: e.source_trust_class,
+      },
+      caller: { readEgressClass: caller.readEgressClass },
+      sink: null,
+    }).canMaterialize;
+  });
+}
+
 async function handleGraphNeighbors(args, accessContext) {
   ensureGraphAdmin(accessContext);
   if (!args.thought_id && !args.canonical_id) {
@@ -743,6 +885,7 @@ async function handleGraphNeighbors(args, accessContext) {
     canonicalId: args.canonical_id,
     maxHops: args.max_hops ?? 2,
     limit: args.limit ?? 10,
+    readEgress: callerReadEgress(accessContext),
   });
 }
 
@@ -756,6 +899,7 @@ async function handleSourceLineage(args, accessContext) {
     canonicalId: args.canonical_id,
     maxDepth: args.max_depth ?? 4,
     limit: args.limit ?? 12,
+    readEgress: callerReadEgress(accessContext),
   });
 }
 
@@ -774,6 +918,7 @@ async function handleWhyConnected(args, accessContext) {
     toCanonicalId: args.to_canonical_id,
     maxHops: args.max_hops ?? 4,
     limit: args.limit ?? 3,
+    readEgress: callerReadEgress(accessContext),
   });
 }
 
@@ -787,8 +932,12 @@ async function handleExpandContext(args, accessContext) {
   const requestedLimit = args.limit ?? 6;
 
   try {
+    // §6.13 (audit H1): route the brain through resolveRequestBrain so the
+    // default/effective brain is egress-checked under enforce (a cloud_bound
+    // admin's private_local default must not leak via graph expansion).
+    const { brainId } = await resolveRequestBrain(accessContext, args.brain);
     const result = await expandContextRows({
-      brainId: accessContext.effectiveBrainId,
+      brainId,
       thoughtId: args.thought_id,
       canonicalId: args.canonical_id,
       questionText: args.question ?? "",
@@ -966,6 +1115,37 @@ function buildMcpServer(accessContext) {
     },
   );
 
+  // docs/53: minting tools. Gated server-side by the can_mint_repo_keys
+  // capability, which only the operator-provisioned minter key holds — every
+  // other caller, including the legacy admin secret, gets a 403 from the handler.
+  // system-config deliberately keeps these OFF every harness allowlist; that is
+  // ergonomics, the capability check is the actual control.
+  server.tool(
+    "mint_repo_key",
+    "Provision a per-repo brain and issue its cloud-bound repo access key. Create-only; returns the key once.",
+    mintRepoKeySchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleMintRepoKey(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "rotate_repo_key",
+    "Revoke every active key for a repo brain and issue a replacement. Returns the new key once.",
+    rotateRepoKeySchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleRotateRepoKey(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
   return server;
 }
 
@@ -1021,7 +1201,7 @@ app.post("/ingest/thought", async (c) => {
   try {
     const accessContext = await resolveAccessContext(c);
     const payload = captureThoughtInput.parse(await c.req.json());
-    const result = await handleCaptureThought(payload, accessContext);
+    const result = await handleCaptureThought(payload, accessContext, { externalIngest: true });
     return c.json(result, 201);
   } catch (error) {
     return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
@@ -1073,11 +1253,12 @@ app.post("/admin/thought/metadata", async (c) => {
       metadataPatch: payload.metadata_patch,
       type: payload.type,
       sourceType: payload.source_type,
-      sensitivityTier: payload.sensitivity_tier,
       importance: payload.importance,
       qualityScore: payload.quality_score,
       enriched: payload.enriched,
       status: payload.status,
+      // §6.10: a cloud_bound caller cannot mutate a restricted row.
+      callerReadEgressClass: accessContext._policy.caller.readEgressClass,
     });
     return c.json({
       success: true,
@@ -1111,6 +1292,7 @@ app.post("/admin/thought/delete", async (c) => {
       brainId,
       thoughtId: payload.thought_id,
       actor,
+      callerReadEgressClass: accessContext._policy.caller.readEgressClass,
     });
     return c.json(deleteResponse(result));
   } catch (error) {
@@ -1128,6 +1310,7 @@ app.post("/admin/thought/restore", async (c) => {
       brainId,
       thoughtId: payload.thought_id,
       actor,
+      callerReadEgressClass: accessContext._policy.caller.readEgressClass,
     });
     return c.json(restoreResponse(result));
   } catch (error) {

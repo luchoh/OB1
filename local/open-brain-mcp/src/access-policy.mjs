@@ -258,12 +258,13 @@ export function authorizeAction({ caller, action, brainMembership = null, estate
 //                naming them resolves-then-denies (403) rather than 404s.
 //
 // Inputs:
-//   caller            : { isAdmin, homeEstateId, kind, ... }
+//   caller            : { isAdmin, homeEstateId, kind, readEgressClass, ... }
 //   brainMemberships  : [{ brainId, role, isDeny }]
 //   estateMemberships : [{ estateId, role, isDeny }]
-//   catalog           : [{ brainId, brainSlug, estateId }]
-// Returns: { accessible: [{brainId,brainSlug}], accessibleIds: Set, lookup: [{brainId,brainSlug}] }
-export function deriveScope({ caller, brainMemberships = [], estateMemberships = [], catalog = [] }) {
+//   catalog           : [{ brainId, brainSlug, estateId, egressClass? }]
+//   egressMode        : 'off' | 'observe' | 'enforce'  (absent → 'off')
+// Returns: { accessible: [{brainId,brainSlug}], accessibleIds: Set, lookup: [{brainId,brainSlug}], egressExcluded: [{brainId,brainSlug}] }
+export function deriveScope({ caller, brainMemberships = [], estateMemberships = [], catalog = [], egressMode }) {
   const estateAllowed = new Set(
     estateMemberships.filter((m) => !m.isDeny).map((m) => m.estateId),
   );
@@ -273,11 +274,19 @@ export function deriveScope({ caller, brainMemberships = [], estateMemberships =
   const lookup = [];
   const seen = new Set();
 
+  // Index memberships by brain once (was a filter per catalog brain = O(N*M)).
+  const membershipsByBrain = new Map();
+  for (const m of brainMemberships) {
+    const list = membershipsByBrain.get(m.brainId);
+    if (list) list.push(m);
+    else membershipsByBrain.set(m.brainId, [m]);
+  }
+
   for (const brain of catalog) {
     if (seen.has(brain.brainId)) continue; // dedupe a catalog with repeats
     seen.add(brain.brainId);
 
-    const rows = brainMemberships.filter((m) => m.brainId === brain.brainId);
+    const rows = membershipsByBrain.get(brain.brainId) ?? [];
     const hasDenyBrain = rows.some((m) => m.isDeny);
     const hasGrantBrain = rows.some((m) => !m.isDeny);
     const estateOk = estateAllowed.has(brain.estateId);
@@ -303,7 +312,62 @@ export function deriveScope({ caller, brainMemberships = [], estateMemberships =
     }
   }
 
-  return { accessible, accessibleIds, lookup };
+  // --- Layer-A egress enforcement (§6.13/§6.2/§9) ---
+  // egressMode absent or 'off': NO filtering. Return as-is.
+  // egressMode 'observe': compute egressExcluded but leave accessible/lookup unchanged.
+  // egressMode 'enforce': remove local-only brains from accessible, accessibleIds, AND lookup
+  //                       for a cloud-bound caller; populate egressExcluded.
+  //
+  // A brain is LOCAL-ONLY when its egressClass ∉ {public, repo} (fail-closed: absent/unknown → local-only).
+  // A caller is cloud-bound when readEgressClass !== 'local_trusted' (fail-closed: absent/unknown → cloud-bound).
+
+  const mode = egressMode ?? "off";
+  if (mode === "off") {
+    return { accessible, accessibleIds, lookup, egressExcluded: [] };
+  }
+
+  const callerIsCloudBound = caller.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED;
+  if (!callerIsCloudBound) {
+    // Local-trusted caller: no exclusion regardless of mode.
+    return { accessible, accessibleIds, lookup, egressExcluded: [] };
+  }
+
+  // Collect ALL nameable (lookup) brains that are local-only — not just accessible ones.
+  // A DENY-shadowed brain lands in lookup but not accessible; it must also be stripped
+  // from lookup to prevent existence leaks (spec: 'so a cloud-bound caller naming a
+  // local-only brain resolves NOT_FOUND, never a denied/exists leak').
+  const egressExcluded = [];
+  const seenEgress = new Set();
+  // Index catalog egress classes once (was a find per lookup entry = O(N^2)).
+  const egressClassByBrain = new Map(catalog.map((b) => [b.brainId, b.egressClass]));
+  for (const ref of lookup) {
+    if (seenEgress.has(ref.brainId)) continue;
+    seenEgress.add(ref.brainId);
+    const ec = egressClassByBrain.get(ref.brainId);
+    const localOnly =
+      ec !== BRAIN_EGRESS_CLASS.PUBLIC && ec !== BRAIN_EGRESS_CLASS.REPO;
+    if (localOnly) {
+      egressExcluded.push({ brainId: ref.brainId, brainSlug: ref.brainSlug });
+    }
+  }
+
+  if (mode === "observe" || egressExcluded.length === 0) {
+    // observe: report but don't alter accessible/lookup.
+    return { accessible, accessibleIds, lookup, egressExcluded };
+  }
+
+  // enforce: remove excluded brains from accessible, accessibleIds, and lookup.
+  const excludedIds = new Set(egressExcluded.map((b) => b.brainId));
+  const filteredAccessible = accessible.filter((b) => !excludedIds.has(b.brainId));
+  const filteredAccessibleIds = new Set([...accessibleIds].filter((id) => !excludedIds.has(id)));
+  const filteredLookup = lookup.filter((b) => !excludedIds.has(b.brainId));
+
+  return {
+    accessible: filteredAccessible,
+    accessibleIds: filteredAccessibleIds,
+    lookup: filteredLookup,
+    egressExcluded,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +399,10 @@ export function resolveSelector({ selector, scope, existsGlobally = false }) {
 
     const shadowed = scope.lookup.find((b) => b.brainId === selector);
     if (shadowed) return denied(DENY_REASONS.NOT_AUTHORIZED);
+
+    // If the UUID was stripped by egress enforcement (§6.13/§9), treat as not_found.
+    // A cloud-bound caller must never learn a local-only brain exists via the UUID path.
+    if (scope.egressExcluded?.some((b) => b.brainId === selector)) return notFound();
 
     // Knowing the UUID is proof enough to learn it exists — reveal as 403, not 404.
     if (existsGlobally) return denied(DENY_REASONS.NOT_AUTHORIZED);
@@ -383,6 +451,263 @@ export function detectSelectorConflict(l1Brain, bodyBrain) {
 }
 
 // ---------------------------------------------------------------------------
+// Effective egress — §6.15 cloud-egress boundary (pure, slice 1)
+// ---------------------------------------------------------------------------
+
+// Egress classifications for brains (brain.egressClass).
+export const BRAIN_EGRESS_CLASS = Object.freeze({
+  PUBLIC: "public",
+  REPO: "repo",
+  PRIVATE_LOCAL: "private_local",
+  QUARANTINE_REVIEW: "quarantine_review",
+});
+
+// Sensitivity tiers for rows (row.sensitivityTier).
+export const SENSITIVITY_TIER = Object.freeze({
+  STANDARD: "standard",
+  RESTRICTED: "restricted",
+});
+
+// Caller egress classifications (caller.readEgressClass).
+export const CALLER_EGRESS_CLASS = Object.freeze({
+  LOCAL_TRUSTED: "local_trusted",
+  CLOUD_BOUND: "cloud_bound",
+});
+
+// Writer-taint classification (row.originEgressClass) — the WRITE path that
+// contributed the row. Monotonic taint; never washed by review (§6.11).
+export const ORIGIN_EGRESS_CLASS = Object.freeze({
+  LOCAL_TRUSTED: "local_trusted",
+  CLOUD_ORIGIN: "cloud_origin",
+});
+
+// Content/source-trust classification (row.sourceTrustClass) — whether the
+// row's *content* is trusted for instructions, independent of who wrote it
+// (§6.11 Codex v7 F8: a local-trusted importer can ingest adversarial text).
+export const SOURCE_TRUST_CLASS = Object.freeze({
+  TRUSTED: "trusted",
+  UNTRUSTED: "untrusted",
+});
+
+// Quarantine review states (row.reviewState) — a three-valued enum. Quarantine
+// fires only on UNREVIEWED; NONE (no workflow applied) and REVIEWED (lifted)
+// clear it. Absent/unknown fails closed to unreviewed (§6.11).
+export const REVIEW_STATE = Object.freeze({
+  NONE: "none",
+  UNREVIEWED: "unreviewed",
+  REVIEWED: "reviewed",
+});
+
+// Integrity verdict (trustLevel) on the §6.15 vector — separate axis from
+// confidentiality.
+export const TRUST_LEVEL = Object.freeze({
+  TRUSTED: "trusted",
+  UNTRUSTED: "untrusted",
+});
+
+// Confidentiality redaction levels (redactionLevel) on the §6.15 vector.
+export const REDACTION_LEVEL = Object.freeze({
+  NONE: "none",
+  LOCAL_METADATA_ONLY: "local_metadata_only",
+  FULL: "full",
+});
+
+// The provenance fields a materialized cloud-origin/untrusted row must carry to
+// a local-trusted audience (§6.11: provenance on every read plane).
+const PROVENANCE_FIELDS = Object.freeze(["originEgressClass", "sourceTrustClass"]);
+
+// ---------------------------------------------------------------------------
+// Effective-egress helpers (pure; fail-closed on every unknown enum value)
+// ---------------------------------------------------------------------------
+
+// The AUDIENCE these bytes would reach. With a caller it is the caller's read
+// egress; for a background job (caller=null) it is the SINK's reachability.
+// Fail-closed both ways: an unknown caller egress is cloud_bound; an absent
+// sink.cloudAgentReachable is cloud-reachable (only an explicit `false` clears).
+function audienceIsCloudBound(caller, sink) {
+  if (caller !== null && caller !== undefined) {
+    return caller.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED;
+  }
+  return sink?.cloudAgentReachable !== false;
+}
+
+// A row is LOCAL-ONLY when its effective egress is restricted: a restricted
+// sensitivity tier, or a private_local / quarantine_review brain. Fail-closed:
+// an unknown brain egress class or sensitivity tier is treated as local-only.
+function isLocalOnlyRow(brainEgressClass, sensitivityTier) {
+  const brainConfines =
+    brainEgressClass !== BRAIN_EGRESS_CLASS.PUBLIC &&
+    brainEgressClass !== BRAIN_EGRESS_CLASS.REPO;
+  const tierConfines = sensitivityTier !== SENSITIVITY_TIER.STANDARD;
+  return brainConfines || tierConfines;
+}
+
+// QUARANTINE: a cloud-origin + restricted + unreviewed row is absent on every
+// plane except an explicit review endpoint (out of scope for slice 1 → deny).
+// Each predicate fails closed on an unknown value: absent originEgressClass is
+// not local_trusted (eligible), absent sensitivityTier is not standard
+// (restricted), and only the explicit NONE/REVIEWED states clear the review gate.
+function isQuarantinedRow(originEgressClass, sensitivityTier, reviewState) {
+  const writerEligible = originEgressClass !== ORIGIN_EGRESS_CLASS.LOCAL_TRUSTED;
+  const tierEligible = sensitivityTier !== SENSITIVITY_TIER.STANDARD;
+  const reviewClears =
+    reviewState === REVIEW_STATE.REVIEWED || reviewState === REVIEW_STATE.NONE;
+  return writerEligible && tierEligible && !reviewClears;
+}
+
+// TRUST is the WORST of writer taint (originEgressClass) and content/source
+// trust (sourceTrustClass) — two independent axes (§6.11 F8). Either being
+// non-clean yields untrusted, which forbids side effects. Fail-closed: an
+// unknown value on either axis is untrusted.
+function assessTrust(originEgressClass, sourceTrustClass) {
+  const writerTainted = originEgressClass !== ORIGIN_EGRESS_CLASS.LOCAL_TRUSTED;
+  const contentUntrusted = sourceTrustClass !== SOURCE_TRUST_CLASS.TRUSTED;
+  const untrusted = writerTainted || contentUntrusted;
+  return {
+    untrusted,
+    trustLevel: untrusted ? TRUST_LEVEL.UNTRUSTED : TRUST_LEVEL.TRUSTED,
+    sideEffectAllowed: !untrusted,
+  };
+}
+
+// Determine effective egress decision for a row materialization request.
+//
+// Inputs (plain objects; any field may be absent → treated as most restrictive):
+//   brain               : { egressClass }
+//   row                 : { sensitivityTier, reviewState, originEgressClass, sourceTrustClass, maxEgressReached }
+//   requestedOperation  : 'read' | 'mutate' | 'process'
+//   caller              : { readEgressClass } | null   (null = background job)
+//   sink                : { type, cloudAgentReachable }
+//
+// Returns a plain decision object (never throws for business logic).
+//
+// `requestedOperation` is part of the interface (above) but is not yet read:
+// the read/mutate/process branch lands in a later slice with its own tests, so
+// per TDD it is not destructured here until a behavior demands it.
+export function effectiveEgress({ brain, row, caller, sink }) {
+  // Resolve input fields; every predicate below defaults to most-restrictive on
+  // an absent/unknown value, so no normalization is needed here.
+  const brainEgressClass = brain?.egressClass;
+  const sensitivityTier = row?.sensitivityTier;
+
+  // The audience these bytes would reach (caller, else background-job sink).
+  const cloudBoundAudience = audienceIsCloudBound(caller, sink);
+
+  // --- Confidentiality axis ---
+  const localOnly = isLocalOnlyRow(brainEgressClass, sensitivityTier);
+  const quarantined = isQuarantinedRow(
+    row?.originEgressClass,
+    sensitivityTier,
+    row?.reviewState,
+  );
+  // Local-only content may materialize only for a local-trusted audience.
+  // Quarantine is an additional absolute deny that overrides audience trust.
+  const canMaterialize = !quarantined && !(localOnly && cloudBoundAudience);
+
+  // Local-only rows reaching a (necessarily local-trusted) audience are carried
+  // as metadata only; non-local-only rows are unredacted; denials are full.
+  const redactionLevel = !canMaterialize
+    ? REDACTION_LEVEL.FULL
+    : localOnly
+      ? REDACTION_LEVEL.LOCAL_METADATA_ONLY
+      : REDACTION_LEVEL.NONE;
+
+  // A processor sink is allowed only when the content materializes and NEITHER
+  // the audience nor the sink itself is cloud-reachable (checked independently).
+  // Fail-closed: an absent sink.cloudAgentReachable is treated as cloud-reachable.
+  const processorSinkAllowed =
+    canMaterialize && !cloudBoundAudience && sink?.cloudAgentReachable === false;
+
+  // --- Trust (integrity) axis — SEPARATE from confidentiality ---
+  const { untrusted, trustLevel, sideEffectAllowed } = assessTrust(
+    row?.originEgressClass,
+    row?.sourceTrustClass,
+  );
+
+  // Provenance must accompany a cloud-origin/untrusted row only when it actually
+  // materializes to a LOCAL-TRUSTED audience (not for cloud-bound audiences).
+  const provenanceFieldsRequired =
+    canMaterialize && untrusted && !cloudBoundAudience ? [...PROVENANCE_FIELDS] : [];
+
+  // Audit whenever materialization is denied OR the content is untrusted.
+  const auditRequired = !canMaterialize || untrusted;
+
+  return {
+    canMaterialize,
+    redactionLevel,
+    processorSinkAllowed,
+    trustLevel,
+    sideEffectAllowed,
+    provenanceFieldsRequired,
+    auditRequired,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Capture stamping (write side)
+// ---------------------------------------------------------------------------
+
+// deriveCaptureStamp — the PURE write-stamping decision for a capture
+// (docs/45 §6.8/§6.11). Derives the trust/quarantine columns a capture writes
+// from the WRITER's egress class (the caller's readEgressClass doubles as writer
+// egress). Fail-closed: an unknown/absent caller egress is cloud_origin. A
+// cloud_origin + restricted capture is QUARANTINED (unreviewed) at creation —
+// the hidden-injection guard. Direct capture is agent-authored, so source is
+// 'trusted' here; external ingest pipelines stamp source_trust_class='untrusted'
+// on their own path (§6.11 F8). Persistence (the SQL insert + monotonic conflict)
+// is the store's job, not this module's.
+export function deriveCaptureStamp({ caller, sensitivityTier, externalIngest = false } = {}) {
+  // §6.11 F8: content arriving via an external-ingest pipeline (mail / telegram /
+  // import) is EXTERNALLY-AUTHORED — stamp it cloud_origin + untrusted regardless
+  // of the (possibly local_trusted) on-box writer presenting it, so an injected
+  // email cannot act as a trusted instruction to the local agent. "The pipeline
+  // is trusted to WRITE" is separate from "the content is trusted as CONTENT".
+  // Caller-derived stamping applies only to agent-authored captures (MCP tool).
+  const originEgressClass =
+    externalIngest || caller?.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED
+      ? ORIGIN_EGRESS_CLASS.CLOUD_ORIGIN
+      : ORIGIN_EGRESS_CLASS.LOCAL_TRUSTED;
+  const sourceTrustClass = externalIngest
+    ? SOURCE_TRUST_CLASS.UNTRUSTED
+    : SOURCE_TRUST_CLASS.TRUSTED;
+  const reviewState =
+    originEgressClass === ORIGIN_EGRESS_CLASS.CLOUD_ORIGIN &&
+    sensitivityTier === SENSITIVITY_TIER.RESTRICTED
+      ? REVIEW_STATE.UNREVIEWED
+      : REVIEW_STATE.NONE;
+  return { originEgressClass, sourceTrustClass, reviewState };
+}
+
+// ---------------------------------------------------------------------------
+// Processor locality (§6.5)
+// ---------------------------------------------------------------------------
+
+// URL.hostname returns IPv6 hosts bracketed ("[::1]"); include both forms.
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "[::1]", "localhost"]);
+
+// isLocalTrustedProcessor — may restricted/personal content be sent to this
+// embedding/LLM endpoint? (docs/45 §6.5). Pure + FAIL-CLOSED: an unparseable URL
+// is not trusted. Loopback is always trusted. A non-loopback host is trusted
+// ONLY if explicitly allowlisted by the operator. And if global TLS verification
+// is disabled (NODE_TLS_REJECT_UNAUTHORIZED=0, e.g. CONSUL_SKIP_TLS_VERIFY), an
+// https non-loopback endpoint's identity cannot be verified, so it is NOT
+// trusted even when allowlisted (the adapter passes globalTlsDisabled).
+export function isLocalTrustedProcessor(urlString, { allowlistHosts = [], globalTlsDisabled = false } = {}) {
+  let url;
+  try {
+    url = new URL(urlString);
+  } catch {
+    return false;
+  }
+  const host = url.hostname;
+  const isLoopback = LOOPBACK_HOSTS.has(host);
+  if (globalTlsDisabled && url.protocol === "https:" && !isLoopback) {
+    return false;
+  }
+  return isLoopback || allowlistHosts.includes(host);
+}
+
+// ---------------------------------------------------------------------------
 // Read fanout
 // ---------------------------------------------------------------------------
 
@@ -399,17 +724,27 @@ export function detectSelectorConflict(l1Brain, bodyBrain) {
 //   explicitBrain  : resolved { brainId, brainSlug } | null  (a selector was given)
 //   effectiveBrain : { brainId, brainSlug } | null           (default/L1 brain)
 // Returns: [{ brainId, brainSlug }]
-export function planReadFanout({ caller, scope, explicitBrain = null, effectiveBrain = null }) {
+export function planReadFanout({ caller, scope, explicitBrain = null, effectiveBrain = null, egressMode = "off" }) {
   const ref = (b) => ({ brainId: b.brainId, brainSlug: b.brainSlug ?? null });
+  // An egress-excluded brain (docs/45 §6.13) must never re-enter the fanout via
+  // the default/effective-brain fallback (or an explicit selector) — otherwise
+  // the stripped default brain leaks through the unscoped read planes. This
+  // suppression applies ONLY under enforce: `scope.egressExcluded` is also
+  // populated in OBSERVE (for logging), but observe must be a behavioural no-op,
+  // so off/observe use an empty set and behave identically to pre-egress.
+  const egressExcludedIds = egressMode === "enforce"
+    ? new Set((scope.egressExcluded ?? []).map((b) => b.brainId))
+    : new Set();
+  const fallback = (b) => (b && !egressExcludedIds.has(b.brainId) ? [ref(b)] : []);
   if (explicitBrain) {
-    return [ref(explicitBrain)];
+    return egressExcludedIds.has(explicitBrain.brainId) ? [] : [ref(explicitBrain)];
   }
   if (isLegacyAdmin(caller)) {
-    return effectiveBrain ? [ref(effectiveBrain)] : [];
+    return fallback(effectiveBrain);
   }
   if (scope.accessible.length > 0) {
     // Return a copy: the result must not alias (and let a caller mutate) the scope.
     return scope.accessible.map(ref);
   }
-  return effectiveBrain ? [ref(effectiveBrain)] : [];
+  return fallback(effectiveBrain);
 }

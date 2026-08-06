@@ -157,6 +157,124 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
     assert.equal(await deletedAt(resurrected.id), null, "the new row is live");
   });
 
+  // --- egress-boundary stamp (docs/45 §6.8/§6.11, slice 4). The fixture brain
+  //     is private_local (kind 'personal' → 016 default), so restricted captures
+  //     are allowed here; the monotone-conflict cases also exercise the 016
+  //     monotonic-taint trigger (a downgrade must not be attempted/persisted). ---
+  const cap = (extra) => store.captureThought({
+    brainId, content: extra.content ?? "x", embedding: EMB, embeddingModel: "zzt-test-model",
+    metadata: {}, ...extra,
+  });
+
+  it("captureThought persists the egress stamp columns on insert", async () => {
+    const row = await cap({ dedupeKey: "st1", content: "stamped", sensitivityTier: "restricted", originEgressClass: "cloud_origin", sourceTrustClass: "trusted", reviewState: "unreviewed" });
+    assert.equal(row.sensitivity_tier, "restricted");
+    assert.equal(row.origin_egress_class, "cloud_origin");
+    assert.equal(row.source_trust_class, "trusted");
+    assert.equal(row.review_state, "unreviewed");
+  });
+
+  it("captureThought defaults sensitivity_tier to standard when not provided", async () => {
+    const row = await cap({ dedupeKey: "st2", originEgressClass: "local_trusted", sourceTrustClass: "trusted", reviewState: "none" });
+    assert.equal(row.sensitivity_tier, "standard");
+    assert.equal(row.origin_egress_class, "local_trusted");
+  });
+
+  it("re-capture taints origin monotonically: local_trusted then cloud_origin → cloud_origin", async () => {
+    const first = await cap({ dedupeKey: "stmono", content: "v1", originEgressClass: "local_trusted", reviewState: "none" });
+    assert.equal(first.origin_egress_class, "local_trusted");
+    const second = await cap({ dedupeKey: "stmono", content: "v2", originEgressClass: "cloud_origin", reviewState: "none" });
+    assert.equal(second.id, first.id);
+    assert.equal(second.origin_egress_class, "cloud_origin", "cloud taint applied on re-capture");
+  });
+
+  it("re-capture cannot wash cloud_origin back to local_trusted (monotone; trigger-safe)", async () => {
+    const first = await cap({ dedupeKey: "stwash", content: "v1", originEgressClass: "cloud_origin", reviewState: "none" });
+    const second = await cap({ dedupeKey: "stwash", content: "v2", originEgressClass: "local_trusted", reviewState: "none" });
+    assert.equal(second.id, first.id);
+    assert.equal(second.origin_egress_class, "cloud_origin", "cloud_origin sticks despite a local re-capture");
+  });
+
+  it("re-capture does not clear an existing quarantine (review_state)", async () => {
+    // local_trusted: re-capturing a restricted row is allowed (the cloud_bound
+    // upsert-over-restricted denial is exercised separately below).
+    const first = await cap({ dedupeKey: "stq", content: "q1", sensitivityTier: "restricted", originEgressClass: "cloud_origin", reviewState: "unreviewed", callerReadEgressClass: "local_trusted" });
+    assert.equal(first.review_state, "unreviewed");
+    const second = await cap({ dedupeKey: "stq", content: "q2", sensitivityTier: "restricted", originEgressClass: "cloud_origin", reviewState: "none", callerReadEgressClass: "local_trusted" });
+    assert.equal(second.review_state, "unreviewed", "re-capture must not clear the quarantine");
+  });
+
+  // --- Layer C write-guard (docs/45 §6.10): a cloud_bound caller may not mutate
+  //     an existing restricted row; it appears NOT_FOUND (no existence oracle).
+  //     local_trusted may; a standard row stays mutable by cloud_bound. Absent
+  //     caller egress fails closed (cloud_bound). ---
+  const notFound = (e) => e.name === "ThoughtStoreError" && e.kind === "not_found";
+
+  it("Layer C: cloud_bound cannot patch a restricted row (NOT_FOUND); local_trusted can", async () => {
+    const row = await cap({ dedupeKey: "lcp", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none" });
+    await assert.rejects(() => store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "x", callerReadEgressClass: "cloud_bound" }), notFound);
+    const ok = await store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "x", callerReadEgressClass: "local_trusted" });
+    assert.equal(ok.status, "x");
+  });
+
+  it("Layer C: cloud_bound CAN patch a standard row", async () => {
+    const row = await cap({ dedupeKey: "lcs" });
+    const ok = await store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "ok", callerReadEgressClass: "cloud_bound" });
+    assert.equal(ok.status, "ok");
+  });
+
+  it("Layer C: cloud_bound cannot soft-delete or restore a restricted row; local_trusted can", async () => {
+    const row = await cap({ dedupeKey: "lcd", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none" });
+    await assert.rejects(() => store.softDeleteThought({ brainId, thoughtId: row.id, actor: ACTOR, callerReadEgressClass: "cloud_bound" }), notFound);
+    await store.softDeleteThought({ brainId, thoughtId: row.id, actor: ACTOR, callerReadEgressClass: "local_trusted" });
+    await assert.rejects(() => store.restoreThought({ brainId, thoughtId: row.id, actor: ACTOR, callerReadEgressClass: "cloud_bound" }), notFound);
+    const r = await store.restoreThought({ brainId, thoughtId: row.id, actor: ACTOR, callerReadEgressClass: "local_trusted" });
+    assert.equal(r.outcome, "restored");
+  });
+
+  it("Layer C: absent/unknown caller egress fails closed (cannot mutate a restricted row)", async () => {
+    const row = await cap({ dedupeKey: "lcu", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none" });
+    await assert.rejects(() => store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "x" }), notFound);
+  });
+
+  // --- Layer C, capture-upsert path (docs/45 §6.10 / Codex v3 F1): a cloud_bound
+  //     caller may not upsert OVER an existing restricted row (its content must
+  //     not change). local_trusted may; a standard row stays re-capturable. ---
+  it("Layer C: cloud_bound cannot upsert-over an existing restricted row (content unchanged); local_trusted can", async () => {
+    const first = await cap({ dedupeKey: "uc1", content: "v1", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none", callerReadEgressClass: "local_trusted" });
+    assert.equal(first.sensitivity_tier, "restricted");
+    await assert.rejects(() => cap({ dedupeKey: "uc1", content: "hacked", callerReadEgressClass: "cloud_bound" }), notFound);
+    const check = await query("select content from thoughts where id = $1::uuid", [first.id]);
+    assert.equal(check.rows[0].content, "v1", "cloud_bound upsert must not mutate the restricted row");
+    const second = await cap({ dedupeKey: "uc1", content: "v2", callerReadEgressClass: "local_trusted" });
+    assert.equal(second.id, first.id);
+    assert.equal(second.content, "v2");
+  });
+
+  it("Layer C: cloud_bound CAN re-capture over a standard row", async () => {
+    const first = await cap({ dedupeKey: "uc2", content: "s1", callerReadEgressClass: "cloud_bound" });
+    const second = await cap({ dedupeKey: "uc2", content: "s2", callerReadEgressClass: "cloud_bound" });
+    assert.equal(second.id, first.id);
+    assert.equal(second.content, "s2");
+  });
+
+  // peekBrainEgressClass backs the capture preflight (review #5): a restricted
+  // capture into a non-private brain is rejected BEFORE the processors run.
+  it("peekBrainEgressClass returns the brain class (private_local fixture); null for a missing brain", async () => {
+    assert.equal(await store.peekBrainEgressClass({ brainId }), "private_local");
+    assert.equal(await store.peekBrainEgressClass({ brainId: "00000000-0000-4000-8000-000000000000" }), null);
+  });
+
+  // migration 018 (review #12): a brain cannot be opened to a cloud-readable
+  // class while it holds a restricted thought (a one-column declassification).
+  it("brain egress guard: cannot open a brain to public/repo while it holds a restricted thought", async () => {
+    await cap({ dedupeKey: "bd1", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none", callerReadEgressClass: "local_trusted" });
+    await assert.rejects(() => query("update brains set egress_class = 'public' where id = $1::uuid", [brainId]), /restricted/i);
+    await assert.rejects(() => query("update brains set egress_class = 'repo' where id = $1::uuid", [brainId]), /restricted/i);
+    const r = await query("select egress_class from brains where id = $1::uuid", [brainId]);
+    assert.equal(r.rows[0].egress_class, "private_local", "rejected update must not have changed the brain");
+  });
+
   // --- soft-delete / restore ---
   it("softDeleteThought sets deleted_at and writes exactly one delete audit row", async () => {
     const row = await capture({ content: "to delete", dedupeKey: "d1" });

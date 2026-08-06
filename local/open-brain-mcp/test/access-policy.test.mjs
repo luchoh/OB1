@@ -6,6 +6,8 @@ import {
   CALLER_KINDS,
   VERDICTS,
   DENY_REASONS,
+  BRAIN_EGRESS_CLASS,
+  CALLER_EGRESS_CLASS,
   isBrainUuid,
   authorizeAction,
   deriveScope,
@@ -434,6 +436,47 @@ test("planReadFanout: empty accessible set falls back to effective brain", () =>
   assert.deepEqual(out, [ref(BRAIN.ob1)]);
 });
 
+// Regression (found by live ob1_dev integration, enforce mode): when egress
+// strips every accessible brain for a cloud-bound caller, the empty-accessible
+// fallback must NOT re-inject the default/effective brain if that brain was the
+// thing egress excluded — otherwise the private_local default leaks through the
+// unscoped read planes (stats/search/list) that fan out via planReadFanout.
+// Suppression is ENFORCE-only.
+test("planReadFanout: under enforce, an egress-excluded effective brain is not used as fallback", () => {
+  const caller = { kind: CALLER_KINDS.SERVICE_KEY, principalId: "p-1", isAdmin: false };
+  const scope = { accessible: [], accessibleIds: new Set(), lookup: [], egressExcluded: [BRAIN.ob1] };
+  const out = planReadFanout({ caller, scope, explicitBrain: null, effectiveBrain: BRAIN.ob1, egressMode: "enforce" });
+  assert.deepEqual(out, [], "the egress-excluded default brain must not leak back into the fanout under enforce");
+});
+
+// Regression C1 (audit, found by adversarial review): OBSERVE must be a
+// behavioural no-op. egressExcluded is populated in observe (for logging) but
+// planReadFanout must NOT suppress on it — else explicit-brain reads to a
+// private_local brain return [] in the DEFAULT (observe) config. The off/observe
+// fanout must be byte-identical to pre-egress behaviour.
+test("planReadFanout: observe/off does NOT suppress an egress-excluded brain (no-op)", () => {
+  const caller = { kind: CALLER_KINDS.SERVICE_KEY, principalId: "p-1", isAdmin: false };
+  const scope = { accessible: [], accessibleIds: new Set(), lookup: [], egressExcluded: [BRAIN.ob1] };
+  // observe + explicit brain that is "would-be-excluded" → still returned
+  assert.deepEqual(
+    planReadFanout({ caller, scope, explicitBrain: BRAIN.ob1, effectiveBrain: BRAIN.ob1, egressMode: "observe" }),
+    [ref(BRAIN.ob1)],
+    "observe must not suppress an explicit brain",
+  );
+  // observe + empty-accessible fallback to a would-be-excluded brain → still returned
+  assert.deepEqual(
+    planReadFanout({ caller, scope, explicitBrain: null, effectiveBrain: BRAIN.ob1, egressMode: "observe" }),
+    [ref(BRAIN.ob1)],
+    "observe must not suppress the fallback brain",
+  );
+  // off (default) likewise
+  assert.deepEqual(
+    planReadFanout({ caller, scope, explicitBrain: BRAIN.ob1, effectiveBrain: BRAIN.ob1 }),
+    [ref(BRAIN.ob1)],
+    "off must not suppress",
+  );
+});
+
 test("planReadFanout: result does not alias scope.accessible (no shared mutable state)", () => {
   const caller = { kind: CALLER_KINDS.SERVICE_KEY, principalId: "p-1", isAdmin: false };
   const scope = { accessible: [BRAIN.ob1, BRAIN.common], accessibleIds: new Set(), lookup: [] };
@@ -533,4 +576,491 @@ test("deny reason vocabulary is the frozen contract the adapter switches on", ()
     authorizeAction({ caller: { kind: CALLER_KINDS.SERVICE_KEY, principalId: null, isAdmin: true }, action: ACTIONS.PURGE }).reason,
     DENY_REASONS.PURGE_REQUIRES_NAMED_ADMIN_SERVICE_KEY,
   );
+});
+
+// --------------------------------------------------------------------------
+// Layer-A egress enforcement (§6.13/§6.2/§9 — slice 3)
+// --------------------------------------------------------------------------
+
+// B1: enforce × cloud_bound caller × private_local brain (otherwise granted)
+// The brain must be ABSENT from accessible + accessibleIds, and PRESENT in egressExcluded.
+test("egress B1: enforce — cloud_bound caller, private_local brain → excluded from accessible, present in egressExcluded", () => {
+  const privateLocalBrain = {
+    brainId: "0b1e0000-0000-4000-8000-000000000010",
+    brainSlug: "priv-local",
+    estateId: EST_AGENT,
+    egressClass: BRAIN_EGRESS_CLASS.PRIVATE_LOCAL,
+  };
+  const caller = {
+    kind: CALLER_KINDS.SERVICE_KEY,
+    principalId: "p-cloud",
+    isAdmin: false,
+    homeEstateId: EST_AGENT,
+    readEgressClass: CALLER_EGRESS_CLASS.CLOUD_BOUND,
+  };
+  const scope = deriveScope({
+    caller,
+    brainMemberships: [{ brainId: privateLocalBrain.brainId, role: "viewer", isDeny: false }],
+    estateMemberships: [],
+    catalog: [privateLocalBrain],
+    egressMode: "enforce",
+  });
+
+  // Must NOT be accessible
+  assert.equal(scope.accessibleIds.has(privateLocalBrain.brainId), false,
+    "private_local brain must not be in accessibleIds for a cloud_bound caller under enforce");
+  assert.equal(scope.accessible.some((b) => b.brainId === privateLocalBrain.brainId), false,
+    "private_local brain must not be in accessible for a cloud_bound caller under enforce");
+
+  // Must be in egressExcluded
+  assert.ok(Array.isArray(scope.egressExcluded), "egressExcluded must be an array");
+  assert.equal(scope.egressExcluded.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "private_local brain must appear in egressExcluded");
+
+  // Must NOT be in lookup (spec: 'AND from lookup' — no existence leak)
+  assert.equal(scope.lookup.some((b) => b.brainId === privateLocalBrain.brainId), false,
+    "private_local brain must not be in lookup for a cloud_bound caller under enforce");
+});
+
+// B2: enforce × cloud_bound caller × quarantine_review brain
+// quarantine_review is LOCAL-ONLY; cloud-bound callers must have it excluded from
+// accessible, accessibleIds, AND lookup (no existence leak — must resolve NOT_FOUND).
+// Also covers the DENY-shadowed existence-leak bug: a quarantine_review brain that
+// has a brain-DENY row (landing only in lookup, not accessible) must also be stripped
+// from lookup so resolveSelector returns NOT_FOUND, not denied (existence leak).
+test("egress B2: enforce — cloud_bound caller, quarantine_review brain → excluded from accessible + lookup, present in egressExcluded", () => {
+  const quarantineBrain = {
+    brainId: "0b1e0000-0000-4000-8000-000000000020",
+    brainSlug: "quarantine-q",
+    estateId: EST_AGENT,
+    egressClass: BRAIN_EGRESS_CLASS.QUARANTINE_REVIEW,
+  };
+  const caller = {
+    kind: CALLER_KINDS.SERVICE_KEY,
+    principalId: "p-cloud",
+    isAdmin: false,
+    homeEstateId: EST_AGENT,
+    readEgressClass: CALLER_EGRESS_CLASS.CLOUD_BOUND,
+  };
+
+  // Case A: brain is granted (accessible path) — standard B2
+  const scopeA = deriveScope({
+    caller,
+    brainMemberships: [{ brainId: quarantineBrain.brainId, role: "viewer", isDeny: false }],
+    estateMemberships: [],
+    catalog: [quarantineBrain],
+    egressMode: "enforce",
+  });
+
+  assert.equal(scopeA.accessibleIds.has(quarantineBrain.brainId), false,
+    "quarantine_review brain must not be in accessibleIds for cloud_bound caller");
+  assert.equal(scopeA.accessible.some((b) => b.brainId === quarantineBrain.brainId), false,
+    "quarantine_review brain must not be in accessible for cloud_bound caller");
+  assert.equal(scopeA.lookup.some((b) => b.brainId === quarantineBrain.brainId), false,
+    "quarantine_review brain must not be in lookup for cloud_bound caller (no existence leak)");
+  assert.equal(scopeA.egressExcluded.some((b) => b.brainId === quarantineBrain.brainId), true,
+    "quarantine_review brain must appear in egressExcluded");
+
+  // resolveSelector must return NOT_FOUND (not denied) — no existence leak via slug
+  const slugVerdict = resolveSelector({ selector: quarantineBrain.brainSlug, scope: scopeA });
+  assert.equal(slugVerdict.kind, VERDICTS.NOT_FOUND,
+    "slug lookup of quarantine_review brain must be NOT_FOUND for cloud_bound (no existence leak)");
+
+  // Case B: DENY-shadowed quarantine_review brain (brain-DENY + estate grant → in lookup but not accessible)
+  // This is the high-severity existence-leak: without the fix, the brain stays in lookup and
+  // resolveSelector returns denied (existence leak). With the fix it must return NOT_FOUND.
+  const scopeB = deriveScope({
+    caller,
+    brainMemberships: [{ brainId: quarantineBrain.brainId, role: "viewer", isDeny: true }],
+    estateMemberships: [{ estateId: EST_AGENT, role: "member", isDeny: false }],
+    catalog: [quarantineBrain],
+    egressMode: "enforce",
+  });
+
+  assert.equal(scopeB.lookup.some((b) => b.brainId === quarantineBrain.brainId), false,
+    "DENY-shadowed quarantine_review brain must not be in lookup for cloud_bound caller (existence leak fix)");
+  assert.equal(scopeB.egressExcluded.some((b) => b.brainId === quarantineBrain.brainId), true,
+    "DENY-shadowed quarantine_review brain must appear in egressExcluded");
+
+  const denyShadowedSlugVerdict = resolveSelector({ selector: quarantineBrain.brainSlug, scope: scopeB });
+  assert.equal(denyShadowedSlugVerdict.kind, VERDICTS.NOT_FOUND,
+    "DENY-shadowed quarantine_review brain slug must resolve NOT_FOUND for cloud_bound (existence leak fix)");
+});
+
+// B4: enforce × local_trusted caller × private_local brain → KEPT in accessible
+// A local_trusted caller must never be restricted by egress enforcement.
+// private_local brains must remain fully accessible and nameable for them.
+test("egress B4: enforce — local_trusted caller, private_local brain → stays in accessible, egressExcluded empty", () => {
+  const privateLocalBrain = {
+    brainId: "0b1e0000-0000-4000-8000-000000000040",
+    brainSlug: "priv-local-trusted",
+    estateId: EST_AGENT,
+    egressClass: BRAIN_EGRESS_CLASS.PRIVATE_LOCAL,
+  };
+  const caller = {
+    kind: CALLER_KINDS.SERVICE_KEY,
+    principalId: "p-local",
+    isAdmin: false,
+    homeEstateId: EST_AGENT,
+    readEgressClass: CALLER_EGRESS_CLASS.LOCAL_TRUSTED,
+  };
+  const scope = deriveScope({
+    caller,
+    brainMemberships: [{ brainId: privateLocalBrain.brainId, role: "viewer", isDeny: false }],
+    estateMemberships: [],
+    catalog: [privateLocalBrain],
+    egressMode: "enforce",
+  });
+
+  // local_trusted caller: no exclusion — brain stays accessible
+  assert.equal(scope.accessible.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "private_local brain must remain in accessible for a local_trusted caller under enforce");
+  assert.equal(scope.accessibleIds.has(privateLocalBrain.brainId), true,
+    "private_local brain must remain in accessibleIds for a local_trusted caller under enforce");
+  assert.equal(scope.lookup.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "private_local brain must remain in lookup for a local_trusted caller under enforce");
+
+  // egressExcluded must be empty (no brain was excluded)
+  assert.ok(Array.isArray(scope.egressExcluded), "egressExcluded must be an array");
+  assert.equal(scope.egressExcluded.length, 0,
+    "egressExcluded must be empty for a local_trusted caller under enforce");
+
+  // resolveSelector must resolve the brain successfully
+  const verdict = resolveSelector({ selector: privateLocalBrain.brainSlug, scope });
+  assert.equal(verdict.kind, VERDICTS.RESOLVED,
+    "private_local brain slug must resolve RESOLVED for local_trusted caller under enforce");
+});
+
+// B5: enforce × absent/unknown caller readEgressClass → fail-closed (treated as cloud_bound) → excluded
+// The spec says: 'absent/unknown ⇒ cloud_bound' (fail-closed). A caller with NO readEgressClass
+// field must be treated as cloud_bound and have local-only brains excluded, not leaked.
+test("egress B5: enforce — absent caller readEgressClass → fail-closed as cloud_bound → private_local brain excluded", () => {
+  const privateLocalBrain = {
+    brainId: "0b1e0000-0000-4000-8000-000000000050",
+    brainSlug: "priv-absent-ec",
+    estateId: EST_AGENT,
+    egressClass: BRAIN_EGRESS_CLASS.PRIVATE_LOCAL,
+  };
+  // Caller with NO readEgressClass field at all (absent, not 'cloud_bound' nor 'local_trusted')
+  const caller = {
+    kind: CALLER_KINDS.SERVICE_KEY,
+    principalId: "p-unknown-ec",
+    isAdmin: false,
+    homeEstateId: EST_AGENT,
+    // readEgressClass deliberately omitted
+  };
+  const scope = deriveScope({
+    caller,
+    brainMemberships: [{ brainId: privateLocalBrain.brainId, role: "viewer", isDeny: false }],
+    estateMemberships: [],
+    catalog: [privateLocalBrain],
+    egressMode: "enforce",
+  });
+
+  // Absent readEgressClass → fail-closed → cloud_bound → brain excluded
+  assert.equal(scope.accessibleIds.has(privateLocalBrain.brainId), false,
+    "absent readEgressClass must fail-closed to cloud_bound: brain excluded from accessibleIds");
+  assert.equal(scope.accessible.some((b) => b.brainId === privateLocalBrain.brainId), false,
+    "absent readEgressClass must fail-closed to cloud_bound: brain excluded from accessible");
+  assert.equal(scope.lookup.some((b) => b.brainId === privateLocalBrain.brainId), false,
+    "absent readEgressClass must fail-closed to cloud_bound: brain excluded from lookup (no existence leak)");
+  assert.equal(scope.egressExcluded.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "absent readEgressClass must fail-closed to cloud_bound: brain present in egressExcluded");
+
+  // resolveSelector must return NOT_FOUND (not denied) — no existence leak
+  const slugVerdict = resolveSelector({ selector: privateLocalBrain.brainSlug, scope });
+  assert.equal(slugVerdict.kind, VERDICTS.NOT_FOUND,
+    "absent readEgressClass → fail-closed: slug must resolve NOT_FOUND (no existence leak)");
+});
+
+// B7: observe × cloud_bound caller × private_local brain → accessible/lookup UNCHANGED, egressExcluded reports it
+// egressMode='observe' must NOT filter accessible, accessibleIds, or lookup — only populate egressExcluded.
+test("egress B7: observe — cloud_bound caller, private_local brain → accessible/lookup unchanged, egressExcluded reports it", () => {
+  const privateLocalBrain = {
+    brainId: "0b1e0000-0000-4000-8000-000000000070",
+    brainSlug: "priv-observe",
+    estateId: EST_AGENT,
+    egressClass: BRAIN_EGRESS_CLASS.PRIVATE_LOCAL,
+  };
+  const caller = {
+    kind: CALLER_KINDS.SERVICE_KEY,
+    principalId: "p-cloud-obs",
+    isAdmin: false,
+    homeEstateId: EST_AGENT,
+    readEgressClass: CALLER_EGRESS_CLASS.CLOUD_BOUND,
+  };
+  const scope = deriveScope({
+    caller,
+    brainMemberships: [{ brainId: privateLocalBrain.brainId, role: "viewer", isDeny: false }],
+    estateMemberships: [],
+    catalog: [privateLocalBrain],
+    egressMode: "observe",
+  });
+
+  // accessible/accessibleIds/lookup must be UNCHANGED — brain still present
+  assert.equal(scope.accessible.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "observe mode must NOT remove the brain from accessible");
+  assert.equal(scope.accessibleIds.has(privateLocalBrain.brainId), true,
+    "observe mode must NOT remove the brain from accessibleIds");
+  assert.equal(scope.lookup.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "observe mode must NOT remove the brain from lookup");
+
+  // egressExcluded must report the brain that WOULD be excluded under enforce
+  assert.ok(Array.isArray(scope.egressExcluded), "egressExcluded must be an array");
+  assert.equal(scope.egressExcluded.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "observe mode must list the private_local brain in egressExcluded (for logging)");
+
+  // resolveSelector must still resolve the brain (observe mode — no actual filtering)
+  const verdict = resolveSelector({ selector: privateLocalBrain.brainSlug, scope });
+  assert.equal(verdict.kind, VERDICTS.RESOLVED,
+    "observe mode: slug must resolve RESOLVED (no filtering, brain still in scope)");
+});
+
+// B3: enforce × cloud_bound caller × repo brain and × public brain → kept in accessible
+// Cloud-readable egress classes (repo, public) must NOT be excluded, even in enforce mode.
+// This is the negative guard: enforce only strips local-only brains, not cloud-readable ones.
+test("egress B3: enforce — cloud_bound caller, repo and public brains → remain in accessible", () => {
+  const repoBrain = {
+    brainId: "0b1e0000-0000-4000-8000-000000000030",
+    brainSlug: "repo-brain",
+    estateId: EST_AGENT,
+    egressClass: BRAIN_EGRESS_CLASS.REPO,
+  };
+  const publicBrain = {
+    brainId: "0b1e0000-0000-4000-8000-000000000031",
+    brainSlug: "public-brain",
+    estateId: EST_AGENT,
+    egressClass: BRAIN_EGRESS_CLASS.PUBLIC,
+  };
+  const caller = {
+    kind: CALLER_KINDS.SERVICE_KEY,
+    principalId: "p-cloud",
+    isAdmin: false,
+    homeEstateId: EST_AGENT,
+    readEgressClass: CALLER_EGRESS_CLASS.CLOUD_BOUND,
+  };
+  const scope = deriveScope({
+    caller,
+    brainMemberships: [
+      { brainId: repoBrain.brainId, role: "viewer", isDeny: false },
+      { brainId: publicBrain.brainId, role: "viewer", isDeny: false },
+    ],
+    estateMemberships: [],
+    catalog: [repoBrain, publicBrain],
+    egressMode: "enforce",
+  });
+
+  // Both cloud-readable brains must stay in accessible
+  assert.equal(scope.accessible.some((b) => b.brainId === repoBrain.brainId), true,
+    "repo brain must remain in accessible for cloud_bound caller under enforce");
+  assert.equal(scope.accessible.some((b) => b.brainId === publicBrain.brainId), true,
+    "public brain must remain in accessible for cloud_bound caller under enforce");
+
+  // Both must stay in accessibleIds
+  assert.equal(scope.accessibleIds.has(repoBrain.brainId), true,
+    "repo brain must remain in accessibleIds for cloud_bound caller under enforce");
+  assert.equal(scope.accessibleIds.has(publicBrain.brainId), true,
+    "public brain must remain in accessibleIds for cloud_bound caller under enforce");
+
+  // Neither must appear in egressExcluded
+  assert.equal(scope.egressExcluded.some((b) => b.brainId === repoBrain.brainId), false,
+    "repo brain must NOT appear in egressExcluded");
+  assert.equal(scope.egressExcluded.some((b) => b.brainId === publicBrain.brainId), false,
+    "public brain must NOT appear in egressExcluded");
+
+  // Both must remain in lookup so resolveSelector can find them
+  assert.equal(scope.lookup.some((b) => b.brainId === repoBrain.brainId), true,
+    "repo brain must remain in lookup for cloud_bound caller under enforce");
+  assert.equal(scope.lookup.some((b) => b.brainId === publicBrain.brainId), true,
+    "public brain must remain in lookup for cloud_bound caller under enforce");
+
+  // resolveSelector must resolve both successfully
+  const repoVerdict = resolveSelector({ selector: repoBrain.brainSlug, scope });
+  assert.equal(repoVerdict.kind, VERDICTS.RESOLVED,
+    "repo brain slug must resolve RESOLVED for cloud_bound under enforce");
+  const publicVerdict = resolveSelector({ selector: publicBrain.brainSlug, scope });
+  assert.equal(publicVerdict.kind, VERDICTS.RESOLVED,
+    "public brain slug must resolve RESOLVED for cloud_bound under enforce");
+});
+
+// B6: enforce × cloud_bound caller × brain with absent/unknown egressClass → fail-closed (local-only) → excluded
+// Spec: 'An absent/unknown brain egressClass is treated as LOCAL-ONLY (FAIL-CLOSED).'
+// A cloud_bound caller querying a brain with NO egressClass field must have it excluded from
+// accessible, accessibleIds, AND lookup (no existence leak), and it must appear in egressExcluded.
+test("egress B6: enforce — cloud_bound caller, absent brain egressClass → fail-closed as local-only → excluded", () => {
+  // Brain with NO egressClass field (absent — not even undefined, just omitted)
+  const unknownEgressBrain = {
+    brainId: "0b1e0000-0000-4000-8000-000000000060",
+    brainSlug: "unknown-egress",
+    estateId: EST_AGENT,
+    // egressClass deliberately omitted — fail-closed must treat as local-only
+  };
+  const caller = {
+    kind: CALLER_KINDS.SERVICE_KEY,
+    principalId: "p-cloud",
+    isAdmin: false,
+    homeEstateId: EST_AGENT,
+    readEgressClass: CALLER_EGRESS_CLASS.CLOUD_BOUND,
+  };
+  const scope = deriveScope({
+    caller,
+    brainMemberships: [{ brainId: unknownEgressBrain.brainId, role: "viewer", isDeny: false }],
+    estateMemberships: [],
+    catalog: [unknownEgressBrain],
+    egressMode: "enforce",
+  });
+
+  // Absent egressClass → fail-closed → treated as local-only → excluded for cloud_bound
+  assert.equal(scope.accessibleIds.has(unknownEgressBrain.brainId), false,
+    "absent egressClass must fail-closed: brain excluded from accessibleIds for cloud_bound caller");
+  assert.equal(scope.accessible.some((b) => b.brainId === unknownEgressBrain.brainId), false,
+    "absent egressClass must fail-closed: brain excluded from accessible for cloud_bound caller");
+  assert.equal(scope.lookup.some((b) => b.brainId === unknownEgressBrain.brainId), false,
+    "absent egressClass must fail-closed: brain excluded from lookup for cloud_bound caller (no existence leak)");
+  assert.equal(scope.egressExcluded.some((b) => b.brainId === unknownEgressBrain.brainId), true,
+    "absent egressClass must fail-closed: brain present in egressExcluded");
+
+  // resolveSelector must return NOT_FOUND (not denied) — no existence leak via slug
+  const slugVerdict = resolveSelector({ selector: unknownEgressBrain.brainSlug, scope });
+  assert.equal(slugVerdict.kind, VERDICTS.NOT_FOUND,
+    "absent egressClass → fail-closed: slug must resolve NOT_FOUND for cloud_bound (no existence leak)");
+
+  // UUID + existsGlobally:true must also resolve NOT_FOUND — no existence leak via UUID
+  // (existsGlobally path must not reveal the brain if it was egress-excluded)
+  const uuidVerdict = resolveSelector({ selector: unknownEgressBrain.brainId, scope, existsGlobally: true });
+  assert.equal(uuidVerdict.kind, VERDICTS.NOT_FOUND,
+    "absent egressClass → fail-closed: UUID+existsGlobally must resolve NOT_FOUND for cloud_bound (no existence leak)");
+});
+
+// B8: off/absent egressMode → byte-identical back-compat for local-only brains.
+// With egressMode='off' (or param entirely absent), a private_local brain that would
+// be excluded under enforce must remain fully accessible; egressExcluded must be [].
+// This guarantees zero regression for callers that don't pass egressMode.
+test("egress B8: egressMode='off' — private_local brain remains accessible (byte-identical back-compat)", () => {
+  const privateLocalBrain = {
+    brainId: "0b1e0000-0000-4000-8000-000000000080",
+    brainSlug: "priv-off-mode",
+    estateId: EST_AGENT,
+    egressClass: BRAIN_EGRESS_CLASS.PRIVATE_LOCAL,
+  };
+  const caller = {
+    kind: CALLER_KINDS.SERVICE_KEY,
+    principalId: "p-cloud-off",
+    isAdmin: false,
+    homeEstateId: EST_AGENT,
+    readEgressClass: CALLER_EGRESS_CLASS.CLOUD_BOUND,
+  };
+
+  // Case A: egressMode explicitly 'off'
+  const scopeOff = deriveScope({
+    caller,
+    brainMemberships: [{ brainId: privateLocalBrain.brainId, role: "viewer", isDeny: false }],
+    estateMemberships: [],
+    catalog: [privateLocalBrain],
+    egressMode: "off",
+  });
+
+  assert.equal(scopeOff.accessible.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "egressMode='off': private_local brain must remain in accessible (no egress filter)");
+  assert.equal(scopeOff.accessibleIds.has(privateLocalBrain.brainId), true,
+    "egressMode='off': private_local brain must remain in accessibleIds");
+  assert.equal(scopeOff.lookup.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "egressMode='off': private_local brain must remain in lookup");
+  assert.ok(Array.isArray(scopeOff.egressExcluded),
+    "egressMode='off': egressExcluded must be an array");
+  assert.equal(scopeOff.egressExcluded.length, 0,
+    "egressMode='off': egressExcluded must be [] (no filtering)");
+
+  // Case B: egressMode param entirely absent
+  const scopeAbsent = deriveScope({
+    caller,
+    brainMemberships: [{ brainId: privateLocalBrain.brainId, role: "viewer", isDeny: false }],
+    estateMemberships: [],
+    catalog: [privateLocalBrain],
+    // egressMode deliberately omitted
+  });
+
+  assert.equal(scopeAbsent.accessible.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "absent egressMode: private_local brain must remain in accessible (no egress filter)");
+  assert.equal(scopeAbsent.accessibleIds.has(privateLocalBrain.brainId), true,
+    "absent egressMode: private_local brain must remain in accessibleIds");
+  assert.equal(scopeAbsent.lookup.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "absent egressMode: private_local brain must remain in lookup");
+  assert.ok(Array.isArray(scopeAbsent.egressExcluded),
+    "absent egressMode: egressExcluded must be an array");
+  assert.equal(scopeAbsent.egressExcluded.length, 0,
+    "absent egressMode: egressExcluded must be [] (no filtering)");
+
+  // resolveSelector must resolve the brain successfully in both cases
+  const verdictOff = resolveSelector({ selector: privateLocalBrain.brainSlug, scope: scopeOff });
+  assert.equal(verdictOff.kind, VERDICTS.RESOLVED,
+    "egressMode='off': slug must resolve RESOLVED (no egress filter)");
+
+  const verdictAbsent = resolveSelector({ selector: privateLocalBrain.brainSlug, scope: scopeAbsent });
+  assert.equal(verdictAbsent.kind, VERDICTS.RESOLVED,
+    "absent egressMode: slug must resolve RESOLVED (no egress filter)");
+});
+
+// B9: enforce × cloud_bound caller × DENY-shadowed private_local brain + UUID + existsGlobally:true
+// → resolveSelector must return NOT_FOUND (no existence leak via UUID path).
+//
+// Scenario: estate-member grant puts the brain in lookup (nameable); a brain-DENY row keeps it
+// out of accessible (not usable). Under egressMode='enforce' the egress loop iterates ALL lookup
+// entries (including DENY-shadowed ones) and adds local-only brains to egressExcluded + strips
+// them from lookup. When the adapter then calls resolveSelector with the UUID and existsGlobally:true
+// (the DB confirmed the UUID exists), the module must check egressExcluded BEFORE the existsGlobally
+// branch, so it returns NOT_FOUND instead of denied(NOT_AUTHORIZED) — which would leak existence.
+//
+// This is the composite gap: B1 tests private_local (non-DENY) but not UUID+existsGlobally;
+// B2 tests quarantine_review DENY-shadowed but not UUID+existsGlobally; B6 tests UUID+existsGlobally
+// but for absent egressClass only. B9 closes the private_local + DENY-shadowed + UUID path.
+test("egress B9: enforce — cloud_bound caller, DENY-shadowed private_local brain, UUID + existsGlobally:true → NOT_FOUND (no existence leak)", () => {
+  const privateLocalBrain = {
+    brainId: "0b1e0000-0000-4000-8000-0000000000b9",
+    brainSlug: "priv-deny-b9",
+    estateId: EST_AGENT,
+    egressClass: BRAIN_EGRESS_CLASS.PRIVATE_LOCAL,
+  };
+  const caller = {
+    kind: CALLER_KINDS.SERVICE_KEY,
+    principalId: "p-cloud-b9",
+    isAdmin: false,
+    homeEstateId: EST_AGENT,
+    readEgressClass: CALLER_EGRESS_CLASS.CLOUD_BOUND,
+  };
+
+  // DENY-shadowed: estate-member grant → isNameable=true (in lookup), brain-DENY → isAccessible=false.
+  // Under enforce the egress loop must still catch this brain (it iterates lookup, not accessible)
+  // and strip it from both lookup and egressExcluded-filter scope.
+  const scope = deriveScope({
+    caller,
+    brainMemberships: [{ brainId: privateLocalBrain.brainId, role: "owner", isDeny: true }],
+    estateMemberships: [{ estateId: EST_AGENT, role: "member", isDeny: false }],
+    catalog: [privateLocalBrain],
+    egressMode: "enforce",
+  });
+
+  // Brain must be stripped from lookup (no existence leak path via lookup/shadowed branch).
+  assert.equal(scope.lookup.some((b) => b.brainId === privateLocalBrain.brainId), false,
+    "DENY-shadowed private_local brain must not be in lookup for cloud_bound caller under enforce");
+
+  // Brain must be recorded in egressExcluded (audit trail).
+  assert.equal(scope.egressExcluded.some((b) => b.brainId === privateLocalBrain.brainId), true,
+    "DENY-shadowed private_local brain must appear in egressExcluded under enforce");
+
+  // Slug resolveSelector must return NOT_FOUND (brain stripped from lookup).
+  const slugVerdict = resolveSelector({ selector: privateLocalBrain.brainSlug, scope });
+  assert.equal(slugVerdict.kind, VERDICTS.NOT_FOUND,
+    "DENY-shadowed private_local brain slug must resolve NOT_FOUND for cloud_bound (no existence leak)");
+
+  // UUID + existsGlobally:true resolveSelector must also return NOT_FOUND.
+  // The egressExcluded check in resolveSelector must fire BEFORE the existsGlobally branch,
+  // preventing the 'denied(NOT_AUTHORIZED)' existence leak the adapter cannot filter.
+  const uuidVerdict = resolveSelector({
+    selector: privateLocalBrain.brainId,
+    scope,
+    existsGlobally: true,
+  });
+  assert.equal(uuidVerdict.kind, VERDICTS.NOT_FOUND,
+    "DENY-shadowed private_local brain UUID+existsGlobally must resolve NOT_FOUND for cloud_bound (no existence leak)");
 });
