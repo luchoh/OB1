@@ -3,7 +3,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
 import { HttpError, authorizeWrite, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
-import { deriveCaptureStamp, isLocalTrustedProcessor, CALLER_EGRESS_CLASS, effectiveEgress } from "./access-policy.mjs";
+import { deriveCaptureStamp, isLocalTrustedProcessor, CALLER_EGRESS_CLASS, CALLER_KINDS, effectiveEgress } from "./access-policy.mjs";
 import { config } from "./config.mjs";
 import { closePool, healthcheckDatabase, query } from "./db.mjs";
 import crypto from "node:crypto";
@@ -37,6 +37,9 @@ import {
   normalizeMetadata,
 } from "./models.mjs";
 import {
+  handleListBrains,
+  handleListKeys,
+  handleListPrincipals,
   handleMintAgentKey,
   handleMintRepoKey,
   handleRotateAgentKey,
@@ -219,6 +222,18 @@ const mintAgentKeySchema = {
 
 const rotateAgentKeySchema = {
   repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier whose caged-agent key should be revoked and replaced."),
+};
+
+// docs/adr/0004 (amendment 2026-08-07): the read side of minting. list_brains and
+// list_principals take NO arguments — the handlers implement no filters, and
+// declaring one here would be accepted and silently ignored, handing an auditor a
+// narrower answer than they asked for. Only the two filters handleListKeys
+// actually reads are declared, with the handler's own defaults.
+const listBrainsSchema = {};
+const listPrincipalsSchema = {};
+const listKeysSchema = {
+  include_inactive: z.boolean().optional().describe("Include revoked keys. Defaults to true — revoked keys are part of the audit trail."),
+  only_admin: z.boolean().optional().describe("Return only keys with is_admin=true. Defaults to false. Set true to answer 'does any stored admin key still exist' directly."),
 };
 
 function jsonToolResult(value) {
@@ -857,6 +872,235 @@ export async function handleStats(args, accessContext) {
   return stats;
 }
 
+// ---------------------------------------------------------------------------
+// whoami — credential self-description (docs/adr/0004-0007 rollout support)
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. Every OB1 client falls back to the shared admin key when its
+// scoped key is unset, so a MIS-PROVISIONED scoped key tests GREEN during the
+// rollout (the fallback silently carried the request) and only starts 401-ing
+// after the admin key is withdrawn — i.e. after the irreversible step. Until now
+// the only question a caller could ask was "does SOME key work?". whoami turns
+// that into "is this the key I THINK it is?", which is the check that actually
+// catches the masking: a repo agent that expects `repo-service:ob1` / editor on
+// `repo:ob1` and instead sees `auth_source: legacy_admin_key` (or an is_admin
+// stored key, or the wrong principal, or an empty brain list) fails loudly BEFORE
+// withdrawal rather than after it.
+//
+// WHY IT IS SAFE TO EXPOSE TO EVERY CALLER — the whole design is "a mirror, never
+// a window":
+//
+//  1. It reveals NO secret. It never touches the presented key, its hash, or any
+//     prefix of either: the only credential fields returned are the row's label,
+//     credential_type, timestamps and its surrogate primary key — none of which
+//     is derived from the secret, and all of which the holder chose or already
+//     knows. There is deliberately no branch anywhere below that reads a key
+//     column other than those.
+//  2. It describes ONLY the presenting credential. The credential lookup is keyed
+//     by `accessContext.accessKeyId` — the exact row that authenticated THIS
+//     request — and the principal lookup by `accessContext.principalId`. Neither
+//     takes an argument, so there is nothing to point at another key/principal;
+//     the tool takes no arguments at all, which is what makes that structural
+//     rather than a validation rule. It never enumerates keys or principals.
+//  3. It is not an existence oracle. The brain list is built from
+//     `scope.accessible` / `scope.egressExcluded`, i.e. brains this caller ALREADY
+//     resolves and reads today, and the egress-class lookup is filtered to exactly
+//     those ids. Nothing outside the caller's own scope is queried or named, so a
+//     caller learns nothing it could not learn by calling `stats` with no selector.
+//     (The legacy admin path has no derived scope; it reports an empty list and
+//     says so, rather than enumerating the whole estate.)
+//  4. It has no side effects and grants nothing: pure reads, no authorization
+//     decision is taken on its output, and the values it echoes are the same ones
+//     already governing every other call this credential makes.
+//  5. It is honest for degenerate callers instead of crashing. The legacy admin
+//     path has no principal (`principalId` null) and no accessible set
+//     (`accessibleBrains` undefined) — both are handled explicitly. And it is
+//     reachable by a BRAIN-LESS caller (the minter key, docs/53, holds no
+//     membership at all): a credential with no usable brain is precisely the case
+//     where you most need to ask what you are, so the tool must not require one.
+async function whoamiIdentity(accessContext) {
+  // The principal behind the presenting credential. Null for the bare legacy
+  // admin key, which has no principal row by construction (auth.mjs
+  // resolveLegacyAdminContext) — report that honestly rather than inventing one.
+  if (accessContext.principalId) {
+    const r = await query(
+      `select p.slug as principal_slug, p.principal_type, h.slug as estate_slug
+         from brain_principals p
+         left join households h on h.id = p.household_id
+        where p.id = $1::uuid`,
+      [accessContext.principalId],
+    );
+    const row = r.rows[0];
+    return {
+      principal: {
+        id: accessContext.principalId,
+        slug: row?.principal_slug ?? null,
+        principal_type: row?.principal_type ?? accessContext.principalType ?? null,
+      },
+      estate: { id: accessContext.householdId ?? null, slug: row?.estate_slug ?? null },
+    };
+  }
+
+  let estateSlug = null;
+  if (accessContext.householdId) {
+    const r = await query("select slug from households where id = $1::uuid", [accessContext.householdId]);
+    estateSlug = r.rows[0]?.slug ?? null;
+  }
+  return {
+    principal: null,
+    estate: { id: accessContext.householdId ?? null, slug: estateSlug },
+  };
+}
+
+// Label/type of the exact key row that authenticated this request. Null for a
+// human token and for the bare legacy key — neither is a stored credential.
+// NOTE the selected columns: label, credential_type, flags, timestamps. Never
+// key_hash, and never anything derived from it.
+async function whoamiCredential(accessContext) {
+  if (!accessContext.accessKeyId) {
+    return null;
+  }
+  const r = await query(
+    `select id, label, credential_type, is_active, created_at, last_used_at
+       from brain_access_keys where id = $1::uuid`,
+    [accessContext.accessKeyId],
+  );
+  const row = r.rows[0];
+  if (!row) {
+    return null;
+  }
+  return {
+    id: row.id,
+    label: row.label,
+    credential_type: row.credential_type,
+    is_active: row.is_active,
+    created_at: row.created_at,
+    last_used_at: row.last_used_at,
+  };
+}
+
+// How this credential reaches a given brain, from the membership rows the
+// request already fetched (accessContext._policy) — no extra queries, and the
+// same rows every authorization decision on this request is made from.
+function whoamiRoleForBrain(accessContext, brainId) {
+  const { caller, brainMembershipById, estateMembershipByEstate, brainEstateById } = accessContext._policy;
+  const brainMembership = brainMembershipById.get(brainId);
+  if (brainMembership && !brainMembership.isDeny) {
+    return { role: brainMembership.role, role_source: "brain_membership" };
+  }
+  const estateId = brainEstateById.get(brainId) ?? null;
+  const estateMembership = estateId ? estateMembershipByEstate.get(estateId) : null;
+  if (estateMembership && !estateMembership.isDeny) {
+    return { role: estateMembership.role, role_source: "estate_membership" };
+  }
+  // ADR-0003: a stored admin key reaches every brain in its home estate with no
+  // membership row at all. Name that reach explicitly so it cannot be mistaken
+  // for a provisioned membership during the rollout audit.
+  if (caller.isAdmin && estateId && estateId === caller.homeEstateId) {
+    return { role: null, role_source: "admin_estate_reach" };
+  }
+  return { role: null, role_source: null };
+}
+
+export async function handleWhoami(accessContext) {
+  const { caller, scope, egressMode } = accessContext._policy;
+
+  const [identity, credential] = await Promise.all([
+    whoamiIdentity(accessContext),
+    whoamiCredential(accessContext),
+  ]);
+
+  const accessible = scope.accessible ?? [];
+  const excluded = scope.egressExcluded ?? [];
+  // Egress class is an authorization input the context does not carry per-brain,
+  // so it needs one lookup — scoped to exactly the ids already in this caller's
+  // own scope, which is what keeps this from becoming an existence oracle.
+  const ids = [...new Set([...accessible, ...excluded].map((b) => b.brainId).filter(Boolean))];
+  const egressBySlugId = new Map();
+  if (ids.length > 0) {
+    const r = await query("select id, slug, egress_class from brains where id = any($1::uuid[])", [ids]);
+    for (const row of r.rows) {
+      egressBySlugId.set(row.id, { slug: row.slug, egressClass: row.egress_class ?? null });
+    }
+  }
+
+  const describeBrain = async (b, { egressExcluded }) => {
+    const meta = egressBySlugId.get(b.brainId);
+    const { role, role_source } = whoamiRoleForBrain(accessContext, b.brainId);
+    // The single most rollout-relevant fact ("can this key actually WRITE to
+    // repo:x?"), taken from the real ladder rather than re-derived here.
+    let canWrite = false;
+    try {
+      await authorizeWrite(accessContext, b.brainId);
+      canWrite = true;
+    } catch (error) {
+      if (!(error instanceof HttpError)) {
+        throw error;
+      }
+    }
+    return {
+      brain_id: b.brainId,
+      slug: b.brainSlug ?? meta?.slug ?? null,
+      role,
+      role_source,
+      egress_class: meta?.egressClass ?? null,
+      can_write: canWrite,
+      ...(egressExcluded ? { egress_excluded: true } : {}),
+    };
+  };
+
+  // The legacy admin path derives no scope, so auth.mjs leaves its default brain
+  // un-named (effectiveBrainSlug null) when no selector was given. "You default
+  // to <uuid>" is useless for a rollout check, so name the caller's OWN default
+  // brain — never anything else.
+  let effectiveBrainSlug = accessContext.effectiveBrainSlug ?? null;
+  if (accessContext.effectiveBrainId && !effectiveBrainSlug) {
+    const r = await query("select slug from brains where id = $1::uuid", [accessContext.effectiveBrainId]);
+    effectiveBrainSlug = r.rows[0]?.slug ?? null;
+  }
+
+  const brains = await Promise.all(accessible.map((b) => describeBrain(b, { egressExcluded: false })));
+  // Brains this credential HAS a membership on but cannot use because the caller
+  // is cloud-bound and the brain is local-only (docs/45 §6.13). Reported so a
+  // "my key sees nothing" report is diagnosable; these are the caller's own
+  // memberships, so naming them leaks nothing it did not already grant.
+  const egressExcludedBrains = egressMode === "enforce"
+    ? await Promise.all(excluded.map((b) => describeBrain(b, { egressExcluded: true })))
+    : [];
+
+  brains.sort((a, b) => String(a.slug).localeCompare(String(b.slug)));
+  egressExcludedBrains.sort((a, b) => String(a.slug).localeCompare(String(b.slug)));
+
+  return {
+    success: true,
+    auth_source: accessContext.authSource,
+    principal: identity.principal,
+    estate: identity.estate,
+    credential,
+    is_admin: Boolean(accessContext.isAdmin),
+    // docs/53: the minting capability, defaulted false for every caller shape
+    // that does not explicitly carry it (incl. the legacy admin secret).
+    can_mint_repo_keys: Boolean(caller.canMintRepoKeys),
+    // The EFFECTIVE class auth.mjs resolved (fail-closed to cloud_bound), not the
+    // raw column — that is the value every read decision on this request uses.
+    read_egress_class: caller.readEgressClass ?? null,
+    egress_mode: egressMode ?? "off",
+    effective_brain: {
+      brain_id: accessContext.effectiveBrainId ?? null,
+      slug: effectiveBrainSlug,
+    },
+    // Membership-derived reach. The legacy admin key derives no scope at all
+    // (it resolves brains globally, per request), so it reports an empty list
+    // and says so rather than enumerating every brain in the database.
+    reach: caller.kind === CALLER_KINDS.LEGACY_ADMIN_KEY
+      ? "global_unscoped_legacy_admin"
+      : "membership_derived",
+    brain_count: brains.length,
+    brains,
+    egress_excluded_brains: egressExcludedBrains,
+  };
+}
+
 function ensureGraphAdmin(accessContext) {
   if (!accessContext.isAdmin) {
     throw new HttpError(403, "Graph endpoints are disabled for non-admin multitenant requests");
@@ -1157,6 +1401,24 @@ function buildMcpServer(accessContext) {
     },
   );
 
+  // Ungated on purpose — see the safety argument on handleWhoami. It is a
+  // mirror, not a window: no arguments, describes only the presenting
+  // credential, reveals no secret material, and names no brain the caller
+  // cannot already resolve. Every caller shape may ask it, including a
+  // brain-less minter key and the legacy admin path.
+  server.tool(
+    "whoami",
+    "Describe the credential presenting this request: which auth path resolved it, its principal and estate, whether it is admin, its egress class, and the full list of brains it can reach with role and egress class. Takes no arguments and never returns key material. Use it to verify a scoped key is the key you think it is — a green call from some other tool only proves SOME credential worked.",
+    {},
+    async () => {
+      try {
+        return jsonToolResult(await handleWhoami(accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
   // docs/53: minting tools. Gated server-side by the can_mint_repo_keys
   // capability, which only the operator-provisioned minter key holds — every
   // other caller, including the legacy admin secret, gets a 403 from the handler.
@@ -1219,6 +1481,52 @@ function buildMcpServer(accessContext) {
     },
   );
 
+  // Read-side inventory tools. Same gate as the mint tools — they require the
+  // can_mint_repo_keys capability, so only the operator-provisioned minter key
+  // can call them; every other caller, the legacy admin secret included, gets a
+  // 403 from the handler. These are OPERATOR tools, not agent tools: they exist so
+  // a key rollout is auditable and idempotent (docs/adr/0004 amendment) rather
+  // than inferred from create-only 409s, and so a stray active admin key can be
+  // found without hand-written SQL. No key material is ever returned.
+  server.tool(
+    "list_brains",
+    "OPERATOR TOOL, NOT AN AGENT TOOL. Requires the can_mint_repo_keys capability; every other caller gets 403. Enumerates the minter household's brains — slug, id, kind, egress class, shared/shared-agent flags, thought counts, and how many live keys REACH each brain by principal membership. Use it to confirm a repo brain exists before or after minting, and to spot a brain more credentials can reach than intended. Takes no arguments and returns no key material.",
+    listBrainsSchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleListBrains(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "list_principals",
+    "OPERATOR TOOL, NOT AN AGENT TOOL. Requires the can_mint_repo_keys capability; every other caller gets 403. Enumerates the household's principals with their brain memberships and roles — the reach a key actually grants, since a key inherits its PRINCIPAL's memberships (ADR-0003). Use it to confirm 'repo-service:<slug>' and 'pi-common:<slug>' were provisioned with the intended membership set. Takes no arguments and returns no key material.",
+    listPrincipalsSchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleListPrincipals(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "list_keys",
+    "OPERATOR TOOL, NOT AN AGENT TOOL. Requires the can_mint_repo_keys capability; every other caller gets 403. Enumerates stored access keys as METADATA ONLY — principal, default brain, label, type, admin flag, created/revoked timestamps. Never returns a key value, prefix or hash, so it cannot answer 'is this my key'; it answers 'which keys exist, and is any admin key still active'. include_inactive defaults to true (revoked keys are audit trail); only_admin=true answers the withdrawal question directly.",
+    listKeysSchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleListKeys(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
   return server;
 }
 
@@ -1267,6 +1575,23 @@ app.get("/health", async (c) => {
       },
       503,
     );
+  }
+});
+
+// GET because it is a pure, side-effect-free read of the caller's own identity
+// and takes no body — the same `app.get` registration `/` and `/health` already
+// use, with the authenticate-then-handle + errorMessage/errorStatus shape every
+// authenticated route uses. Authenticated like everything else (`x-access-key`
+// header / `Authorization: Bearer`), so an unauthenticated probe still gets 401
+// and learns nothing. Reachable from a shell during rollout, which is the point:
+// the check must be runnable against a key BEFORE that key is wired into a
+// client's MCP config.
+app.get("/whoami", async (c) => {
+  try {
+    const accessContext = await resolveAccessContext(c);
+    return c.json(await handleWhoami(accessContext));
+  } catch (error) {
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
   }
 });
 

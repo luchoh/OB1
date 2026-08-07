@@ -1,10 +1,12 @@
 import crypto from "node:crypto";
-import { pool } from "./db.mjs";
+import { pool, query } from "./db.mjs";
 import { HttpError, hashAccessKey } from "./auth.mjs";
 
 // repo-key-minting.mjs — the handlers behind the `mint_repo_key` /
-// `rotate_repo_key` tools (docs/53) and the `mint_agent_key` /
-// `rotate_agent_key` tools that provision the caged agent.
+// `rotate_repo_key` tools (docs/53), the `mint_agent_key` / `rotate_agent_key`
+// tools that provision the caged agent, and the read-only `list_brains` /
+// `list_principals` / `list_keys` enumeration tools that make the resulting
+// estate auditable (see the ENUMERATION section at the foot of this file).
 //
 // PURPOSE: let system-config provision a per-repo brain + a cloud_bound repo key
 // for each interactive harness, so no harness needs the shared MCP_ACCESS_KEY
@@ -720,6 +722,379 @@ export async function handleRotateAgentKey(args, accessContext) {
   }
 }
 
+// ===========================================================================
+// ENUMERATION — list_brains / list_principals / list_keys
+// ===========================================================================
+//
+// WHY THESE EXIST. Withdrawing the shared admin key (docs/adr/0004) is
+// irreversible in practice, and until now the estate was write-only through
+// tooling: you could mint, but you could not ASK what exists. That produced two
+// concrete failure modes the operator hit:
+//
+//   A) Every OB1 client falls back to MCP_ACCESS_KEY when its scoped key is
+//      unset, so a MIS-PROVISIONED scoped key tests GREEN during rollout (it
+//      silently used the admin fallback) and only 401s after the admin key is
+//      withdrawn. The only question answerable today is "does some key work?",
+//      never "is this the key I think it is?". list_keys makes the estate's
+//      credential inventory checkable BEFORE the irreversible step.
+//   B) Rollout was neither auditable nor idempotent: a create-only 409 cannot
+//      distinguish "already done" from "half-done", and finding a stray active
+//      admin key needed hand-written SQL against the live database. The orphan
+//      bootstrap-admin key that sat in the database from March until 2026-06-13
+//      is exactly what list_keys is built to surface.
+//
+// GATED ON THE MINTING CAPABILITY, deliberately the SAME gate as mint/rotate
+// (requireMintCapability / brain_access_keys.can_mint_repo_keys). The minter is
+// the operator-held provisioning credential; taking inventory of what it
+// provisions is precisely its job. No agent key carries can_mint_repo_keys, so
+// no agent gains estate visibility from this. It is not gated on is_admin
+// because after ADR-0004 no agent-reachable admin exists, and pinning
+// enumeration to admin would make it unusable exactly when it is needed.
+//
+// SCOPED TO THE MINTER HOUSEHOLD, confined exactly like the mint handlers
+// (mintingHouseholdId). Cross-estate enumeration is not this credential's
+// business. The one deliberate exception is directional, not enumerative: reach
+// COUNTS in list_brains and foreign membership rows in list_principals count/name
+// brains-and-keys pointing INTO this household from elsewhere, because "who can
+// reach my brains" is unanswerable otherwise — and a leaked foreign key reaching
+// in is the exact hazard this tool exists to find. No foreign key's label,
+// principal or estate is ever enumerated.
+//
+// NEVER key_hash — not the value, not a prefix, not a length. auth.mjs
+// authenticates by looking up sha256(presented key) in brain_access_keys.key_hash
+// (unique index brain_access_keys_key_hash_idx): the stored hash IS the
+// authenticator for these keys, not a mere fingerprint of it. Anything holding
+// the hash can be granted... nothing, but anything that can WRITE it can mint a
+// key of its choosing, and any prefix shrinks the offline search for the
+// plaintext. So the column is never selected here at all — not selected-then-
+// dropped, so no future refactor can leak it by widening a returned object.
+//
+// READ-ONLY, AND DELIBERATELY WITHOUT A TRANSACTION. Each handler issues exactly
+// ONE statement, and a single statement in READ COMMITTED already runs against
+// one consistent snapshot, so a BEGIN/COMMIT would buy no extra atomicity — only
+// an open transaction held across the network round trip. The mint handlers need
+// a transaction because they do check-then-write across statements; these do not
+// write at all, so they use the pooled `query` helper rather than checking out a
+// client.
+
+// Optional boolean tool arguments. Strict rather than truthy: `include_inactive:
+// "false"` must not silently mean true and hide exactly the rows the operator is
+// hunting for. The zod schema in server.mjs guards the tool call; this guards
+// every other caller.
+function optionalBoolean(value, fallback, name) {
+  if (value === undefined || value === null) {
+    return fallback;
+  }
+  if (typeof value !== "boolean") {
+    throw new HttpError(400, `${name} must be a boolean`);
+  }
+  return value;
+}
+
+// Shared by all three handlers: same capability gate, same household confinement,
+// in that order — the 403 for a non-minter must not depend on whether the caller
+// happens to be homed in an estate.
+function enumerationHouseholdId(accessContext) {
+  requireMintCapability(accessContext);
+  return mintingHouseholdId(accessContext);
+}
+
+// list_brains — every brain in the minter household, with the two numbers that
+// say whether it matters: how much is in it, and how many live credentials can
+// get at it.
+//
+// REACH, not brain_id. A key's brain_id is a default-brain hint, never a clamp
+// (ADR-0003); reach comes from the PRINCIPAL's memberships. The three arms below
+// mirror auth.mjs fetchBrainCatalog exactly — brain membership (non-deny),
+// non-deny estate membership, or admin-in-home-estate — so this count means the
+// same thing the authorizer means. Counting k.brain_id instead would have
+// reported 0 reachable keys for a brain that half the estate can write to.
+//
+// The legacy MCP_ACCESS_KEY admin path is NOT counted and cannot be: it is a
+// config value with no row in this database (auth.mjs `key === config.accessKey`).
+// While that branch is reachable, every brain here is reachable by one more
+// credential than the count says. That is the whole point of ADR-0004.
+export async function handleListBrains(args, accessContext) {
+  const householdId = enumerationHouseholdId(accessContext);
+
+  // Shape note: the reach set is materialised as an explicit (brain, key) join in
+  // `reach` and only then aggregated, rather than as a correlated
+  // `cross join lateral (select count(*) ... where ... b.id ...)` per brain. The
+  // lateral spelling was written first and REJECTED because it returned
+  // plan-dependent WRONG counts on PostgreSQL 16.10: with the outer `brains` row
+  // referenced only from inside the EXISTS subqueries (two levels down), some
+  // plans counted keys that reach a different brain — reproducibly 2 instead of 1
+  // for a brain reachable by exactly one key, and flipping between runs of the
+  // same fixture as the row layout changed. An audit tool that undercounts or
+  // overcounts who can reach a brain is worse than no audit tool, so the
+  // correlation is kept one level deep where it demonstrably holds.
+  const result = await query(
+    `with household_brains as (
+       select id, household_id from brains where household_id = $1::uuid
+     ),
+     reach as (
+       select hb.id as brain_id, k.is_admin, p.household_id as principal_household_id
+       from household_brains hb
+       join brain_access_keys k on k.is_active = true
+       join brain_principals p on p.id = k.principal_id
+       -- A brain-level DENY vetoes every grant arm, including admin home-reach.
+       -- The authorizer is: NOT hasDenyBrain AND (grant OR adminHomeReach OR
+       -- estateOk), access-policy.mjs:300. Without the veto this CTE reports reach the read
+       -- path would refuse — and a tool whose whole purpose is answering "who can
+       -- reach this brain" is worse than useless if it over-reports.
+       where not exists (
+           select 1 from brain_memberships bd
+           where bd.principal_id = p.id and bd.brain_id = hb.id and bd.is_deny = true
+         )
+         and (
+           exists (
+             select 1 from brain_memberships bm
+             where bm.principal_id = p.id and bm.brain_id = hb.id and bm.is_deny = false
+           )
+           or exists (
+             select 1 from estate_memberships em
+             where em.principal_id = p.id and em.estate_id = hb.household_id and em.is_deny = false
+           )
+           or (k.is_admin and p.household_id = hb.household_id)
+         )
+     ),
+     reach_counts as (
+       select
+         brain_id,
+         count(*)::int as active_key_count,
+         count(*) filter (where is_admin)::int as active_admin_key_count,
+         count(*) filter (where principal_household_id <> $1::uuid)::int as external_principal_key_count
+       from reach
+       group by brain_id
+     ),
+     thought_counts as (
+       select t.brain_id,
+              count(*) filter (where t.deleted_at is null)::int as thought_count,
+              count(*) filter (where t.deleted_at is not null)::int as deleted_thought_count
+       from thoughts t
+       join household_brains hb on hb.id = t.brain_id
+       group by t.brain_id
+     )
+     select
+       b.id,
+       b.slug,
+       b.display_name,
+       b.kind,
+       b.egress_class,
+       b.is_default_shared,
+       b.is_shared_agent_brain,
+       b.created_at,
+       coalesce(tc.thought_count, 0) as thought_count,
+       coalesce(tc.deleted_thought_count, 0) as deleted_thought_count,
+       coalesce(rc.active_key_count, 0) as active_key_count,
+       coalesce(rc.active_admin_key_count, 0) as active_admin_key_count,
+       coalesce(rc.external_principal_key_count, 0) as external_principal_key_count
+     from brains b
+     left join reach_counts rc on rc.brain_id = b.id
+     left join thought_counts tc on tc.brain_id = b.id
+     where b.household_id = $1::uuid
+     order by b.slug asc`,
+    [householdId],
+  );
+
+  return {
+    household_id: householdId,
+    brain_count: result.rowCount,
+    brains: result.rows.map((row) => ({
+      brain_id: row.id,
+      slug: row.slug,
+      display_name: row.display_name,
+      kind: row.kind,
+      egress_class: row.egress_class,
+      is_default_shared: row.is_default_shared,
+      is_shared_agent_brain: row.is_shared_agent_brain,
+      thought_count: row.thought_count,
+      deleted_thought_count: row.deleted_thought_count,
+      active_key_count: row.active_key_count,
+      active_admin_key_count: row.active_admin_key_count,
+      // Live keys reaching this brain whose principal is homed in ANOTHER estate.
+      // Non-zero is not automatically wrong (ADR-0003 allows granted cross-estate
+      // reach) but it is always worth a second look, so it gets its own number
+      // rather than hiding inside active_key_count.
+      external_principal_key_count: row.external_principal_key_count,
+      created_at: row.created_at,
+    })),
+    note: "Key counts are by PRINCIPAL REACH (memberships/estate/admin), not by the key's default-brain hint. The legacy MCP_ACCESS_KEY admin path has no database row and is not counted.",
+  };
+}
+
+// list_principals — who exists, and what each one can reach. This is the table
+// that makes "is this the key I think it is?" answerable: a scoped key is only as
+// narrow as its principal's membership set, so a repo-service principal showing
+// two brains is a mis-provision even though its key looks perfect.
+//
+// Deny rows are shown, not filtered: an operator who denied a membership by hand
+// needs to see it is still there, and grantEditorMemberships deliberately does
+// not overwrite it.
+export async function handleListPrincipals(args, accessContext) {
+  const householdId = enumerationHouseholdId(accessContext);
+
+  const result = await query(
+    `select
+       p.id,
+       p.slug,
+       p.display_name,
+       p.principal_type,
+       p.created_at,
+       db.slug as default_brain_slug,
+       p.default_brain_id,
+       (select count(*)::int from brain_access_keys k
+         where k.principal_id = p.id and k.is_active = true) as active_key_count,
+       (select count(*)::int from brain_access_keys k
+         where k.principal_id = p.id and k.is_active = false) as inactive_key_count,
+       coalesce(
+         (select json_agg(json_build_object(
+             'brain_id', mb.id,
+             'brain_slug', mb.slug,
+             'role', m.role,
+             'is_deny', m.is_deny,
+             'egress_class', mb.egress_class,
+             'in_household', mb.household_id = p.household_id
+           ) order by mb.slug asc)
+          from brain_memberships m
+          join brains mb on mb.id = m.brain_id
+          where m.principal_id = p.id),
+         '[]'::json
+       ) as memberships,
+       coalesce(
+         (select json_agg(json_build_object('estate_id', em.estate_id, 'role', em.role, 'is_deny', em.is_deny)
+                          order by em.estate_id)
+          from estate_memberships em
+          where em.principal_id = p.id),
+         '[]'::json
+       ) as estate_memberships
+     from brain_principals p
+     left join brains db on db.id = p.default_brain_id
+     where p.household_id = $1::uuid
+     order by p.principal_type asc, p.slug asc`,
+    [householdId],
+  );
+
+  return {
+    household_id: householdId,
+    principal_count: result.rowCount,
+    principals: result.rows.map((row) => ({
+      principal_id: row.id,
+      slug: row.slug,
+      display_name: row.display_name,
+      principal_type: row.principal_type,
+      default_brain_id: row.default_brain_id,
+      default_brain_slug: row.default_brain_slug,
+      active_key_count: row.active_key_count,
+      inactive_key_count: row.inactive_key_count,
+      // A principal's reach IS this list (auth.mjs fetchBrainMemberships), plus
+      // any estate membership below. `in_household: false` is reach granted into
+      // another estate (ADR-0003).
+      memberships: row.memberships,
+      // Estate membership grants every brain in that estate at once, so a
+      // principal with an empty `memberships` list is not necessarily narrow.
+      estate_memberships: row.estate_memberships,
+    })),
+  };
+}
+
+// list_keys — the credential inventory, and the answer to the question the
+// operator actually has: "is there a stray ACTIVE admin key anywhere in this
+// estate?"
+//
+// Inactive keys are INCLUDED by default and marked, because "there is no admin
+// key" and "the admin key was revoked on 2026-06-13" are different facts and only
+// the second one is evidence. is_admin / can_mint_repo_keys lead every row and are
+// summarised at the top level, so a stray does not have to be spotted by eye in a
+// long list.
+//
+// key_hash is NEVER selected (see the section header): the stored hash is the
+// authenticator, so exposing it — or any prefix of it — is equivalent to exposing
+// the key.
+export async function handleListKeys(args, accessContext) {
+  const householdId = enumerationHouseholdId(accessContext);
+  const includeInactive = optionalBoolean(args?.include_inactive, true, "include_inactive");
+  const onlyAdmin = optionalBoolean(args?.only_admin, false, "only_admin");
+
+  // Scoped to principals homed in the minter household. A foreign principal's key
+  // reaching into these brains is reported as a COUNT by list_brains
+  // (external_principal_key_count) rather than enumerated here — naming another
+  // estate's credentials is not this key's business.
+  const result = await query(
+    `select
+       k.id,
+       k.label,
+       k.credential_type,
+       k.is_admin,
+       k.can_mint_repo_keys,
+       k.read_egress_class,
+       k.is_active,
+       k.created_at,
+       k.last_used_at,
+       k.principal_id,
+       p.slug as principal_slug,
+       p.principal_type,
+       k.brain_id,
+       b.slug as brain_slug
+     from brain_access_keys k
+     join brain_principals p on p.id = k.principal_id
+     left join brains b on b.id = k.brain_id
+     where p.household_id = $1::uuid
+       and ($2::boolean or k.is_active = true)
+       and ($3::boolean = false or k.is_admin = true)
+     order by k.is_admin desc, k.can_mint_repo_keys desc, k.is_active desc,
+              p.slug asc, k.created_at asc`,
+    [householdId, includeInactive, onlyAdmin],
+  );
+
+  const keys = result.rows.map((row) => ({
+    key_id: row.id,
+    // Privilege first: these three are what makes a key dangerous.
+    is_admin: row.is_admin,
+    can_mint_repo_keys: row.can_mint_repo_keys,
+    is_active: row.is_active,
+    label: row.label,
+    credential_type: row.credential_type,
+    // null => cloud_bound (fail-closed, docs/45 §6.2). Surfaced raw, not
+    // defaulted, so an explicitly local_trusted key is distinguishable from an
+    // unset one.
+    read_egress_class: row.read_egress_class,
+    principal_id: row.principal_id,
+    principal_slug: row.principal_slug,
+    principal_type: row.principal_type,
+    // The key's default-brain HINT (ADR-0003), not a clamp: reach comes from the
+    // principal, which list_principals shows.
+    bound_brain_id: row.brain_id,
+    bound_brain_slug: row.brain_slug,
+    created_at: row.created_at,
+    last_used_at: row.last_used_at,
+  }));
+
+  const activeAdminKeys = keys.filter((k) => k.is_admin && k.is_active);
+  const activeMinterKeys = keys.filter((k) => k.can_mint_repo_keys && k.is_active);
+
+  return {
+    household_id: householdId,
+    include_inactive: includeInactive,
+    only_admin: onlyAdmin,
+    key_count: keys.length,
+    active_key_count: keys.filter((k) => k.is_active).length,
+    // The headline. Non-zero here after ADR-0004 withdrawal means the withdrawal
+    // is not done, whatever the env files say.
+    active_admin_key_count: activeAdminKeys.length,
+    active_admin_keys: activeAdminKeys.map((k) => ({
+      key_id: k.key_id,
+      label: k.label,
+      principal_slug: k.principal_slug,
+      created_at: k.created_at,
+      last_used_at: k.last_used_at,
+    })),
+    active_minting_key_count: activeMinterKeys.length,
+    keys,
+    note: "Key hashes are never returned: the stored hash is the authenticator, so exposing it (or a prefix) is equivalent to exposing the key. Scoped to principals homed in this household; a legacy MCP_ACCESS_KEY admin has no row here at all.",
+  };
+}
+
 // Exported for unit tests: the pure validation surface, without a DB.
 export const __testables = {
   REPO_SLUG_PATTERN,
@@ -737,4 +1112,6 @@ export const __testables = {
   assertManagedPrincipalType,
   assertManagedCredentialType,
   assertIsRepoBrain,
+  optionalBoolean,
+  enumerationHouseholdId,
 };
