@@ -1188,13 +1188,14 @@ function buildMcpServer(accessContext) {
     },
   );
 
-  // An agent key is STRICTLY MORE REACH than a repo key: same repo brain, plus
-  // write access to the shared agent brain that spans every repo. It exists for
-  // the caged agent, which is injection-exposed, so the extra reach is stated in
-  // the tool description rather than left for an operator to infer from the name.
+  // An agent key is not a wider repo key: it is a SECOND, DISJOINT credential for
+  // the caged agent (docs/adr/0006), reaching the shared cross-repo brain and no
+  // repo brain at all. pi does repo work with the repo key, exactly like claude and
+  // codex. Both facts go in the description rather than being left for an operator
+  // to infer from the name.
   server.tool(
     "mint_agent_key",
-    "Issue a caged-agent access key for a repo whose brain already exists (run mint_repo_key first). WIDER THAN mint_repo_key: the key's own principal is a member of BOTH the repo brain and the shared cross-repo agent brain, so what it writes is readable from every other repo. Create-only; returns the key once.",
+    "Issue the caged agent (pi) its per-repo COMMON key, a second credential alongside the repo key. Its principal 'pi-common:<repo_slug>' is an editor on the estate's ONE shared cross-repo agent brain and on NOTHING else — it does not reach the repo brain, so pi still presents the repo key from mint_repo_key for repo work. Anything written with it is readable from every other repo. The repo brain must already exist (typo guard) and the estate must have a brain marked is_shared_agent_brain. Create-only; returns the key once.",
     mintAgentKeySchema,
     async (args) => {
       try {
@@ -1207,7 +1208,7 @@ function buildMcpServer(accessContext) {
 
   server.tool(
     "rotate_agent_key",
-    "Revoke every active caged-agent key for a repo and issue a replacement with the same two-brain reach (repo brain + shared agent brain). Returns the new key once. Does not touch the repo key issued by mint_repo_key.",
+    "Revoke every active caged-agent COMMON key for a repo and issue a replacement with the same single-brain reach: editor on the estate's shared cross-repo agent brain, and no repo brain. Returns the new key once. Does not touch the repo key issued by mint_repo_key — pi presents that one too, so revoking it would cut off claude and codex as well.",
     rotateAgentKeySchema,
     async (args) => {
       try {
