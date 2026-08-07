@@ -74,7 +74,18 @@ DEFAULT_STATE_PATH = Path(os.environ.get("TELEGRAM_BRIDGE_STATE_FILE") or (INTEG
 DEFAULT_REVIEW_STATE_PATH = default_review_state_path(INTEGRATION_DIR / "telegram-review-state.json")
 
 DEFAULT_OPEN_BRAIN_BASE = (os.environ.get("OPEN_BRAIN_BASE_URL") or f"http://127.0.0.1:{os.environ.get('OPEN_BRAIN_PORT', '8787')}").rstrip("/")
-DEFAULT_OPEN_BRAIN_ACCESS_KEY = os.environ.get("MCP_ACCESS_KEY") or os.environ.get("OPEN_BRAIN_ACCESS_KEY") or ""
+# OPEN_BRAIN_INGEST_KEY first: it is the scoped, non-admin credential
+# provision-ingest-key.sh mints and the one this daemon should hold once the shared
+# global-admin key is withdrawn (docs/adr/0004, 0007). MCP_ACCESS_KEY stays as a
+# fallback so nothing breaks before system-config sets the new variable — until it
+# does, this daemon keeps authenticating exactly as it does today.
+# The same precedence is already used by the imap path (recipes/shared_docling.py:34).
+DEFAULT_OPEN_BRAIN_ACCESS_KEY = (
+    os.environ.get("OPEN_BRAIN_INGEST_KEY")
+    or os.environ.get("MCP_ACCESS_KEY")
+    or os.environ.get("OPEN_BRAIN_ACCESS_KEY")
+    or ""
+)
 DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "mlx-community/Qwen3.5-397B-A17B-nvfp4")
 
 DEFAULT_TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or ""
@@ -269,7 +280,7 @@ def parse_args():
     if not args.telegram_token and not args.update_file:
         parser.error("Missing Telegram bot token. Set TELEGRAM_BOT_TOKEN or pass --telegram-token.")
     if not args.dry_run and not args.access_key:
-        parser.error("Missing OB1 access key. Set MCP_ACCESS_KEY or pass --access-key.")
+        parser.error("Missing OB1 access key. Set OPEN_BRAIN_INGEST_KEY (preferred) or MCP_ACCESS_KEY, or pass --access-key.")
     if not args.dry_run and not (args.minio_endpoint or args.minio_service_name):
         parser.error("Missing MinIO discovery config. Set MINIO_SERVICE_NAME or pass --minio-endpoint.")
     if not args.dry_run and args.minio_secure is None:

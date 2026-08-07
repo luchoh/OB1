@@ -64,7 +64,18 @@ DEFAULT_SYNC_LOG_PATH = Path(os.environ.get("DICTATION_SYNC_LOG_FILE") or (RECIP
 SYNC_SCHEMA_VERSION = 1
 
 DEFAULT_BASE_URL = (os.environ.get("OPEN_BRAIN_BASE_URL") or f"http://127.0.0.1:{os.environ.get('OPEN_BRAIN_PORT', '8787')}").rstrip("/")
-DEFAULT_ACCESS_KEY = os.environ.get("MCP_ACCESS_KEY") or os.environ.get("OPEN_BRAIN_ACCESS_KEY") or ""
+# OPEN_BRAIN_INGEST_KEY first: it is the scoped, non-admin credential
+# provision-ingest-key.sh mints and the one this importer should hold once the shared
+# global-admin key is withdrawn (docs/adr/0004, 0007). MCP_ACCESS_KEY stays as a
+# fallback so nothing breaks before system-config sets the new variable — until it
+# does, this importer keeps authenticating exactly as it does today.
+# The same precedence is already used by the imap path (recipes/shared_docling.py:34).
+DEFAULT_ACCESS_KEY = (
+    os.environ.get("OPEN_BRAIN_INGEST_KEY")
+    or os.environ.get("MCP_ACCESS_KEY")
+    or os.environ.get("OPEN_BRAIN_ACCESS_KEY")
+    or ""
+)
 DEFAULT_LLM_MODEL = os.environ.get("LLM_MODEL", "DeepSeek-V4-Flash-nvfp4")
 DEFAULT_BUCKET = os.environ.get("DICTATION_MINIO_BUCKET") or "dictation-artifacts"
 DEFAULT_PREFIX = os.environ.get("DICTATION_MINIO_PREFIX") or "canonical/"
@@ -228,7 +239,7 @@ def parse_args():
     args.telegram_review_state_file = Path(args.telegram_review_state_file)
 
     if not args.dry_run and not args.access_key:
-        parser.error("Missing access key. Set MCP_ACCESS_KEY or pass --access-key.")
+        parser.error("Missing access key. Set OPEN_BRAIN_INGEST_KEY (preferred) or MCP_ACCESS_KEY, or pass --access-key.")
 
     if not args.artifact_file and not args.object_key and not (args.minio_endpoint or args.minio_service_name):
         parser.error("Provide --artifact-file, --object-key, or MinIO connection details.")
