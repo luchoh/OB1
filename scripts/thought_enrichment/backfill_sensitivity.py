@@ -43,9 +43,10 @@ BATCH_SIZE = 500
 
 async def run(brain_id: str, *, apply: bool) -> int:
     base_url = os.environ.get("OPEN_BRAIN_BASE_URL", "http://[::1]:8787")
-    access_key = os.environ.get("MCP_ACCESS_KEY")
+    # Scoped enrichment key first — see enrich.py for why a non-admin key suffices.
+    access_key = os.environ.get("OPEN_BRAIN_ENRICHMENT_KEY") or os.environ.get("MCP_ACCESS_KEY")
     if apply and not access_key:
-        print("ERROR: MCP_ACCESS_KEY is required when --apply is set", file=sys.stderr)
+        print("ERROR: OPEN_BRAIN_ENRICHMENT_KEY or MCP_ACCESS_KEY is required when --apply is set", file=sys.stderr)
         return 2
 
     print(f"Mode: {'APPLY (writing changes)' if apply else 'DRY RUN (no changes)'}")

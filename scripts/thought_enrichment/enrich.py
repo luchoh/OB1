@@ -183,9 +183,14 @@ async def run_enrich(
     retry_failed: bool,
 ) -> int:
     base_url = os.environ.get("OPEN_BRAIN_BASE_URL", "http://[::1]:8787")
-    access_key = os.environ.get("MCP_ACCESS_KEY")
+    # OPEN_BRAIN_ENRICHMENT_KEY first: a scoped, non-admin key is sufficient here.
+    # /admin/thought/metadata is gated by authorizeWrite (the ADR-0002 role ladder),
+    # not by isAdmin — so `editor` on the target brain is all this needs, and it
+    # should not be holding the global-admin key once that is withdrawn
+    # (docs/adr/0004). MCP_ACCESS_KEY stays as a fallback so today's runs keep working.
+    access_key = os.environ.get("OPEN_BRAIN_ENRICHMENT_KEY") or os.environ.get("MCP_ACCESS_KEY")
     if not dry_run and not access_key:
-        print("ERROR: MCP_ACCESS_KEY is required when --apply is set", file=sys.stderr)
+        print("ERROR: OPEN_BRAIN_ENRICHMENT_KEY or MCP_ACCESS_KEY is required when --apply is set", file=sys.stderr)
         return 2
 
     print(f"Mode: {'DRY RUN' if dry_run else 'APPLY'}{' (retry-failed)' if retry_failed else ''}")

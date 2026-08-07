@@ -198,7 +198,15 @@ def parse_args():
     parser.add_argument("--model", choices=["local", "ollama"], default="local")
     parser.add_argument("--ollama-model", default="qwen3")
     parser.add_argument("--base-url", default=os.environ.get("OPEN_BRAIN_BASE_URL", "http://localhost:8787"))
-    parser.add_argument("--access-key", default=os.environ.get("MCP_ACCESS_KEY") or os.environ.get("OPEN_BRAIN_ACCESS_KEY"))
+    # Scoped key first (docs/adr/0004); admin was never required for this path.
+    parser.add_argument(
+        "--access-key",
+        default=(
+            os.environ.get("OPEN_BRAIN_ENRICHMENT_KEY")
+            or os.environ.get("MCP_ACCESS_KEY")
+            or os.environ.get("OPEN_BRAIN_ACCESS_KEY")
+        ),
+    )
     parser.add_argument("--database-url", default=os.environ.get("DATABASE_URL"))
     parser.add_argument("--conversation-limit", type=int)
     parser.add_argument("--title-contains")
@@ -213,7 +221,7 @@ def parse_args():
 def main():
     args = parse_args()
     if not args.access_key and not args.dry_run:
-        raise SystemExit("Missing access key. Set MCP_ACCESS_KEY or pass --access-key.")
+        raise SystemExit("Missing access key. Set OPEN_BRAIN_ENRICHMENT_KEY (preferred) or MCP_ACCESS_KEY, or pass --access-key.")
 
     prompt_template = load_claim_prompt(args.prompt_file)
     rows = fetch_candidate_rows(args)
