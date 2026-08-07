@@ -54,6 +54,46 @@ function tierGuardSql(paramIndex, column = "sensitivity_tier") {
   return `(${column} is not distinct from 'standard' or $${paramIndex} = 'local_trusted')`;
 }
 
+// The shared-agent-brain dedupe namespace (0.8.0).
+//
+// WHY: dedupe_key defaults to sha256(content), so any principal that can
+// READ a row can recompute its key — and the capture upsert would then rewrite
+// that row IN PLACE (same id, same created_at, only updated_at moves). On a
+// single-tenant brain that is the intended idempotent-import behaviour. On a
+// brain shared by mutually-distrusting agents (pi runs inside an injection-
+// exposed cage) it is a silent cross-principal overwrite: one agent can put
+// words in another's row and the id/created_at say nothing happened.
+//
+// The fix is structural rather than a check: on `brains.is_shared_agent_brain`,
+// each writer gets its OWN dedupe namespace, `<principal_uuid>:<key>`. Two
+// principals capturing identical content can no longer collide at all, so the
+// "must insert a separate row instead of overwriting" outcome falls out of the
+// unique index itself — no read-then-write race, no extra round trip. The same
+// principal re-capturing derives the same namespaced key, so legitimate
+// idempotent re-import still upserts its own row.
+//
+// Cost: one PK lookup on `brains` inside the SAME statement. Non-shared brains
+// (every brain today) keep the exact key they have always had.
+//
+// Both statements that use this CTE bind the brain id as $1.
+const SHARED_BRAIN_CTE = `
+      brain as (
+        select coalesce(b.is_shared_agent_brain, false) as shared
+        from brains b where b.id = $1::uuid
+      )`;
+
+// The effective dedupe key: caller-supplied key, else sha256(content), namespaced
+// by the writing principal on a shared agent brain. `principalParam` is the bind
+// position of the writer's principal id.
+function dedupeKeySql(keyParam, contentParam, principalParam) {
+  const raw = `coalesce($${keyParam}, encode(digest($${contentParam}, 'sha256'), 'hex'))`;
+  return `case
+          when (select shared from brain) and $${principalParam}::uuid is not null
+            then $${principalParam}::uuid::text || ':' || ${raw}
+          else ${raw}
+        end`;
+}
+
 // ---------------------------------------------------------------------------
 // Capture / upsert
 // ---------------------------------------------------------------------------
@@ -82,6 +122,11 @@ export async function captureThought({
   // §6.10: a cloud_bound caller may not upsert-OVER an existing restricted row.
   // Fail-closed: absent/unknown egress class is cloud_bound.
   callerReadEgressClass = "cloud_bound",
+  // Writer attribution (migration 021). Nullable on purpose: a caller with no
+  // principal (legacy admin key) writes NULL rather than failing. NULL means
+  // "unattributed", never "mine" — see the shared-brain guard below.
+  writtenByPrincipalId = null,
+  writtenByKeyId = null,
 }) {
   const typeValue = typeof metadata?.type === "string" && metadata.type.trim()
     ? metadata.type.trim()
@@ -96,6 +141,7 @@ export async function captureThought({
   // handler's preflight (or this fail-closed backstop) denies it as NOT_FOUND.
   const result = await query(
     `
+      with ${SHARED_BRAIN_CTE}
       insert into thoughts (
         brain_id,
         content,
@@ -108,22 +154,26 @@ export async function captureThought({
         sensitivity_tier,
         origin_egress_class,
         source_trust_class,
-        review_state
+        review_state,
+        written_by_principal_id,
+        written_by_key_id
       )
-      values (
+      select
         $1::uuid,
         $2,
         $3::vector,
         $4,
         $5,
-        coalesce($6, encode(digest($2, 'sha256'), 'hex')),
+        ${dedupeKeySql(6, 2, 14)},
         $7::jsonb,
         $8,
         coalesce($9, 'standard'),
         $10,
         $11,
-        $12
-      )
+        $12,
+        $14::uuid,
+        $15::uuid
+      from brain
       on conflict (brain_id, dedupe_key) where deleted_at is null
       do update set
         content = excluded.content,
@@ -151,8 +201,23 @@ export async function captureThought({
           when thoughts.review_state = 'unreviewed' or excluded.review_state = 'unreviewed' then 'unreviewed'
           else coalesce(thoughts.review_state, excluded.review_state)
         end,
+        -- attribution follows the LAST writer, but coalesce so an unattributed
+        -- re-capture (legacy admin) never ERASES a known writer.
+        written_by_principal_id = coalesce(excluded.written_by_principal_id, thoughts.written_by_principal_id),
+        written_by_key_id = coalesce(excluded.written_by_key_id, thoughts.written_by_key_id),
         updated_at = now()
       where ${tierGuardSql(13, "thoughts.sensitivity_tier")}
+        -- Shared-brain ownership backstop. The namespaced dedupe key above
+        -- already makes a cross-principal collision unreachable; this makes the
+        -- rule explicit and covers the residual cases — a row written before the
+        -- namespace existed, and an unattributed writer (NULL principal), which
+        -- owns nothing and so may overwrite nothing. 0 rows ⇒ NOT_FOUND below,
+        -- the same fail-closed shape the tier guard uses (no existence oracle).
+        and (
+          not (select shared from brain)
+          or (thoughts.written_by_principal_id is not null
+              and thoughts.written_by_principal_id = excluded.written_by_principal_id)
+        )
       returning
         id,
         brain_id,
@@ -167,6 +232,8 @@ export async function captureThought({
         origin_egress_class,
         source_trust_class,
         review_state,
+        written_by_principal_id,
+        written_by_key_id,
         created_at,
         updated_at
     `,
@@ -184,14 +251,19 @@ export async function captureThought({
       sourceTrustClass,
       reviewState,
       callerReadEgressClass,
+      writtenByPrincipalId,
+      writtenByKeyId,
     ],
   );
 
-  // 0 rows ⇒ the conflict targeted an existing restricted row and the guard
-  // (above) blocked the DO UPDATE for a cloud_bound caller. Deny without
-  // confirming the row exists (§6.10: no existence oracle). The handler's
-  // preflight normally catches this before any processor call; this is the
-  // atomic, TOCTOU-safe backstop.
+  // 0 rows ⇒ one of three things, none of which we distinguish for the caller:
+  // the conflict targeted an existing restricted row and the tier guard blocked
+  // the DO UPDATE for a cloud_bound caller; the shared-brain ownership backstop
+  // refused to overwrite another (or an unattributed) principal's row; or the
+  // brain id does not exist (the `from brain` CTE yields no row). Deny without
+  // confirming what exists (§6.10: no existence oracle). The handler's preflight
+  // normally catches the tier case before any processor call; this is the atomic,
+  // TOCTOU-safe backstop.
   if (result.rows.length === 0) {
     throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, `Thought not found: ${dedupeKey ?? "(no dedupe key)"}`);
   }
@@ -205,14 +277,24 @@ export async function captureThought({
 // BEFORE the embedding/LLM processors so a cloud_bound upsert over a restricted
 // row is denied before any content leaves the box. Returns `null` for an
 // existing row whose tier is NULL (fail-closed → treat as non-standard).
-export async function peekCaptureConflictTier({ brainId, dedupeKey }) {
+// `writtenByPrincipalId` must be the SAME principal the capture will pass, or the
+// peek looks at a different key than the capture will conflict on for a shared
+// agent brain (see SHARED_BRAIN_CTE).
+export async function peekCaptureConflictTier({ brainId, dedupeKey, writtenByPrincipalId = null }) {
   if (!dedupeKey) {
     return undefined;
   }
   const r = await query(
-    `select sensitivity_tier from thoughts
-       where brain_id = $1::uuid and dedupe_key = $2 and deleted_at is null`,
-    [brainId, dedupeKey],
+    `with ${SHARED_BRAIN_CTE}
+     select t.sensitivity_tier from brain, thoughts t
+       where t.brain_id = $1::uuid
+         and t.dedupe_key = case
+           when (select shared from brain) and $3::uuid is not null
+             then $3::uuid::text || ':' || $2
+           else $2
+         end
+         and t.deleted_at is null`,
+    [brainId, dedupeKey, writtenByPrincipalId],
   );
   return r.rowCount === 0 ? undefined : (r.rows[0].sensitivity_tier ?? null);
 }
