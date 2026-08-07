@@ -23,7 +23,15 @@ from recipes.shared_capture import (  # noqa: E402  (after sys.path setup above)
 )
 
 DEFAULT_BASE_URL = os.environ.get("OPEN_BRAIN_BASE_URL") or f"http://127.0.0.1:{os.environ.get('OPEN_BRAIN_PORT', '8787')}"
-DEFAULT_ACCESS_KEY = os.environ.get("MCP_ACCESS_KEY") or os.environ.get("OPEN_BRAIN_ACCESS_KEY") or ""
+# Scoped key first (docs/adr/0004): this writes thoughts, which the role ladder
+# permits to any `editor` — it never needed global admin. MCP_ACCESS_KEY remains a
+# fallback so existing invocations keep working until the scoped key is provisioned.
+DEFAULT_ACCESS_KEY = (
+    os.environ.get("OPEN_BRAIN_ENRICHMENT_KEY")
+    or os.environ.get("MCP_ACCESS_KEY")
+    or os.environ.get("OPEN_BRAIN_ACCESS_KEY")
+    or ""
+)
 
 
 def load_module(name, path):
@@ -53,7 +61,7 @@ def parse_args():
     if not args.chatgpt_export and not args.claude_export:
         parser.error("At least one of --chatgpt-export or --claude-export is required.")
     if not args.dry_run and not args.access_key:
-        parser.error("Missing access key. Set MCP_ACCESS_KEY or pass --access-key.")
+        parser.error("Missing access key. Set OPEN_BRAIN_ENRICHMENT_KEY (preferred) or MCP_ACCESS_KEY, or pass --access-key.")
     return args
 
 

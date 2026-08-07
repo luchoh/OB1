@@ -12,15 +12,20 @@ import { HttpError, hashAccessKey } from "./auth.mjs";
 // can_mint_repo_keys — creates repo brains, repo keys and agent keys and NOTHING
 // else.
 //
-// TWO CREDENTIAL FAMILIES, ONE BRAIN. A key grants the reach of its PRINCIPAL
-// (auth.mjs fetchBrainMemberships), so one key = one principal = one membership
-// set. The host-side harnesses (claude, codex) share the repo-service principal
-// and reach the repo brain only. The caged agent (pi) runs injection-exposed with
-// ungated bash, so it gets its OWN principal — repo brain plus the household's
-// shared agent brain — and can never be handed the repo-service credential.
-// Because both families hold keys on the SAME repo brain, every guard here is
-// scoped by principal and credential_type: a brain-wide guard would make the two
-// families clobber each other (see handleMintRepoKey / handleRotateRepoKey).
+// TWO CREDENTIAL FAMILIES, DISJOINT BRAINS (docs/adr/0006). A key grants the
+// reach of its PRINCIPAL (auth.mjs fetchBrainMemberships), so one key = one
+// principal = one membership set — which is why pi cannot be "the same key plus
+// one brain" and needs a second credential.
+//   repo-service:<slug>  editor on repo:<slug>       — claude, codex AND pi
+//   pi-common:<slug>     editor on the shared brain  — pi only
+// pi is the CONTAINED agent (claude/codex run as the operator on the host), so it
+// is the one trusted with the estate-wide shared brain; it does repo work with the
+// same repo key as everyone else. The agent key therefore reaches the shared brain
+// and nothing else: no repo-brain membership, so pi-authored repo rows are
+// indistinguishable from claude's, which the operator accepted.
+// The guards below are still scoped by principal and credential_type rather than
+// by brain — 0.8.0 put both families on the repo brain, and any surviving row from
+// then must not let one family's rotation clobber the other's key.
 //
 // THE RULE THIS FILE EXISTS TO KEEP: every security-relevant column written here
 // is a hard-coded literal, never taken from tool arguments. A caller controls
@@ -42,7 +47,10 @@ const REPO_SLUG_PATTERN = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 // table they are looking at.
 const BRAIN_SLUG_PREFIX = "repo:";
 const PRINCIPAL_SLUG_PREFIX = "repo-service:";
-const AGENT_PRINCIPAL_SLUG_PREFIX = "pi:";
+// "pi-common", not "pi": the principal's whole reach is the estate-wide COMMON
+// brain, and the slug should say so to an operator reading brain_principals. The
+// repo part of the slug is per-repo revocation granularity, not repo reach.
+const AGENT_PRINCIPAL_SLUG_PREFIX = "pi-common:";
 
 // principal_type / credential_type are plain text with no CHECK constraint
 // (migration 005), so 'caged_agent' and 'agent_key' need no migration. Verified
@@ -176,6 +184,8 @@ function insertRepoKey(client, { principalId, brainId, repoSlug }) {
   });
 }
 
+// brainId here is the SHARED brain: brain_id is a default-brain hint (ADR-0003),
+// never a clamp, and the shared brain is now the only brain this key reaches.
 function insertAgentKey(client, { principalId, brainId, repoSlug }) {
   return insertCredential(client, {
     principalId,
@@ -271,18 +281,21 @@ function resolveRepoServicePrincipal(client, { householdId, principalSlug, brain
   });
 }
 
-// The caged agent's blast radius IS this brain list: repo brain + the household's
-// one shared agent brain, nothing else, ever.
+// The caged agent's blast radius IS this brain list: the household's one shared
+// agent brain, nothing else, ever. A pre-0.8.0 pi principal that still carries a
+// repo-brain membership fails the foreign-membership guard rather than being
+// silently re-issued — a migration is not needed, but such a principal must be
+// cleaned up (or renamed out of the way) by hand before it can be re-minted.
 function resolveCagedAgentPrincipal(client, {
-  householdId, principalSlug, brainId, sharedBrainId, repoSlug, createIfMissing,
+  householdId, principalSlug, sharedBrainId, repoSlug, createIfMissing,
 }) {
   return resolveManagedPrincipal(client, {
     householdId,
     principalSlug,
     principalType: PRINCIPAL_TYPE_CAGED_AGENT,
-    displayName: `Caged agent: ${repoSlug}`,
-    defaultBrainId: brainId,
-    allowedBrainIds: [brainId, sharedBrainId],
+    displayName: `Caged agent (common): ${repoSlug}`,
+    defaultBrainId: sharedBrainId,
+    allowedBrainIds: [sharedBrainId],
     createIfMissing,
     missingMessage: `No agent principal '${principalSlug}'; use mint_agent_key to create it`,
   });
@@ -531,13 +544,14 @@ export async function handleRotateRepoKey(args, accessContext) {
   }
 }
 
-// mint_agent_key — CREATE-ONLY, like mint_repo_key. Issues the caged agent (pi)
-// its OWN principal, because a key carries its principal's memberships: handing
-// pi the repo-service key would either give the harnesses the shared agent brain
-// or give pi nothing, and there is no third option with one shared principal.
+// mint_agent_key — CREATE-ONLY, like mint_repo_key. Issues pi its SECOND
+// credential: editor on the estate-wide shared agent brain and nothing else. pi
+// does repo work with the repo key from mint_repo_key, like claude and codex; this
+// key exists only because a key carries its principal's memberships, so widening
+// pi without widening the harnesses requires a separate principal (ADR-0006).
 //
-// Neither brain is ever created here. The repo brain comes from mint_repo_key;
-// the shared agent brain is an operator decision (lockSharedAgentBrain).
+// No brain is ever created here. The repo brain comes from mint_repo_key; the
+// shared agent brain is an operator decision (lockSharedAgentBrain).
 export async function handleMintAgentKey(args, accessContext) {
   requireMintCapability(accessContext);
   const repoSlug = validateRepoSlug(args?.repo_slug);
@@ -549,6 +563,14 @@ export async function handleMintAgentKey(args, accessContext) {
   try {
     await client.query("BEGIN");
 
+    // TYPO GUARD, deliberately kept even though this key does not reach the repo
+    // brain. repo_slug is otherwise write-only input: a fat-fingered slug would
+    // mint a live credential on the shared brain under a principal no cage will
+    // ever present, and nothing would ever report it — the operator would find out
+    // when pi could not write, with an orphaned key still valid. Requiring the
+    // repo brain to exist costs nothing (mint_repo_key already runs first in the
+    // documented provisioning order) and makes the mistake a 404 instead.
+    //
     // Lock order is repo brain then shared agent brain in both agent handlers:
     // every concurrent agent mint takes the same brains in the same order, so two
     // repos provisioning at once cannot deadlock on the one shared brain.
@@ -560,7 +582,7 @@ export async function handleMintAgentKey(args, accessContext) {
     const sharedBrain = await lockSharedAgentBrain(client, householdId);
 
     const principalId = await resolveCagedAgentPrincipal(client, {
-      householdId, principalSlug, brainId: brain.id, sharedBrainId: sharedBrain.id,
+      householdId, principalSlug, sharedBrainId: sharedBrain.id,
       repoSlug, createIfMissing: true,
     });
 
@@ -580,18 +602,18 @@ export async function handleMintAgentKey(args, accessContext) {
       );
     }
 
-    await grantEditorMemberships(client, principalId, [brain.id, sharedBrain.id]);
+    // EXACTLY ONE membership. The repo brain is reached with the repo key.
+    await grantEditorMemberships(client, principalId, [sharedBrain.id]);
 
     const { plaintext, keyId } = await insertAgentKey(client, {
-      principalId, brainId: brain.id, repoSlug,
+      principalId, brainId: sharedBrain.id, repoSlug,
     });
     await client.query("COMMIT");
 
     auditCredentialEvent("agent_key.minted", {
       mintedByPrincipalId: accessContext?.principalId ?? null,
       repoSlug,
-      brainId: brain.id,
-      brainSlug,
+      repoBrainSlug: brainSlug,
       sharedBrainId: sharedBrain.id,
       sharedBrainSlug: sharedBrain.slug,
       principalId,
@@ -599,10 +621,10 @@ export async function handleMintAgentKey(args, accessContext) {
       keyId,
     });
 
+    // No repo brain id/slug in the result: this key does not reach the repo brain,
+    // and returning one invited exactly the misreading this rework is undoing.
     return {
       repo_slug: repoSlug,
-      brain_id: brain.id,
-      brain_slug: brainSlug,
       shared_brain_id: sharedBrain.id,
       shared_brain_slug: sharedBrain.slug,
       // Surfaced because a cloud_bound agent key cannot read a private_local
@@ -612,7 +634,7 @@ export async function handleMintAgentKey(args, accessContext) {
       principal_id: principalId,
       principal_slug: principalSlug,
       key: plaintext,
-      note: "Store this key now — it is returned once and only its sha256 hash is persisted.",
+      note: "Store this key now — it is returned once and only its sha256 hash is persisted. This key reaches the shared agent brain only; repo work uses the repo key from mint_repo_key.",
     };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
@@ -622,9 +644,11 @@ export async function handleMintAgentKey(args, accessContext) {
   }
 }
 
-// rotate_agent_key — REVOKE + REPLACE for the caged agent only. The agent is the
-// injection-exposed principal, so this is the credential most likely to need
-// burning in a hurry; it must not take the harness keys down with it.
+// rotate_agent_key — REVOKE + REPLACE for the caged agent's COMMON key only. The
+// agent is the injection-exposed principal, so this is the credential most likely
+// to need burning in a hurry; it must not take the repo key down with it — pi
+// presents that one too, and revoking it would also cut off claude and codex.
+// The repo brain is looked up here for the same typo-guard reason as in mint.
 export async function handleRotateAgentKey(args, accessContext) {
   requireMintCapability(accessContext);
   const repoSlug = validateRepoSlug(args?.repo_slug);
@@ -647,12 +671,12 @@ export async function handleRotateAgentKey(args, accessContext) {
     // that gained reach since it was minted must not have that reach re-issued
     // under a fresh key just because the slug still matches.
     const principalId = await resolveCagedAgentPrincipal(client, {
-      householdId, principalSlug, brainId: brain.id, sharedBrainId: sharedBrain.id,
+      householdId, principalSlug, sharedBrainId: sharedBrain.id,
       repoSlug, createIfMissing: false,
     });
 
-    // Scoped to the agent principal AND agent_key: never the repo key on this
-    // brain, never the minter's key (different principal, brain_id null).
+    // Scoped to the agent principal AND agent_key: never the repo key (a different
+    // principal on a different brain), never the minter's key (brain_id null).
     const revoked = await client.query(
       `update brain_access_keys
        set is_active = false, updated_at = now()
@@ -661,15 +685,14 @@ export async function handleRotateAgentKey(args, accessContext) {
     );
 
     const { plaintext, keyId } = await insertAgentKey(client, {
-      principalId, brainId: brain.id, repoSlug,
+      principalId, brainId: sharedBrain.id, repoSlug,
     });
     await client.query("COMMIT");
 
     auditCredentialEvent("agent_key.rotated", {
       rotatedByPrincipalId: accessContext?.principalId ?? null,
       repoSlug,
-      brainId: brain.id,
-      brainSlug,
+      repoBrainSlug: brainSlug,
       sharedBrainId: sharedBrain.id,
       sharedBrainSlug: sharedBrain.slug,
       principalId,
@@ -680,8 +703,6 @@ export async function handleRotateAgentKey(args, accessContext) {
 
     return {
       repo_slug: repoSlug,
-      brain_id: brain.id,
-      brain_slug: brainSlug,
       shared_brain_id: sharedBrain.id,
       shared_brain_slug: sharedBrain.slug,
       shared_brain_egress_class: sharedBrain.egress_class,
@@ -689,7 +710,7 @@ export async function handleRotateAgentKey(args, accessContext) {
       principal_slug: principalSlug,
       revoked_key_count: revoked.rowCount,
       key: plaintext,
-      note: "Store this key now — it is returned once and only its sha256 hash is persisted. Previous agent keys for this repo are revoked; repo keys are untouched.",
+      note: "Store this key now — it is returned once and only its sha256 hash is persisted. Previous agent keys for this repo are revoked; the repo key is untouched, so pi keeps its repo access.",
     };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});

@@ -2,11 +2,13 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import * as minting from "../src/repo-key-minting.mjs";
 
-// mint_agent_key / rotate_agent_key (0.8.0) issue a STRICTLY WIDER credential
-// than mint_repo_key: the caged agent's principal is a member of the repo brain
-// AND of the shared cross-repo agent brain. That makes the capability gate the
-// single thing standing between "a key that reads one repo" and "a key that
-// writes a brain every repo can read", so it is tested the same way the repo
+// mint_agent_key / rotate_agent_key issue the caged agent's COMMON credential
+// (docs/adr/0006): its principal is an editor on the estate's ONE shared
+// cross-repo brain and on nothing else. It is not a wider repo key — pi does repo
+// work with the same repo key claude and codex hold — but it is the ONLY key in
+// the system that reaches a brain every repo can read. That makes the capability
+// gate the single thing standing between "a key that reads one repo" and "a key
+// that writes the estate-wide common brain", so it is tested the same way the repo
 // gate is — as a pure function of the access context, no database.
 //
 // Everything here is DB-FREE by construction. The denied-shape tests deliberately
@@ -35,7 +37,7 @@ const agentHandlers = [
 // them. Not one of these may mint an agent key: `canMintRepoKeys` is set to true
 // only for the operator-provisioned minter key.
 const DENIED_CALLERS = [
-  ["repo key (claude/codex harness)", {
+  ["repo key (claude/codex/pi harness)", {
     kind: "service_key",
     principalId: "11111111-1111-4111-8111-111111111111",
     principalType: "repo_service",
@@ -43,7 +45,7 @@ const DENIED_CALLERS = [
     canMintRepoKeys: false,
     readEgressClass: "cloud_bound",
   }],
-  ["caged agent key (pi escalating from inside the cage)", {
+  ["caged agent common key (pi escalating from inside the cage)", {
     kind: "service_key",
     principalId: "22222222-2222-4222-8222-222222222222",
     principalType: "caged_agent",
@@ -57,7 +59,10 @@ const DENIED_CALLERS = [
     isAdmin: true,
     readEgressClass: "cloud_bound",
   }],
-  ["stored admin key", {
+  // After the withdrawal (docs/adr/0004-0005) this is the one credential the
+  // operator still holds, and it is the most powerful one in the system. It is
+  // still not a minter: minting is a capability, never a rank.
+  ["named admin key", {
     kind: "service_key",
     principalId: "33333333-3333-4333-8333-333333333333",
     isAdmin: true,
@@ -169,10 +174,11 @@ test("agent-key handlers: the gate is the shared requireMintCapability", { skip:
 // --------------------------------------------------------------------------
 // Slug validation
 //
-// The slug is concatenated into 'repo:<slug>' and 'pi:<slug>' and becomes a row
-// identity, exactly as on the repo path. These run through the HANDLER (not the
-// helper) so a new code path that forgot to validate cannot pass: the context
-// carries both the capability and a household, so nothing else can reject first.
+// The slug is concatenated into 'repo:<slug>' and the agent principal namespace
+// and becomes a row identity, exactly as on the repo path. These run through the
+// HANDLER (not the helper) so a new code path that forgot to validate cannot
+// pass: the context carries both the capability and a household, so nothing else
+// can reject first.
 // --------------------------------------------------------------------------
 
 const MINTER_CONTEXT = contextFor(MINTER);
@@ -180,7 +186,7 @@ const MINTER_CONTEXT = contextFor(MINTER);
 test("agent-key handlers: a non-DNS-safe slug is a 400 before any database work", { skip: agentHandlerSkip }, async () => {
   const bad = [
     "", "-lead", "trail-", "OB1", "under_score", "with space", "dot.separated",
-    "repo:ob1", "pi:ob1", "x".repeat(64), "a/../b", "a'; drop table brains; --",
+    "repo:ob1", "pi:ob1", "pi-common:ob1", "x".repeat(64), "a/../b", "a'; drop table brains; --",
     "ob1\nsystem-config", "ob1\u200bsc", "\u043eb1", "ob1\u0000",
     null, undefined, 42, {}, [],
   ];
@@ -233,10 +239,16 @@ const managedTypeSkip = assertManagedPrincipalType && assertManagedCredentialTyp
   : "repo-key-minting.mjs does not expose the managed-type assertions (expected __testables.assertManagedPrincipalType / assertManagedCredentialType)";
 
 test("managed types: only the module's own literals are writable", { skip: managedTypeSkip }, () => {
-  assert.equal(assertManagedPrincipalType("repo_service"), "repo_service");
-  assert.equal(assertManagedPrincipalType("caged_agent"), "caged_agent");
-  assert.equal(assertManagedCredentialType("repo_key"), "repo_key");
-  assert.equal(assertManagedCredentialType("agent_key"), "agent_key");
+  const t = minting.__testables;
+  assert.equal(assertManagedPrincipalType(t.PRINCIPAL_TYPE_REPO_SERVICE), t.PRINCIPAL_TYPE_REPO_SERVICE);
+  assert.equal(assertManagedPrincipalType(t.PRINCIPAL_TYPE_CAGED_AGENT), t.PRINCIPAL_TYPE_CAGED_AGENT);
+  assert.equal(assertManagedCredentialType(t.CREDENTIAL_TYPE_REPO_KEY), t.CREDENTIAL_TYPE_REPO_KEY);
+  assert.equal(assertManagedCredentialType(t.CREDENTIAL_TYPE_AGENT_KEY), t.CREDENTIAL_TYPE_AGENT_KEY);
+  // The two families must stay distinguishable in the table: the DB-backed guards
+  // that stop one family's rotation revoking the other's key are all written as
+  // `credential_type = <literal>`, so equal literals would silently merge them.
+  assert.notEqual(t.PRINCIPAL_TYPE_REPO_SERVICE, t.PRINCIPAL_TYPE_CAGED_AGENT);
+  assert.notEqual(t.CREDENTIAL_TYPE_REPO_KEY, t.CREDENTIAL_TYPE_AGENT_KEY);
 });
 
 test("managed types: anything else throws rather than reaching a column", { skip: managedTypeSkip }, () => {
@@ -254,9 +266,9 @@ test("managed types: anything else throws rather than reaching a column", { skip
   }
 });
 
-// The two namespaces must not overlap: a repo key and an agent key on the same
-// repo are two principals, and an operator reading brain_principals has only the
-// slug prefix to tell them apart.
+// The two namespaces must not overlap: the harness credential and pi's common
+// credential are two principals with DISJOINT reach (ADR-0006), and an operator
+// reading brain_principals has only the slug prefix to tell them apart.
 const prefixes = minting.__testables;
 const prefixSkip = prefixes.PRINCIPAL_SLUG_PREFIX && prefixes.AGENT_PRINCIPAL_SLUG_PREFIX
   ? false
@@ -272,4 +284,93 @@ test("principal namespaces: the agent prefix is distinct and never a prefix of t
   for (const prefix of [repo, agent]) {
     assert.throws(() => validateRepoSlug(`${prefix}ob1`), (error) => error.status === 400);
   }
+});
+
+// The property the prefix test above exists to buy: no repo slug can ever compose
+// a harness principal slug that equals an agent principal slug for some other
+// repo. If it could, one family's per-repo revocation would hit the other's row.
+test("principal namespaces: composed slugs can never collide across families", { skip: prefixSkip }, () => {
+  const repo = prefixes.PRINCIPAL_SLUG_PREFIX;
+  const agent = prefixes.AGENT_PRINCIPAL_SLUG_PREFIX;
+  const slugs = ["ob1", "a", "system-config", "common", "pi", "repo-service", "x".repeat(63)];
+
+  for (const left of slugs) {
+    for (const right of slugs) {
+      assert.notEqual(`${repo}${left}`, `${agent}${right}`, `${repo}${left} collided with ${agent}${right}`);
+    }
+  }
+});
+
+// The brain namespace is separate again: 'repo:<slug>' names a brain, never a
+// principal, so an operator reading a slug knows which table it came from.
+test("principal namespaces: the brain prefix belongs to neither principal family", { skip: prefixSkip }, () => {
+  const brain = prefixes.BRAIN_SLUG_PREFIX;
+  assert.ok(brain, "expected __testables.BRAIN_SLUG_PREFIX");
+  for (const principal of [prefixes.PRINCIPAL_SLUG_PREFIX, prefixes.AGENT_PRINCIPAL_SLUG_PREFIX]) {
+    assert.notEqual(brain, principal);
+    assert.ok(!principal.startsWith(brain), `${principal} must not live under the brain namespace`);
+  }
+});
+
+// --------------------------------------------------------------------------
+// assertIsRepoBrain
+//
+// The pure half of the guard that keeps a minting key from being pointed at the
+// estate's personal brain by naming it 'repo:<something>'. Both agent handlers
+// call it before they touch anything, and the shared-agent-brain check in
+// lockSharedAgentBrain re-checks the same shape for the same reason: the row's
+// flags are authority, its slug is not.
+// --------------------------------------------------------------------------
+
+const assertIsRepoBrain = minting.__testables.assertIsRepoBrain ?? null;
+const repoBrainSkip = assertIsRepoBrain
+  ? false
+  : "repo-key-minting.mjs does not expose the repo-brain shape guard (expected __testables.assertIsRepoBrain)";
+
+const REPO_BRAIN_ROW = { kind: "repo", egress_class: "repo", is_default_shared: false };
+
+test("repo-brain guard: the one acceptable shape passes", { skip: repoBrainSkip }, () => {
+  assert.doesNotThrow(() => assertIsRepoBrain({ ...REPO_BRAIN_ROW }, "ob1"));
+});
+
+test("repo-brain guard: every other shape is a 409, not a silent grant", { skip: repoBrainSkip }, () => {
+  const rejected = [
+    ["the estate's default shared brain", { ...REPO_BRAIN_ROW, is_default_shared: true }],
+    ["a personal brain wearing a repo slug", { ...REPO_BRAIN_ROW, kind: "personal" }],
+    ["a private_local brain", { ...REPO_BRAIN_ROW, egress_class: "private_local" }],
+    ["a local_trusted brain", { ...REPO_BRAIN_ROW, egress_class: "local_trusted" }],
+    ["kind absent", { egress_class: "repo", is_default_shared: false }],
+    ["egress_class absent", { kind: "repo", is_default_shared: false }],
+    // is_default_shared arriving as a truthy non-boolean must still refuse: the
+    // column is read straight out of a row, not normalised on the way in.
+    ["is_default_shared truthy string", { ...REPO_BRAIN_ROW, is_default_shared: "false" }],
+  ];
+
+  for (const [label, row] of rejected) {
+    assert.throws(
+      () => assertIsRepoBrain(row, "ob1"),
+      (error) => error.status === 409 && /refusing to touch it/.test(error.message),
+      `expected a 409 for ${label}`,
+    );
+  }
+});
+
+// --------------------------------------------------------------------------
+// display_name bound
+//
+// The repo suite covers the sanitizer's behaviour; what belongs here is that the
+// exported bound and the sanitizer agree. A constant that drifted from the
+// slice() inside it would silently widen what lands in the brains table.
+// --------------------------------------------------------------------------
+
+const sanitizeDisplayName = minting.__testables.sanitizeDisplayName ?? null;
+const displayNameBound = minting.__testables.DISPLAY_NAME_MAX ?? null;
+const boundSkip = sanitizeDisplayName && typeof displayNameBound === "number"
+  ? false
+  : "repo-key-minting.mjs does not expose both the sanitizer and its bound (expected __testables.sanitizeDisplayName / DISPLAY_NAME_MAX)";
+
+test("display_name: the exported bound is the bound the sanitizer enforces", { skip: boundSkip }, () => {
+  assert.ok(displayNameBound > 0);
+  assert.equal(sanitizeDisplayName("x".repeat(displayNameBound)).length, displayNameBound);
+  assert.equal(sanitizeDisplayName("x".repeat(displayNameBound * 4)).length, displayNameBound);
 });

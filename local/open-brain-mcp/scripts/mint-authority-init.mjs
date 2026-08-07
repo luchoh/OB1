@@ -311,22 +311,26 @@ async function installKey(client, { householdId, keyHash }) {
       throw new Error("that key is already registered to a different principal; choose a different key.");
     }
   }
-  // Same-principal reinstall: drop the old row so the unique key_hash index
-  // cannot collide with the insert below.
-  await client.query("delete from brain_access_keys where key_hash = $1", [keyHash]);
-
   const revoked = await client.query(
     `update brain_access_keys set is_active = false, updated_at = now()
      where principal_id = $1::uuid and is_active = true`,
     [principalId],
   );
 
+  // Upsert rather than delete-then-insert. A key row can be REFERENCED by
+  // thoughts.written_by_key_id, declared `on delete restrict` (migration 021) so
+  // that revoking a key can never erase the record of what it wrote — which means
+  // deleting the row fails outright once the key has written anything. Reinstalling
+  // the same key therefore reactivates its existing row; the revoke above has
+  // already deactivated every other key for this principal.
   await client.query(
     `insert into brain_access_keys
        (principal_id, brain_id, key_hash, label, credential_type,
         is_active, is_admin, read_egress_class, can_mint_repo_keys)
      values ($1::uuid, null, $2, 'repo-key minter', 'minter',
-             true, false, null, true)`,
+             true, false, null, true)
+     on conflict (key_hash) do update
+       set is_active = true, updated_at = now()`,
     [principalId, keyHash],
   );
 
