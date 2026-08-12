@@ -196,14 +196,18 @@ async function createBrain(client, { householdId, slug }) {
   );
   const brainId = created.rows[0].id;
 
-  // Give the estate's people owner rights, so a human can read, curate and delete
-  // what the agents write. Without this the operator's only route in is the admin
-  // secret, and there would be no role-based way to clean up a poisoned row.
+  // Give the estate's person operators owner rights, including a person whose
+  // home household is elsewhere but who administers this estate. Production uses
+  // that latter shape (local-household:luchoh -> agent-estate); limiting this to
+  // people homed in the estate strands the shared brain without a human owner.
   const owners = await client.query(
     `insert into brain_memberships (principal_id, brain_id, role)
      select p.id, $2::uuid, 'owner'
-     from brain_principals p
-     where p.household_id = $1::uuid and p.principal_type = 'person'
+     from estate_memberships em
+     join brain_principals p on p.id = em.principal_id
+     where em.estate_id = $1::uuid
+       and em.is_deny = false
+       and p.principal_type = 'person'
      on conflict (principal_id, brain_id) do nothing
      returning principal_id`,
     [householdId, brainId],

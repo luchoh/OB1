@@ -87,7 +87,19 @@
         (cd local/open-brain-mcp && npm install)
       fi
 
-      echo "Starting Open Brain local runtime on $OPEN_BRAIN_HOST:$OPEN_BRAIN_PORT"
+      # The developer-owned 8787 runtime may select the isolated ob1_dev
+      # profile. Its non-secret settings still come from the repo dotenv file;
+      # its DB credentials come only from the caller-supplied runtime env file.
+      # Production and every other profile keep their existing environment
+      # behavior. Keep this immediately before the Node exec boundary.
+      source "$DEVENV_ROOT/scripts/load-open-brain-dev-runtime-env.sh" \
+        "$DEVENV_ROOT/.env.open-brain-local"
+
+      case "$OPEN_BRAIN_HOST" in
+        *:*) runtime_address="[$OPEN_BRAIN_HOST]:$OPEN_BRAIN_PORT" ;;
+        *) runtime_address="$OPEN_BRAIN_HOST:$OPEN_BRAIN_PORT" ;;
+      esac
+      echo "Starting Open Brain local runtime on $runtime_address"
       exec ./scripts/run-open-brain-local.sh
     ) &
     runtime_pid=$!

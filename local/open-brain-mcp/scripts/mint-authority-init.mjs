@@ -230,9 +230,10 @@ async function warnAboutForeignMinters(client, householdId) {
     [MINTER_SLUG, householdId],
   );
   for (const row of result.rows) {
+    if (!row.has_active_key) continue;
     console.warn(
       `WARNING: a '${MINTER_SLUG}' principal also exists in household ${row.household_slug} (${row.household_id})`
-      + `${row.has_active_key ? " and it holds an ACTIVE key" : ""}. Review and remove it.`,
+      + " and it holds an ACTIVE key. Review and remove it.",
     );
   }
 }
@@ -299,16 +300,32 @@ async function installKey(client, { householdId, keyHash }) {
   }
   const principalId = row.id;
 
-  // Reject a hash collision with an existing NON-minter key rather than letting
-  // the unique key_hash index abort with an opaque error. The same raw key
-  // re-installed for the minter itself is fine and simply re-installs.
+  // Reject a hash collision with an existing non-minter key rather than letting
+  // the unique key_hash index abort with an opaque error. An INACTIVE minter key
+  // left in a legacy household is the one deliberate exception: possession of
+  // the raw key proves the operator may rehome it to this minter. This preserves
+  // its key row (and any written_by_key_id references) rather than minting or
+  // duplicating a credential.
   const clash = await client.query(
-    "select principal_id from brain_access_keys where key_hash = $1",
+    `select k.id, k.principal_id, k.is_active, k.credential_type,
+            p.slug, p.principal_type
+       from brain_access_keys k
+       join brain_principals p on p.id = k.principal_id
+      where k.key_hash = $1
+      for update`,
     [keyHash],
   );
+  let adoptKeyId = null;
   for (const clashRow of clash.rows) {
     if (clashRow.principal_id !== principalId) {
-      throw new Error("that key is already registered to a different principal; choose a different key.");
+      const adoptable = !clashRow.is_active
+        && clashRow.credential_type === "minter"
+        && clashRow.slug === MINTER_SLUG
+        && clashRow.principal_type === "minter";
+      if (!adoptable) {
+        throw new Error("that key is already registered to a different principal; choose a different key.");
+      }
+      adoptKeyId = clashRow.id;
     }
   }
   const revoked = await client.query(
@@ -323,19 +340,30 @@ async function installKey(client, { householdId, keyHash }) {
   // deleting the row fails outright once the key has written anything. Reinstalling
   // the same key therefore reactivates its existing row; the revoke above has
   // already deactivated every other key for this principal.
-  await client.query(
-    `insert into brain_access_keys
-       (principal_id, brain_id, key_hash, label, credential_type,
-        is_active, is_admin, read_egress_class, can_mint_repo_keys)
-     values ($1::uuid, null, $2, 'repo-key minter', 'minter',
-             true, false, null, true)
-     on conflict (key_hash) do update
-       set is_active = true, updated_at = now()`,
-    [principalId, keyHash],
-  );
+  if (adoptKeyId) {
+    await client.query(
+      `update brain_access_keys
+          set principal_id = $1::uuid, brain_id = null, label = 'repo-key minter',
+              credential_type = 'minter', is_active = true, is_admin = false,
+              read_egress_class = null, can_mint_repo_keys = true, updated_at = now()
+        where id = $2::uuid`,
+      [principalId, adoptKeyId],
+    );
+  } else {
+    await client.query(
+      `insert into brain_access_keys
+         (principal_id, brain_id, key_hash, label, credential_type,
+          is_active, is_admin, read_egress_class, can_mint_repo_keys)
+       values ($1::uuid, null, $2, 'repo-key minter', 'minter',
+               true, false, null, true)
+       on conflict (key_hash) do update
+         set is_active = true, updated_at = now()`,
+      [principalId, keyHash],
+    );
+  }
 
   await client.query("COMMIT");
-  return revoked.rowCount;
+  return { adoptedKey: Boolean(adoptKeyId), revokedCount: revoked.rowCount };
 }
 
 async function main() {
@@ -369,11 +397,15 @@ async function main() {
       throw new Error(`key must be at least ${MIN_KEY_LENGTH} characters; nothing changed. Generate one with: openssl rand -hex 32`);
     }
 
-    const revokedCount = await installKey(client, { householdId: household.id, keyHash: hashAccessKey(raw) });
+    const { adoptedKey, revokedCount } = await installKey(client, { householdId: household.id, keyHash: hashAccessKey(raw) });
 
     // Deliberately prints no key material.
-    console.log(`Minter key installed in household ${household.slug} (${household.id}). Revoked ${revokedCount} previously active minter key(s).`);
-    console.log("Store the raw key in your password manager now — it cannot be recovered from OB1.");
+    if (adoptedKey) {
+      console.log(`Existing minter key rehomed to household ${household.slug} (${household.id}). Revoked ${revokedCount} previously active minter key(s).`);
+    } else {
+      console.log(`Minter key installed in household ${household.slug} (${household.id}). Revoked ${revokedCount} previously active minter key(s).`);
+      console.log("OB1 stores only the key hash; retain the raw key in your password manager.");
+    }
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
     fail(error instanceof Error ? error.message : String(error));
