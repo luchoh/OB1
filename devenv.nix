@@ -95,6 +95,33 @@
       source "$DEVENV_ROOT/scripts/load-open-brain-dev-runtime-env.sh" \
         "$DEVENV_ROOT/.env.open-brain-local"
 
+      # DEV's boot/admin key comes from agenix, NOT from the dotenv above.
+      #
+      # Until 2026-08-21 MCP_ACCESS_KEY came from .env.open-brain-local, whose
+      # value was byte-identical to the fleet-wide ob1-ingest-access-key. So
+      # this runtime silently accepted the shared admin key that every shell on
+      # the box exported, and rotating that key could not close dev — the dotenv
+      # is dev's real key source, so dev kept honouring the old value.
+      #
+      # This override sits AFTER both the dotenv source and the runtime-env
+      # loader and immediately before the Node exec boundary, so nothing
+      # downstream can put the old value back.
+      #
+      # Fail CLOSED: refuse to start rather than fall back to the dotenv value.
+      # A dev runtime booting on the shared fleet admin key is the exact
+      # condition being removed, and it looks identical to success.
+      #
+      # The two dev-facing ingest daemons (ob1-telegram-bridges.dev,
+      # ob1-dictation-imports.dev) read this SAME file in system-config. Change
+      # the source here and you must change it there, or every dev ingest 401s.
+      if [ ! -r /run/agenix/ob1-dev-boot-access-key ]; then
+        echo "ERROR: /run/agenix/ob1-dev-boot-access-key is missing or unreadable." >&2
+        echo "       Refusing to start on a fallback credential." >&2
+        echo "       Rebuild m2maxstudio (nixdev) to provision it." >&2
+        exit 1
+      fi
+      export MCP_ACCESS_KEY="$(cat /run/agenix/ob1-dev-boot-access-key)"
+
       case "$OPEN_BRAIN_HOST" in
         *:*) runtime_address="[$OPEN_BRAIN_HOST]:$OPEN_BRAIN_PORT" ;;
         *) runtime_address="$OPEN_BRAIN_HOST:$OPEN_BRAIN_PORT" ;;
@@ -113,6 +140,28 @@
   '';
 
   enterShell = ''
+    # OB1's own scoped PROD brain key (repo-service:ob1 — editor on repo:ob1 only,
+    # non-admin, non-minter, cannot purge). Consumed by .mcp.json as
+    # ''${OB1_MCP_ACCESS_KEY} and expanded at connect time; the value never lands
+    # in a config file.
+    #
+    # This export EXISTS TO OVERRIDE a global. OB1_MCP_ACCESS_KEY is one shared
+    # variable written by three zshrc blocks (pi-cli, codex-cli, grok-cli),
+    # last-wins, and the last one exports system-config's DEV key. A fresh shell
+    # here would otherwise present another repo's credential against prod.
+    # direnv applies per-directory, so this wins inside ~/Dev/OB1.
+    #
+    # Fail CLOSED: if the secret is unreadable we UNSET rather than inherit. A
+    # 401 from an empty header is a visible failure; silently presenting
+    # system-config's dev key is a wrong-credential bug that looks like success.
+    if [ -r /run/agenix/ob1-ob1-repo-key ]; then
+      export OB1_MCP_ACCESS_KEY="$(cat /run/agenix/ob1-ob1-repo-key)"
+    else
+      unset OB1_MCP_ACCESS_KEY
+      echo "WARNING: /run/agenix/ob1-ob1-repo-key is missing or unreadable."
+      echo "         OB1_MCP_ACCESS_KEY unset — the ob1 MCP server will not authenticate."
+    fi
+
     echo "Open Brain development shell"
     echo ""
     echo "Commands:"
