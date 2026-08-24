@@ -78,7 +78,15 @@ describe("writer attribution and the shared-brain overwrite guard (DB-backed)", 
 
   // A capture as a named writer. Everything else is held constant so the only
   // variable across these tests is WHO is writing.
+
+// Migration 022 fail-closed contract: any mutation of `thoughts` must announce a
+// valid audit actor for the transaction, or the revision trigger refuses the
+// write. Inserts are unaffected (the trigger is AFTER UPDATE), but every
+// re-capture and patch in this suite is a mutation, so the store calls carry one.
+const TEST_ACTOR = { auth_source: "service_key", principal_id: null, is_admin: false };
+
   const capture = (opts) => store.captureThought({
+    actor: TEST_ACTOR,
     content: "x",
     embedding: EMB,
     embeddingModel: "zzt-test-model",

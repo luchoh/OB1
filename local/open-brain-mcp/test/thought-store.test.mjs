@@ -59,8 +59,16 @@ if (skipReason && closePool) {
 }
 
 // --- Helpers ---------------------------------------------------------------
+
+// Migration 022 fail-closed contract: any mutation of `thoughts` must announce a
+// valid audit actor for the transaction, or the revision trigger refuses the
+// write. Inserts are unaffected (the trigger is AFTER UPDATE), but every
+// re-capture and patch in this suite is a mutation, so the store calls carry one.
+const TEST_ACTOR = { auth_source: "service_key", principal_id: null, is_admin: false };
+
 async function capture({ content, dedupeKey, metadata = {} }) {
   return store.captureThought({
+    actor: TEST_ACTOR,
     brainId,
     content,
     embedding: EMB,
@@ -163,7 +171,7 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
   //     monotonic-taint trigger (a downgrade must not be attempted/persisted). ---
   const cap = (extra) => store.captureThought({
     brainId, content: extra.content ?? "x", embedding: EMB, embeddingModel: "zzt-test-model",
-    metadata: {}, ...extra,
+    metadata: {}, actor: TEST_ACTOR, ...extra,
   });
 
   it("captureThought persists the egress stamp columns on insert", async () => {
@@ -212,14 +220,14 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
 
   it("Layer C: cloud_bound cannot patch a restricted row (NOT_FOUND); local_trusted can", async () => {
     const row = await cap({ dedupeKey: "lcp", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none" });
-    await assert.rejects(() => store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "x", callerReadEgressClass: "cloud_bound" }), notFound);
-    const ok = await store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "x", callerReadEgressClass: "local_trusted" });
+    await assert.rejects(() => store.patchThoughtMetadata({ actor: TEST_ACTOR, brainId, thoughtId: row.id, status: "x", callerReadEgressClass: "cloud_bound" }), notFound);
+    const ok = await store.patchThoughtMetadata({ actor: TEST_ACTOR, brainId, thoughtId: row.id, status: "x", callerReadEgressClass: "local_trusted" });
     assert.equal(ok.status, "x");
   });
 
   it("Layer C: cloud_bound CAN patch a standard row", async () => {
     const row = await cap({ dedupeKey: "lcs" });
-    const ok = await store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "ok", callerReadEgressClass: "cloud_bound" });
+    const ok = await store.patchThoughtMetadata({ actor: TEST_ACTOR, brainId, thoughtId: row.id, status: "ok", callerReadEgressClass: "cloud_bound" });
     assert.equal(ok.status, "ok");
   });
 
@@ -234,7 +242,7 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
 
   it("Layer C: absent/unknown caller egress fails closed (cannot mutate a restricted row)", async () => {
     const row = await cap({ dedupeKey: "lcu", sensitivityTier: "restricted", originEgressClass: "local_trusted", reviewState: "none" });
-    await assert.rejects(() => store.patchThoughtMetadata({ brainId, thoughtId: row.id, status: "x" }), notFound);
+    await assert.rejects(() => store.patchThoughtMetadata({ actor: TEST_ACTOR, brainId, thoughtId: row.id, status: "x" }), notFound);
   });
 
   // --- Layer C, capture-upsert path (docs/45 §6.10 / Codex v3 F1): a cloud_bound
@@ -317,7 +325,7 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
   // --- metadata patch ---
   it("patchThoughtMetadata updates a live row; tombstoned and cross-brain are NOT_FOUND", async () => {
     const row = await capture({ content: "patch me", dedupeKey: "p1", metadata: { source: "x" } });
-    const patched = await store.patchThoughtMetadata({
+    const patched = await store.patchThoughtMetadata({ actor: TEST_ACTOR,
       brainId,
       thoughtId: row.id,
       metadataPatch: { user_metadata: { tag: "v" } },
@@ -329,7 +337,7 @@ describe("thought store (DB-backed)", { skip: skipReason }, () => {
 
     await store.softDeleteThought({ brainId, thoughtId: row.id, actor: ACTOR });
     await assert.rejects(
-      () => store.patchThoughtMetadata({ brainId, thoughtId: row.id, metadataPatch: { x: 1 } }),
+      () => store.patchThoughtMetadata({ actor: TEST_ACTOR, brainId, thoughtId: row.id, metadataPatch: { x: 1 } }),
       (e) => e.kind === "not_found",
       "a soft-deleted thought is invisible to a metadata write",
     );

@@ -24,7 +24,24 @@
 // infers scope). The store is DB-coupled by design — its tests are DB-backed
 // against the dev database; this module's logic IS the SQL.
 
-import { query, formatVector } from "./db.mjs";
+import { query, withAuditActor, formatVector } from "./db.mjs";
+
+// Pick the executor for a mutation that the revision trigger (migration 022)
+// may fire on. With an actor we run inside a transaction that announces it to
+// Postgres so the trigger can attribute the revision.
+//
+// Without one the statement runs on a plain pooled connection where the setting
+// does not exist, and the trigger REFUSES the mutation — 022 fails closed. That
+// is deliberate: an unattributed edit is permanent, whereas a refused write is
+// loud and fixed in minutes. A fresh INSERT is unaffected (the trigger is AFTER
+// UPDATE), which is why this stays a runner choice rather than a hard argument
+// check here — only an actual mutation demands an actor.
+function auditedRunner(actor) {
+  if (!actor) {
+    return query;
+  }
+  return (text, values) => withAuditActor(actor, (run) => run(text, values));
+}
 
 // Refusals the store surfaces as data (the transport adapter maps kind -> HTTP).
 // Not thrown for control flow elsewhere — these mark the three outcomes a caller
@@ -127,6 +144,11 @@ export async function captureThought({
   // "unattributed", never "mine" — see the shared-brain guard below.
   writtenByPrincipalId = null,
   writtenByKeyId = null,
+  // Audit actor for the revision trigger (022). Distinct from the writtenBy*
+  // fields above: those describe who OWNS the row, this describes who performed
+  // THIS mutation, and the two differ precisely in the case versioning exists
+  // for — one principal overwriting another's row.
+  actor = null,
 }) {
   const typeValue = typeof metadata?.type === "string" && metadata.type.trim()
     ? metadata.type.trim()
@@ -139,7 +161,7 @@ export async function captureThought({
   // The DO UPDATE is additionally guarded (§6.10): a cloud_bound re-capture over
   // an existing restricted row matches no conflict-update row → 0 rows → the
   // handler's preflight (or this fail-closed backstop) denies it as NOT_FOUND.
-  const result = await query(
+  const result = await auditedRunner(actor)(
     `
       with ${SHARED_BRAIN_CTE}
       insert into thoughts (
@@ -360,6 +382,9 @@ export async function patchThoughtMetadata({
   // docs/45 §6.10: a cloud-bound caller may not mutate an existing restricted
   // row. Fail-closed: absent/unknown egress class is treated as cloud_bound.
   callerReadEgressClass = "cloud_bound",
+  // Audit actor for the revision trigger (022). Before this, the metadata route
+  // was the only mutation path in the store that left no trace at all.
+  actor = null,
 }) {
   const setClauses = [];
   const params = [thoughtId, brainId];
@@ -411,7 +436,7 @@ export async function patchThoughtMetadata({
   params.push(callerReadEgressClass);
   const egressIdx = params.length;
 
-  const result = await query(
+  const result = await auditedRunner(actor)(
     `
       update thoughts
       set ${setClauses.join(",\n        ")}

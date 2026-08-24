@@ -368,7 +368,10 @@ async function handleCaptureThought(args, accessContext, { externalIngest = fals
   // ADR-0002 write ladder: capture is a WRITE. Authorize before doing any work.
   // (Pre-ADR-0002 the runtime had no write gate — any reachable brain was
   // writable; this is the call site that enforcement was missing.)
-  await authorizeWrite(accessContext, brainId);
+  // The verdict carries the audit actor descriptor {auth_source, principal_id,
+  // is_admin}. It used to be discarded here; the revision trigger (022) needs it
+  // to attribute an overwrite, so it is threaded to the store.
+  const writeActor = await authorizeWrite(accessContext, brainId);
   const callerReadEgressClass = accessContext._policy.caller.readEgressClass;
   const caller = accessContext._policy?.caller;
   const content = args.content.trim();
@@ -481,6 +484,7 @@ async function handleCaptureThought(args, accessContext, { externalIngest = fals
     // reads NULL as "not the same writer".
     writtenByPrincipalId: accessContext.principalId ?? caller?.principalId ?? null,
     writtenByKeyId: accessContext.accessKeyId ?? caller?.accessKeyId ?? null,
+    actor: writeActor,
   });
 
   // Never hand back the internal namespaced dedupe key. On a shared agent brain
@@ -783,8 +787,13 @@ export async function handleListThoughts(args, accessContext) {
   // v24 D4/D6: fan out, tag rows with origin, merge newest-first, truncate.
   const perBrain = await Promise.all(
     brains.map(async (b) => {
+      // Writer joined on rather than added to the function's return shape — see
+      // the note on WRITER_JOIN in retrieval.mjs for why.
       const result = await query(
-        "select * from list_recent_thoughts($1::uuid, $2, $3::jsonb)",
+        `select m.*, wp.slug as written_by
+         from list_recent_thoughts($1::uuid, $2, $3::jsonb) m
+         left join thoughts wt on wt.id = m.id
+         left join brain_principals wp on wp.id = wt.written_by_principal_id`,
         [b.brainId, limit, filter],
       );
       return result.rows.map((row) => ({ ...row, brain_id: b.brainId, brain_slug: b.brainSlug }));
@@ -1644,7 +1653,7 @@ app.post("/admin/thought/metadata", async (c) => {
     // it like capture so the ladder has no inconsistent seam (a viewer must not
     // mutate via the metadata path). Runs before the thought lookup, so an
     // unauthorized caller gets 403, not a 404 leak.
-    await authorizeWrite(accessContext, brainId);
+    const patchActor = await authorizeWrite(accessContext, brainId);
     const row = await patchThoughtMetadata({
       brainId,
       thoughtId: payload.thought_id,
@@ -1657,6 +1666,7 @@ app.post("/admin/thought/metadata", async (c) => {
       status: payload.status,
       // §6.10: a cloud_bound caller cannot mutate a restricted row.
       callerReadEgressClass: accessContext._policy.caller.readEgressClass,
+      actor: patchActor,
     });
     return c.json({
       success: true,

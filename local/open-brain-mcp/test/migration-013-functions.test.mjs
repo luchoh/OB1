@@ -38,6 +38,11 @@ let store;
 let brainId;
 let skipReason = false;
 
+// Migration 022 fail-closed contract: a mutation of `thoughts` must announce a
+// valid audit actor for its transaction or the revision trigger refuses it.
+const TEST_ACTOR = { auth_source: "service_key", principal_id: null, is_admin: false };
+let withAuditActor;
+
 try {
   const { config } = await import("../src/config.mjs");
   if (config.postgres?.database === "ob1") {
@@ -45,6 +50,7 @@ try {
   } else {
     const db = await import("../src/db.mjs");
     query = db.query;
+    withAuditActor = db.withAuditActor;
     closePool = db.closePool;
     await query("select 1");
     store = await import("../src/thought-store.mjs");
@@ -136,9 +142,15 @@ describe("migration 013 — rank fallback fix (search_thoughts_text)", { skip: s
     oldFallbackId = (await cap("zzm-old")).id;
 
     // Identical content/text-rank; differ ONLY in the rank-fallback inputs.
-    await query("update thoughts set importance = null, quality_score = null where id = $1::uuid", [nullId]);
-    await query("update thoughts set importance = 3, quality_score = 50 where id = $1::uuid", [defaultId]);
-    await query("update thoughts set importance = 5, quality_score = 0.50 where id = $1::uuid", [oldFallbackId]);
+    // importance and quality_score are versioned columns (migration 022), so
+    // these updates fire the revision trigger and must announce an audit actor
+    // like any other mutation — the trigger fails closed without one.
+    const setRank = (id, importance, quality) => withAuditActor(TEST_ACTOR, (run) =>
+      run("update thoughts set importance = $2, quality_score = $3 where id = $1::uuid",
+        [id, importance, quality]));
+    await setRank(nullId, null, null);
+    await setRank(defaultId, 3, 50);
+    await setRank(oldFallbackId, 5, 0.50);
   });
 
   after(async () => {

@@ -141,10 +141,30 @@ function queryEmbeddingVector(queryText) {
   return createEmbedding(normalized);
 }
 
+// The ranked-read functions do not return the writer, and adding it to them
+// would mean DROPping and recreating all five (Postgres refuses to replace a
+// function whose return shape changed) — ~360 lines of body reproduced by hand
+// for a column the caller can join on. They return `id`, so we join here
+// instead: no migration, and the five function definitions stay untouched.
+//
+// The join is against the already-limited result set (at most match_count rows),
+// both sides on primary keys.
+//
+// The slug, not the uuid: the point is that a reader can see at a glance that an
+// agent wrote something, and a uuid does not tell them that. NULL is the honest
+// and common answer — every row captured before writer attribution existed, and
+// anything written through the legacy shared key, genuinely has no recorded
+// writer. "Unknown" is not the same as "yours".
+const WRITER_JOIN = `
+  left join thoughts wt on wt.id = m.id
+  left join brain_principals wp on wp.id = wt.written_by_principal_id`;
+
 async function matchThoughtRows({ brainId, embedding, threshold, count, filter, recencyWeight = 0, halfLifeDays = 90 }) {
   if (recencyWeight > 0) {
     return query(
-      "select * from match_thoughts_recency($1::uuid, $2::vector, $3, $4, $5::jsonb, $6, $7)",
+      `select m.*, wp.slug as written_by
+       from match_thoughts_recency($1::uuid, $2::vector, $3, $4, $5::jsonb, $6, $7) m
+       ${WRITER_JOIN}`,
       [
         brainId,
         formatVector(embedding),
@@ -157,7 +177,9 @@ async function matchThoughtRows({ brainId, embedding, threshold, count, filter, 
     );
   }
   return query(
-    "select * from match_thoughts($1::uuid, $2::vector, $3, $4, $5::jsonb)",
+    `select m.*, wp.slug as written_by
+     from match_thoughts($1::uuid, $2::vector, $3, $4, $5::jsonb) m
+     ${WRITER_JOIN}`,
     [
       brainId,
       formatVector(embedding),
