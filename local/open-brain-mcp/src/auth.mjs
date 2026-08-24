@@ -5,6 +5,7 @@ import { query } from "./db.mjs";
 import {
   ACTIONS,
   CALLER_KINDS,
+  CALLER_EGRESS_CLASS,
   VERDICTS,
   isBrainUuid,
   deriveScope,
@@ -53,7 +54,10 @@ function humanToken(c) {
   return match?.[1]?.trim() || null;
 }
 
-function hashAccessKey(value) {
+// Exported: repo-key-minting.mjs and scripts/mint-authority-init.mjs both store
+// keys hash-only and must hash them exactly the way the auth path does. One
+// definition, or the two drift and a minted key never authenticates.
+export function hashAccessKey(value) {
   return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
@@ -125,7 +129,8 @@ async function fetchEstateMemberships(principalId) {
 async function fetchBrainCatalog(principalId, { isAdmin, homeEstateId }) {
   const result = await query(
     `
-      select b.id as brain_id, b.slug as brain_slug, b.household_id as estate_id
+      select b.id as brain_id, b.slug as brain_slug, b.household_id as estate_id,
+             b.egress_class as egress_class
       from brains b
       where exists (
           select 1 from brain_memberships bm
@@ -139,7 +144,14 @@ async function fetchBrainCatalog(principalId, { isAdmin, homeEstateId }) {
     `,
     [principalId, Boolean(isAdmin), homeEstateId],
   );
-  return result.rows.map((r) => ({ brainId: r.brain_id, brainSlug: r.brain_slug, estateId: r.estate_id }));
+  return result.rows.map((r) => ({
+    brainId: r.brain_id,
+    brainSlug: r.brain_slug,
+    estateId: r.estate_id,
+    // egress_class is an AUTHORIZATION INPUT to scope derivation (docs/45 §6.13).
+    // NULL/absent → the policy fail-closes it to local-only.
+    egressClass: r.egress_class ?? undefined,
+  }));
 }
 
 async function brainExists(brainId) {
@@ -239,7 +251,20 @@ async function slugForBrain(brainId, scope) {
 // key's brain_id hint when present (ADR-0003: a default hint, never a clamp).
 async function buildPrincipalContext(
   principalId,
-  { authSource, isAdmin, defaultBrainOverride = null, requireUsableBrain },
+  {
+    authSource,
+    isAdmin,
+    defaultBrainOverride = null,
+    requireUsableBrain,
+    readEgressClass = CALLER_EGRESS_CLASS.CLOUD_BOUND,
+    canMintRepoKeys = false,
+    // Writer attribution (0.8.0): WHICH credential is speaking, not what it may
+    // do. Both default to null so a caller shape that cannot supply them (human
+    // token today, legacy admin — which never calls this function) attributes as
+    // "unknown" rather than failing. Never an authorization input.
+    accessKeyId = null,
+    principalType = null,
+  },
   requestedBrainSlug,
 ) {
   const base = await query(
@@ -258,6 +283,19 @@ async function buildPrincipalContext(
     homeEstateId,
     isAdmin: Boolean(isAdmin),
     defaultBrainId,
+    // Layer-A egress audience (docs/45 §6.2). Only a stored key explicitly marked
+    // local_trusted is trusted; every other shape is cloud_bound (fail-closed).
+    readEgressClass,
+    // docs/53: least-privilege repo-key minting. Defaulted false HERE, so every
+    // caller shape that does not explicitly pass it — human token, and the legacy
+    // admin path, which never calls this function at all — is false. The admin
+    // secret can therefore never mint through the tool.
+    canMintRepoKeys: Boolean(canMintRepoKeys),
+    // Attribution only (see above): the key row that authenticated this request
+    // and the principal's type. Carried on the caller so any write path can stamp
+    // "who wrote this" without re-querying the credential.
+    accessKeyId: accessKeyId ?? null,
+    principalType: principalType ?? null,
   };
 
   const [brainMemberships, estateMemberships, catalog] = await Promise.all([
@@ -266,7 +304,25 @@ async function buildPrincipalContext(
     fetchBrainCatalog(principalId, caller),
   ]);
 
-  const scope = deriveScope({ caller, brainMemberships, estateMemberships, catalog });
+  const egressMode = config.egressEnforce;
+  const scope = deriveScope({ caller, brainMemberships, estateMemberships, catalog, egressMode });
+
+  // docs/45 §9: in observe/enforce, record (audit only) the local-only brains a
+  // cloud-bound caller's read would otherwise reach. Slugs only — NEVER thought
+  // content. observe = visibility without behaviour change; enforce = these were
+  // actually stripped from scope.
+  if ((egressMode === "observe" || egressMode === "enforce") && scope.egressExcluded.length > 0) {
+    console.warn(
+      JSON.stringify({
+        event: "egress.read_excluded",
+        mode: egressMode,
+        authSource: caller.kind,
+        principalId: caller.principalId,
+        readEgressClass: caller.readEgressClass,
+        excludedBrainSlugs: scope.egressExcluded.map((b) => b.brainSlug),
+      }),
+    );
+  }
 
   let requestedBrain = null;
   if (requestedBrainSlug) {
@@ -288,6 +344,7 @@ async function buildPrincipalContext(
     requestedBrain,
     effectiveBrainId,
     effectiveBrainSlug,
+    egressMode,
   });
 }
 
@@ -302,6 +359,7 @@ function makeContext({
   requestedBrain,
   effectiveBrainId,
   effectiveBrainSlug,
+  egressMode = "off",
 }) {
   const brainMembershipById = new Map(
     brainMemberships.map((m) => [m.brainId, { role: m.role, isDeny: m.isDeny }]),
@@ -314,6 +372,9 @@ function makeContext({
   return {
     authSource: caller.kind,
     principalId: caller.principalId,
+    // Writer attribution (0.8.0). Null for any caller that is not a stored key.
+    accessKeyId: caller.accessKeyId ?? null,
+    principalType: caller.principalType ?? null,
     householdId: caller.homeEstateId,
     defaultBrainId: caller.defaultBrainId,
     allowedBrainIds: brainMemberships.filter((m) => !m.isDeny).map((m) => m.brainId),
@@ -323,7 +384,7 @@ function makeContext({
     requestedBrainId: requestedBrain?.brainId ?? null,
     requestedBrainSlug: requestedBrain?.brainSlug ?? null,
     isAdmin: caller.isAdmin,
-    _policy: { caller, scope, brainMembershipById, estateMembershipByEstate, brainEstateById },
+    _policy: { caller, scope, egressMode, brainMembershipById, estateMembershipByEstate, brainEstateById },
   };
 }
 
@@ -368,10 +429,18 @@ async function resolveHumanAccessContext(c, requestedBrainSlug) {
     throw new HttpError(403, "Authenticated user is not bound to an OB1 principal");
   }
 
-  // Human tokens are never admin keys; reach is purely membership-derived.
+  // Human tokens are never admin keys; reach is purely membership-derived. A
+  // human token is a cloud-bound audience (docs/45 §6.2): no key-level
+  // local_trusted marking exists for it, so it never reads local-only brains
+  // under enforce.
   return buildPrincipalContext(
     bindingResult.rows[0].principal_id,
-    { authSource: CALLER_KINDS.HUMAN_TOKEN, isAdmin: false, requireUsableBrain: false },
+    {
+      authSource: CALLER_KINDS.HUMAN_TOKEN,
+      isAdmin: false,
+      requireUsableBrain: false,
+      readEgressClass: CALLER_EGRESS_CLASS.CLOUD_BOUND,
+    },
     requestedBrainSlug,
   );
 }
@@ -379,7 +448,9 @@ async function resolveHumanAccessContext(c, requestedBrainSlug) {
 async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
   const result = await query(
     `
-      select k.brain_id as key_brain_id, k.is_admin, p.id as principal_id
+      select k.id as key_id, k.brain_id as key_brain_id, k.is_admin,
+             k.read_egress_class, k.can_mint_repo_keys,
+             p.id as principal_id, p.principal_type
       from brain_access_keys k
       join brain_principals p on p.id = k.principal_id
       where k.key_hash = $1 and k.is_active = true
@@ -400,13 +471,32 @@ async function resolveStoredAccessKeyContext(keyHash, requestedBrainSlug) {
   // ADR-0003: the key's brain_id is a default-brain hint only — NOT a naming
   // clamp. The old brain-bound restriction is retired; capability comes from
   // roles, reach from memberships + (for admin keys) the home estate.
+  // docs/45 §6.2: only an explicit local_trusted marking trusts the key for
+  // local-only reads. NULL/unknown fails closed to cloud_bound.
+  const readEgressClass = row.read_egress_class === CALLER_EGRESS_CLASS.LOCAL_TRUSTED
+    ? CALLER_EGRESS_CLASS.LOCAL_TRUSTED
+    : CALLER_EGRESS_CLASS.CLOUD_BOUND;
+
+  // docs/53: the minter is deliberately brain-less (brain_id null, no
+  // memberships), so the usual "key must land on a usable brain" 403 would reject
+  // it before any tool ran. Relax that ONE precondition for a minting key only —
+  // it buys no reach: with an empty scope every content tool still has no brain
+  // to act on, and mint/rotate resolve their own brain inside a transaction.
+  const canMintRepoKeys = Boolean(row.can_mint_repo_keys);
+
   return buildPrincipalContext(
     row.principal_id,
     {
       authSource: CALLER_KINDS.SERVICE_KEY,
       isAdmin: Boolean(row.is_admin),
       defaultBrainOverride: row.key_brain_id,
-      requireUsableBrain: true,
+      requireUsableBrain: !canMintRepoKeys,
+      readEgressClass,
+      canMintRepoKeys,
+      // Attribution: the exact credential row behind this request, so a write can
+      // be traced back to ONE key (a principal may hold several) after the fact.
+      accessKeyId: row.key_id,
+      principalType: row.principal_type ?? null,
     },
     requestedBrainSlug,
   );
@@ -422,6 +512,14 @@ async function resolveLegacyAdminContext(requestedBrainSlug) {
     homeEstateId: null,
     isAdmin: true,
     defaultBrainId: null,
+    // Unattributable by construction: the bare env key is not a stored row and
+    // has no principal, so its writes stamp NULL writer columns.
+    accessKeyId: null,
+    principalType: null,
+    // The bare legacy key is an unattributable, cloud-bound audience (docs/45
+    // §6.2). It does not fan out (no accessible set), so egress filtering on the
+    // legacy path is moot, but the field is set for shape consistency / fail-safe.
+    readEgressClass: CALLER_EGRESS_CLASS.CLOUD_BOUND,
   };
 
   let requestedBrain = null;
@@ -443,6 +541,8 @@ async function resolveLegacyAdminContext(requestedBrainSlug) {
   return {
     authSource: caller.kind,
     principalId: null,
+    accessKeyId: null,
+    principalType: null,
     householdId,
     defaultBrainId: effectiveBrainId,
     allowedBrainIds: effectiveBrainId ? [effectiveBrainId] : [],
@@ -456,7 +556,8 @@ async function resolveLegacyAdminContext(requestedBrainSlug) {
     isAdmin: true,
     _policy: {
       caller,
-      scope: { accessible: [], accessibleIds: new Set(), lookup: [] },
+      scope: { accessible: [], accessibleIds: new Set(), lookup: [], egressExcluded: [] },
+      egressMode: config.egressEnforce,
       brainMembershipById: new Map(),
       estateMembershipByEstate: new Map(),
       brainEstateById: new Map(),
@@ -483,6 +584,11 @@ export async function resolveAccessContext(c, { routeBrainSlug = null } = {}) {
 
   const storedContext = await resolveStoredAccessKeyContext(hashAccessKey(key), requestedBrainSlug);
   if (!storedContext) {
+    // Rejections were entirely silent, so probing for the minting capability with
+    // a stolen or guessed key left no trace at all. Log the FACT only — never the
+    // presented key, its hash, or any prefix of either, since this line is written
+    // for every failed attempt and would otherwise become a credential oracle.
+    console.warn(JSON.stringify({ event: "auth.key_rejected", authSource: "access_key" }));
     throw new HttpError(401, "Unauthorized");
   }
 
@@ -496,20 +602,59 @@ export async function resolveAccessContext(c, { routeBrainSlug = null } = {}) {
 // Resolve a body/tool-arg `brain` selector for an authenticated request. Absent
 // -> the effective (default/L1) brain. A body selector that disagrees with an
 // explicit L1 selector is a conflict (400), not a silent override (v24 D3).
+// A brain is "local-only" (not cloud-readable) unless its egress_class is
+// public/repo. Fail-closed: an unknown/missing class is local-only. Used to
+// confine the legacy global-admin path under enforce — it bypasses deriveScope
+// (no scope/catalog), so the egressExcluded mechanism never reaches it.
+async function brainIsLocalOnly(brainId) {
+  const r = await query("select egress_class from brains where id = $1::uuid", [brainId]);
+  const ec = r.rows[0]?.egress_class;
+  return ec !== "public" && ec !== "repo";
+}
+
 export async function resolveRequestBrain(accessContext, brainArg) {
   const selector = typeof brainArg === "string" ? brainArg.trim() : brainArg;
+  const { caller, scope, egressMode } = accessContext._policy;
+  const enforce = egressMode === "enforce";
+  const callerCloudBound = caller.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED;
+
   if (selector == null || selector === "") {
+    const brainId = accessContext.effectiveBrainId;
+    // §6.13 (audit H1): an EXPLICIT selector for an egress-excluded brain already
+    // 404s (it is gone from `scope.lookup` under enforce), but the no-selector
+    // DEFAULT-brain fallback bypasses scope — so a cloud_bound caller whose
+    // default brain is private_local would leak it through ask_brain /
+    // expand_context (single-brain reads) and could write to it. Reject the
+    // default brain here under enforce too. (This also settles the enforce
+    // write-path question: enforce excludes such a brain for BOTH read and write,
+    // which is fail-safe — a properly-provisioned cloud principal never holds a
+    // private_local membership in the first place.)
+    if (enforce && brainId && scope.egressExcluded?.some((b) => b.brainId === brainId)) {
+      throw new HttpError(404, "Brain not found");
+    }
+    // §6.3 (review #3): the legacy global-admin path has no scope/egressExcluded,
+    // so confine its DEFAULT brain by egress_class — a cloud_bound legacy key must
+    // not reach a local-only brain under enforce.
+    if (enforce && callerCloudBound && brainId
+        && caller.kind === CALLER_KINDS.LEGACY_ADMIN_KEY
+        && await brainIsLocalOnly(brainId)) {
+      throw new HttpError(404, "Brain not found");
+    }
     return {
-      brainId: accessContext.effectiveBrainId,
+      brainId,
       brainSlug: accessContext.effectiveBrainSlug ?? null,
     };
   }
 
-  const { caller, scope } = accessContext._policy;
   let resolved;
   if (caller.kind === CALLER_KINDS.LEGACY_ADMIN_KEY) {
     const r = await resolveGlobalSelector(selector);
     resolved = { brainId: r.brainId, brainSlug: r.brainSlug };
+    // §6.3 (review #3): the legacy global resolution names brains across every
+    // estate with no scope/egress check; confine it under enforce.
+    if (enforce && callerCloudBound && resolved.brainId && await brainIsLocalOnly(resolved.brainId)) {
+      throw new HttpError(404, `Brain not found: ${selector}`);
+    }
   } else {
     resolved = await resolveScopedSelector(selector, scope);
   }
@@ -534,7 +679,7 @@ export async function resolveReadBrains(accessContext, brainArg) {
     return [await resolveRequestBrain(accessContext, selector)];
   }
 
-  const { caller, scope } = accessContext._policy;
+  const { caller, scope, egressMode } = accessContext._policy;
   const effectiveBrain = {
     brainId: accessContext.effectiveBrainId,
     brainSlug: accessContext.effectiveBrainSlug ?? null,
@@ -542,6 +687,7 @@ export async function resolveReadBrains(accessContext, brainArg) {
   return planReadFanout({
     caller,
     scope,
+    egressMode,
     // An L1 selector (route/query/header) narrows the read to that one brain.
     explicitBrain: accessContext.requestedBrainId ? effectiveBrain : null,
     effectiveBrain,

@@ -1,0 +1,1117 @@
+import crypto from "node:crypto";
+import { pool, query } from "./db.mjs";
+import { HttpError, hashAccessKey } from "./auth.mjs";
+
+// repo-key-minting.mjs — the handlers behind the `mint_repo_key` /
+// `rotate_repo_key` tools (docs/53), the `mint_agent_key` / `rotate_agent_key`
+// tools that provision the caged agent, and the read-only `list_brains` /
+// `list_principals` / `list_keys` enumeration tools that make the resulting
+// estate auditable (see the ENUMERATION section at the foot of this file).
+//
+// PURPOSE: let system-config provision a per-repo brain + a cloud_bound repo key
+// for each interactive harness, so no harness needs the shared MCP_ACCESS_KEY
+// (which is global admin). The capability that gates every handler here —
+// can_mint_repo_keys — creates repo brains, repo keys and agent keys and NOTHING
+// else.
+//
+// TWO CREDENTIAL FAMILIES, DISJOINT BRAINS (docs/adr/0006). A key grants the
+// reach of its PRINCIPAL (auth.mjs fetchBrainMemberships), so one key = one
+// principal = one membership set — which is why pi cannot be "the same key plus
+// one brain" and needs a second credential.
+//   repo-service:<slug>  editor on repo:<slug>       — claude, codex AND pi
+//   pi-common:<slug>     editor on the shared brain  — pi only
+// pi is the CONTAINED agent (claude/codex run as the operator on the host), so it
+// is the one trusted with the estate-wide shared brain; it does repo work with the
+// same repo key as everyone else. The agent key therefore reaches the shared brain
+// and nothing else: no repo-brain membership, so pi-authored repo rows are
+// indistinguishable from claude's, which the operator accepted.
+// The guards below are still scoped by principal and credential_type rather than
+// by brain — 0.8.0 put both families on the repo brain, and any surviving row from
+// then must not let one family's rotation clobber the other's key.
+//
+// THE RULE THIS FILE EXISTS TO KEEP: every security-relevant column written here
+// is a hard-coded literal, never taken from tool arguments. A caller controls
+// only `repo_slug` and a display name. It cannot ask for is_admin, for a
+// different egress_class, for can_mint_repo_keys, or for a brain kind. A minting
+// key that could choose those would be an admin key with extra steps.
+//
+// Both handlers run in a real transaction with SELECT ... FOR UPDATE on the repo
+// brain row, because "check then insert" across two statements is a race: two
+// concurrent mints for the same repo would otherwise both pass the
+// already-has-an-active-key check and issue two live keys.
+
+// DNS-safe: these slugs become brain slugs and appear in operator tooling. Also
+// the reason a slug can never smuggle SQL or a namespace separator.
+const REPO_SLUG_PATTERN = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
+
+// Brains and principals live in separate namespaces (each is unique per
+// household), kept visibly distinct so an operator reading a row knows which
+// table they are looking at.
+const BRAIN_SLUG_PREFIX = "repo:";
+const PRINCIPAL_SLUG_PREFIX = "repo-service:";
+// "pi-common", not "pi": the principal's whole reach is the estate-wide COMMON
+// brain, and the slug should say so to an operator reading brain_principals. The
+// repo part of the slug is per-repo revocation granularity, not repo reach.
+const AGENT_PRINCIPAL_SLUG_PREFIX = "pi-common:";
+
+// principal_type / credential_type are plain text with no CHECK constraint
+// (migration 005), so 'caged_agent' and 'agent_key' need no migration. Verified
+// against ob1_dev: pg_constraint carries no check on either column. They are
+// module constants precisely BECAUSE the database will not reject a typo.
+const PRINCIPAL_TYPE_REPO_SERVICE = "repo_service";
+const PRINCIPAL_TYPE_CAGED_AGENT = "caged_agent";
+const CREDENTIAL_TYPE_REPO_KEY = "repo_key";
+const CREDENTIAL_TYPE_AGENT_KEY = "agent_key";
+
+const MANAGED_PRINCIPAL_TYPES = new Set([PRINCIPAL_TYPE_REPO_SERVICE, PRINCIPAL_TYPE_CAGED_AGENT]);
+const MANAGED_CREDENTIAL_TYPES = new Set([CREDENTIAL_TYPE_REPO_KEY, CREDENTIAL_TYPE_AGENT_KEY]);
+
+// The two generic helpers below take a principal/credential type as a parameter,
+// which is one refactor away from a caller passing an argument-derived string
+// into a security-relevant column. These make that a crash rather than a grant:
+// only the module's own constants are ever writable.
+function assertManagedPrincipalType(value) {
+  if (!MANAGED_PRINCIPAL_TYPES.has(value)) {
+    throw new Error(`refusing to write unmanaged principal_type '${value}'`);
+  }
+  return value;
+}
+
+function assertManagedCredentialType(value) {
+  if (!MANAGED_CREDENTIAL_TYPES.has(value)) {
+    throw new Error(`refusing to write unmanaged credential_type '${value}'`);
+  }
+  return value;
+}
+
+function requireMintCapability(accessContext) {
+  if (accessContext?._policy?.caller?.canMintRepoKeys !== true) {
+    throw new HttpError(403, "Not authorized to mint repo keys");
+  }
+}
+
+function validateRepoSlug(value) {
+  const slug = typeof value === "string" ? value.trim() : "";
+  if (!REPO_SLUG_PATTERN.test(slug)) {
+    throw new HttpError(
+      400,
+      "repo_slug must be DNS-safe: lowercase letters, digits and hyphens, 1-63 chars, not starting or ending with a hyphen",
+    );
+  }
+  return slug;
+}
+
+// The minter is brain-less, so its home estate is the only household it can
+// provision into. This is what confines minting to one estate.
+function mintingHouseholdId(accessContext) {
+  const householdId = accessContext?.householdId ?? null;
+  if (!householdId) {
+    throw new HttpError(403, "Minting key is not homed in an estate");
+  }
+  return householdId;
+}
+
+// display_name is operator-facing text that lands in a brain listing. Unbounded,
+// it accepted a 200,000-character name; unstripped, an ANSI escape or a newline
+// in it corrupts whatever terminal or listing the operator reads it in. Bound and
+// strip here as well as in the zod schema — the schema guards the tool call, this
+// guards every caller.
+const DISPLAY_NAME_MAX = 128;
+const CONTROL_CHARS = /[\u0000-\u001f\u007f-\u009f]/g;
+
+export function sanitizeDisplayName(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+  // Control characters become spaces rather than vanishing, so "a\nb" stays two
+  // words instead of silently becoming "ab".
+  return value.replace(CONTROL_CHARS, " ").replace(/\s+/g, " ").trim().slice(0, DISPLAY_NAME_MAX).trim();
+}
+
+function newRepoKey() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+// Lock the candidate repo brain for the length of the transaction. Returns null
+// when the slug is free.
+async function lockRepoBrain(client, householdId, brainSlug) {
+  const result = await client.query(
+    `select id, kind, egress_class, is_default_shared
+     from brains
+     where household_id = $1::uuid and slug = $2
+     for update`,
+    [householdId, brainSlug],
+  );
+  return result.rows[0] ?? null;
+}
+
+// A brain that is not a repo brain — and above all the default shared brain — is
+// never touched by either handler. This is the guard that keeps a minting key
+// from being pointed at the household's personal brain by naming it.
+function assertIsRepoBrain(row, repoSlug) {
+  if (row.is_default_shared || row.kind !== "repo" || row.egress_class !== "repo") {
+    throw new HttpError(
+      409,
+      `Brain '${BRAIN_SLUG_PREFIX}${repoSlug}' exists but is not a repo brain; refusing to touch it`,
+    );
+  }
+}
+
+// Every column but principal/brain/label is a literal here — is_admin false,
+// can_mint_repo_keys false, read_egress_class null. credential_type is the one
+// varying column and it is checked against the module's own set.
+async function insertCredential(client, { principalId, brainId, label, credentialType }) {
+  assertManagedCredentialType(credentialType);
+  const plaintext = newRepoKey();
+  const inserted = await client.query(
+    `insert into brain_access_keys
+       (principal_id, brain_id, key_hash, label, credential_type,
+        is_active, is_admin, read_egress_class, can_mint_repo_keys)
+     values ($1::uuid, $2::uuid, $3, $4, $5,
+             true, false, null, false)
+     returning id`,
+    [principalId, brainId, hashAccessKey(plaintext), label, credentialType],
+  );
+  // read_egress_class null => cloud_bound (fail-closed, docs/45 §6.2): neither a
+  // repo key nor an agent key may read private_local brains under enforce.
+  return { plaintext, keyId: inserted.rows[0].id };
+}
+
+function insertRepoKey(client, { principalId, brainId, repoSlug }) {
+  return insertCredential(client, {
+    principalId,
+    brainId,
+    label: `repo key: ${repoSlug}`,
+    credentialType: CREDENTIAL_TYPE_REPO_KEY,
+  });
+}
+
+// brainId here is the SHARED brain: brain_id is a default-brain hint (ADR-0003),
+// never a clamp, and the shared brain is now the only brain this key reaches.
+function insertAgentKey(client, { principalId, brainId, repoSlug }) {
+  return insertCredential(client, {
+    principalId,
+    brainId,
+    label: `agent key: ${AGENT_PRINCIPAL_SLUG_PREFIX}${repoSlug}`,
+    credentialType: CREDENTIAL_TYPE_AGENT_KEY,
+  });
+}
+
+// Minting is credential issuance. Without a line here the only trace of a mint is
+// a row's created_at, and a rotation that revokes a live credential leaves nothing
+// at all — so "who minted what, and when" is unanswerable after a key leak.
+// Slugs and ids only: never the plaintext, never a hash, not even a prefix.
+function auditCredentialEvent(event, fields) {
+  console.warn(JSON.stringify({ event, ...fields }));
+}
+
+// A principal whose slug happens to match ours may be something else entirely —
+// and brain_access_keys grants the reach of its PRINCIPAL, not of the brain we
+// name. Adopting a stranger's principal would silently issue a "repo key" that
+// carries that principal's whole membership set, including write on a
+// private_local personal brain. So: only ever adopt a principal of the type this
+// credential family owns, and only one whose memberships are already confined to
+// the brains the credential is meant to grant.
+//
+// The FOR UPDATE here is also what makes each family's "already has a live key"
+// check safe: the principal row is the serialization point for two concurrent
+// mints of the same credential.
+async function resolveManagedPrincipal(client, {
+  householdId,
+  principalSlug,
+  principalType,
+  displayName,
+  defaultBrainId,
+  allowedBrainIds,
+  createIfMissing,
+  missingMessage,
+}) {
+  assertManagedPrincipalType(principalType);
+  const existing = await client.query(
+    `select id, principal_type from brain_principals
+     where household_id = $1::uuid and slug = $2
+     for update`,
+    [householdId, principalSlug],
+  );
+
+  if (existing.rowCount === 0) {
+    if (!createIfMissing) {
+      throw new HttpError(404, missingMessage);
+    }
+    const created = await client.query(
+      `insert into brain_principals
+         (household_id, slug, display_name, principal_type, default_brain_id)
+       values ($1::uuid, $2, $3, $4, $5::uuid)
+       returning id`,
+      [householdId, principalSlug, displayName, principalType, defaultBrainId],
+    );
+    return created.rows[0].id;
+  }
+
+  const row = existing.rows[0];
+  if (row.principal_type !== principalType) {
+    throw new HttpError(
+      409,
+      `Principal '${principalSlug}' exists but is a '${row.principal_type}', not a '${principalType}'; refusing to issue a key for it`,
+    );
+  }
+
+  const foreign = await client.query(
+    `select count(*)::int as n from brain_memberships
+     where principal_id = $1::uuid and brain_id <> all($2::uuid[])`,
+    [row.id, allowedBrainIds],
+  );
+  if (foreign.rows[0].n > 0) {
+    throw new HttpError(
+      409,
+      `Principal '${principalSlug}' has memberships on brains outside this credential's scope; refusing to issue a key that would inherit them`,
+    );
+  }
+
+  return row.id;
+}
+
+function resolveRepoServicePrincipal(client, { householdId, principalSlug, brainId, repoSlug }) {
+  return resolveManagedPrincipal(client, {
+    householdId,
+    principalSlug,
+    principalType: PRINCIPAL_TYPE_REPO_SERVICE,
+    displayName: `Repo service: ${repoSlug}`,
+    defaultBrainId: brainId,
+    allowedBrainIds: [brainId],
+    createIfMissing: true,
+  });
+}
+
+// The caged agent's blast radius IS this brain list: the household's one shared
+// agent brain, nothing else, ever. A pre-0.8.0 pi principal that still carries a
+// repo-brain membership fails the foreign-membership guard rather than being
+// silently re-issued — a migration is not needed, but such a principal must be
+// cleaned up (or renamed out of the way) by hand before it can be re-minted.
+function resolveCagedAgentPrincipal(client, {
+  householdId, principalSlug, sharedBrainId, repoSlug, createIfMissing,
+}) {
+  return resolveManagedPrincipal(client, {
+    householdId,
+    principalSlug,
+    principalType: PRINCIPAL_TYPE_CAGED_AGENT,
+    displayName: `Caged agent (common): ${repoSlug}`,
+    defaultBrainId: sharedBrainId,
+    allowedBrainIds: [sharedBrainId],
+    createIfMissing,
+    missingMessage: `No agent principal '${principalSlug}'; use mint_agent_key to create it`,
+  });
+}
+
+// The household's shared agent brain is operator-created and NEVER created here:
+// it is a cross-repo write surface for an injection-exposed agent, so which brain
+// plays that role — and at which egress_class — is a deliberate human decision,
+// not a side effect of provisioning a repo. Two of them is equally a human
+// decision the code must not make for itself.
+async function lockSharedAgentBrain(client, householdId) {
+  const result = await client.query(
+    `select id, slug, egress_class, is_default_shared, kind
+     from brains
+     where household_id = $1::uuid and is_shared_agent_brain = true
+     order by created_at asc
+     for update`,
+    [householdId],
+  );
+  if (result.rowCount === 0) {
+    throw new HttpError(
+      409,
+      "This estate has no shared agent brain (brains.is_shared_agent_brain); create it first — agent keys are never issued against an implicitly created brain",
+    );
+  }
+  if (result.rowCount > 1) {
+    throw new HttpError(
+      409,
+      `This estate has ${result.rowCount} brains marked is_shared_agent_brain; exactly one is required — refusing to guess which one the agent should write to`,
+    );
+  }
+
+  // The flag alone is not enough authority. It is a plain boolean an operator can
+  // set on ANY row, including the household's personal private_local brain — and
+  // doing so would hand the caged, injection-exposed pi principal editor rights on
+  // it. The shape is checked here, not trusted from the column, for the same
+  // reason assertIsRepoBrain re-checks a repo brain rather than trusting its slug.
+  const shared = result.rows[0];
+  if (shared.is_default_shared || shared.kind !== "repo" || shared.egress_class !== "repo") {
+    throw new HttpError(
+      409,
+      `Brain '${shared.slug}' is flagged is_shared_agent_brain but is not a repo-class brain `
+      + `(kind=${shared.kind}, egress_class=${shared.egress_class}, is_default_shared=${shared.is_default_shared}); `
+      + "refusing to grant an agent key against it",
+    );
+  }
+  return shared;
+}
+
+// Grant editor on exactly the intended brains. ON CONFLICT DO NOTHING and not an
+// upsert: an operator who downgraded or denied one of these memberships by hand
+// meant it, and a re-mint must not silently restore write.
+async function grantEditorMemberships(client, principalId, brainIds) {
+  await client.query(
+    `insert into brain_memberships (principal_id, brain_id, role)
+     select $1::uuid, b, 'editor' from unnest($2::uuid[]) as b
+     on conflict (principal_id, brain_id) do nothing`,
+    [principalId, brainIds],
+  );
+}
+
+// mint_repo_key — CREATE-ONLY. It will provision a missing repo brain, but it
+// will never replace a live credential: if the repo brain already has an active
+// key, the caller is told to rotate instead. Silently issuing a second live key
+// would mean a repo has two valid credentials and revoking one revokes nothing.
+export async function handleMintRepoKey(args, accessContext) {
+  requireMintCapability(accessContext);
+  const repoSlug = validateRepoSlug(args?.repo_slug);
+  const householdId = mintingHouseholdId(accessContext);
+  const brainSlug = `${BRAIN_SLUG_PREFIX}${repoSlug}`;
+  const principalSlug = `${PRINCIPAL_SLUG_PREFIX}${repoSlug}`;
+  const displayName = sanitizeDisplayName(args?.display_name) || `Repo brain: ${repoSlug}`;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    let brainId;
+    const existing = await lockRepoBrain(client, householdId, brainSlug);
+    if (existing) {
+      assertIsRepoBrain(existing, repoSlug);
+      // Scoped to the REPO-SERVICE credential, not to the brain. The caged agent
+      // holds an agent_key on this same brain; a brain-wide check would report
+      // "already has an active key" for a repo that has never been issued one,
+      // making provisioning order (agent before repo) an unrecoverable 409.
+      const active = await client.query(
+        `select 1
+         from brain_access_keys k
+         join brain_principals p on p.id = k.principal_id
+         where k.brain_id = $1::uuid
+           and k.is_active = true
+           and k.credential_type = $2
+           and p.principal_type = $3
+         limit 1`,
+        [existing.id, CREDENTIAL_TYPE_REPO_KEY, PRINCIPAL_TYPE_REPO_SERVICE],
+      );
+      if (active.rowCount > 0) {
+        throw new HttpError(
+          409,
+          `Repo '${repoSlug}' already has an active key; use rotate_repo_key to replace it`,
+        );
+      }
+      brainId = existing.id;
+    } else {
+      try {
+        const created = await client.query(
+          `insert into brains (household_id, slug, display_name, kind, egress_class, is_default_shared)
+           values ($1::uuid, $2, $3, 'repo', 'repo', false)
+           returning id`,
+          [householdId, brainSlug, displayName],
+        );
+        brainId = created.rows[0].id;
+      } catch (error) {
+        // Losing a create race is the same condition as "already provisioned", and
+        // the caller deserves that answer rather than a raw Postgres constraint
+        // name. FOR UPDATE cannot cover this case: there is no row to lock yet.
+        if (error?.code === "23505") {
+          throw new HttpError(
+            409,
+            `Repo '${repoSlug}' already has an active key; use rotate_repo_key to replace it`,
+          );
+        }
+        throw error;
+      }
+    }
+
+    // The per-repo service principal is reused across rotations, so the repo's
+    // audit trail stays attached to one identity rather than fragmenting per key.
+    const principalId = await resolveRepoServicePrincipal(client, {
+      householdId, principalSlug, brainId, repoSlug,
+    });
+
+    await client.query(
+      `insert into brain_memberships (principal_id, brain_id, role)
+       values ($1::uuid, $2::uuid, 'editor')
+       on conflict (principal_id, brain_id) do nothing`,
+      [principalId, brainId],
+    );
+
+    const { plaintext, keyId } = await insertRepoKey(client, { principalId, brainId, repoSlug });
+    await client.query("COMMIT");
+
+    auditCredentialEvent("repo_key.minted", {
+      mintedByPrincipalId: accessContext?.principalId ?? null,
+      repoSlug,
+      brainId,
+      brainSlug,
+      principalId,
+      keyId,
+    });
+
+    // Plaintext is returned exactly once and stored nowhere.
+    return {
+      repo_slug: repoSlug,
+      brain_id: brainId,
+      brain_slug: brainSlug,
+      principal_id: principalId,
+      key: plaintext,
+      note: "Store this key now — it is returned once and only its sha256 hash is persisted.",
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// rotate_repo_key — REVOKE + REPLACE in one transaction. Without this, mint's
+// create-only rule is a deadlock: a compromised or lost repo key could never be
+// replaced through the capability, only by hand with the admin secret.
+export async function handleRotateRepoKey(args, accessContext) {
+  requireMintCapability(accessContext);
+  const repoSlug = validateRepoSlug(args?.repo_slug);
+  const householdId = mintingHouseholdId(accessContext);
+  const brainSlug = `${BRAIN_SLUG_PREFIX}${repoSlug}`;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const brain = await lockRepoBrain(client, householdId, brainSlug);
+    if (!brain) {
+      throw new HttpError(404, `No repo brain for '${repoSlug}'`);
+    }
+    assertIsRepoBrain(brain, repoSlug);
+
+    const principalResult = await client.query(
+      `select p.id
+       from brain_principals p
+       join brain_memberships m on m.principal_id = p.id
+       where m.brain_id = $1::uuid
+         and p.principal_type = 'repo_service'
+         and p.household_id = $2::uuid
+       order by p.created_at asc
+       limit 1`,
+      [brain.id, householdId],
+    );
+    if (principalResult.rowCount === 0) {
+      throw new HttpError(409, `Repo brain '${brainSlug}' has no repo_service principal to rotate`);
+    }
+    const principalId = principalResult.rows[0].id;
+
+    // Scoped to the repo-service PRINCIPAL and to repo_key, not to the brain.
+    // A brain-wide revoke also killed the caged agent's key on this brain, so
+    // rotating the harness credential silently took pi offline with no mention of
+    // it in the result. The minter's own key is untouched either way: it has
+    // brain_id null and a different principal.
+    const revoked = await client.query(
+      `update brain_access_keys
+       set is_active = false, updated_at = now()
+       where brain_id = $1::uuid
+         and is_active = true
+         and principal_id = $2::uuid
+         and credential_type = $3`,
+      [brain.id, principalId, CREDENTIAL_TYPE_REPO_KEY],
+    );
+
+    const { plaintext, keyId } = await insertRepoKey(client, { principalId, brainId: brain.id, repoSlug });
+    await client.query("COMMIT");
+
+    auditCredentialEvent("repo_key.rotated", {
+      rotatedByPrincipalId: accessContext?.principalId ?? null,
+      repoSlug,
+      brainId: brain.id,
+      brainSlug,
+      principalId,
+      keyId,
+      revokedKeyCount: revoked.rowCount,
+    });
+
+    return {
+      repo_slug: repoSlug,
+      brain_id: brain.id,
+      brain_slug: brainSlug,
+      principal_id: principalId,
+      revoked_key_count: revoked.rowCount,
+      key: plaintext,
+      note: "Store this key now — it is returned once and only its sha256 hash is persisted. Previous keys for this repo are revoked.",
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// mint_agent_key — CREATE-ONLY, like mint_repo_key. Issues pi its SECOND
+// credential: editor on the estate-wide shared agent brain and nothing else. pi
+// does repo work with the repo key from mint_repo_key, like claude and codex; this
+// key exists only because a key carries its principal's memberships, so widening
+// pi without widening the harnesses requires a separate principal (ADR-0006).
+//
+// No brain is ever created here. The repo brain comes from mint_repo_key; the
+// shared agent brain is an operator decision (lockSharedAgentBrain).
+export async function handleMintAgentKey(args, accessContext) {
+  requireMintCapability(accessContext);
+  const repoSlug = validateRepoSlug(args?.repo_slug);
+  const householdId = mintingHouseholdId(accessContext);
+  const brainSlug = `${BRAIN_SLUG_PREFIX}${repoSlug}`;
+  const principalSlug = `${AGENT_PRINCIPAL_SLUG_PREFIX}${repoSlug}`;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // TYPO GUARD, deliberately kept even though this key does not reach the repo
+    // brain. repo_slug is otherwise write-only input: a fat-fingered slug would
+    // mint a live credential on the shared brain under a principal no cage will
+    // ever present, and nothing would ever report it — the operator would find out
+    // when pi could not write, with an orphaned key still valid. Requiring the
+    // repo brain to exist costs nothing (mint_repo_key already runs first in the
+    // documented provisioning order) and makes the mistake a 404 instead.
+    //
+    // Lock order is repo brain then shared agent brain in both agent handlers:
+    // every concurrent agent mint takes the same brains in the same order, so two
+    // repos provisioning at once cannot deadlock on the one shared brain.
+    const brain = await lockRepoBrain(client, householdId, brainSlug);
+    if (!brain) {
+      throw new HttpError(404, `No repo brain for '${repoSlug}'; run mint_repo_key first`);
+    }
+    assertIsRepoBrain(brain, repoSlug);
+    const sharedBrain = await lockSharedAgentBrain(client, householdId);
+
+    const principalId = await resolveCagedAgentPrincipal(client, {
+      householdId, principalSlug, sharedBrainId: sharedBrain.id,
+      repoSlug, createIfMissing: true,
+    });
+
+    // Create-only, scoped to the agent credential: a second live agent key would
+    // mean revoking one revokes nothing. The principal row is FOR UPDATE-held by
+    // resolveCagedAgentPrincipal, so this check cannot race its own insert.
+    const active = await client.query(
+      `select 1 from brain_access_keys
+       where principal_id = $1::uuid and credential_type = $2 and is_active = true
+       limit 1`,
+      [principalId, CREDENTIAL_TYPE_AGENT_KEY],
+    );
+    if (active.rowCount > 0) {
+      throw new HttpError(
+        409,
+        `Agent '${principalSlug}' already has an active key; use rotate_agent_key to replace it`,
+      );
+    }
+
+    // EXACTLY ONE membership. The repo brain is reached with the repo key.
+    await grantEditorMemberships(client, principalId, [sharedBrain.id]);
+
+    const { plaintext, keyId } = await insertAgentKey(client, {
+      principalId, brainId: sharedBrain.id, repoSlug,
+    });
+    await client.query("COMMIT");
+
+    auditCredentialEvent("agent_key.minted", {
+      mintedByPrincipalId: accessContext?.principalId ?? null,
+      repoSlug,
+      repoBrainSlug: brainSlug,
+      sharedBrainId: sharedBrain.id,
+      sharedBrainSlug: sharedBrain.slug,
+      principalId,
+      principalSlug,
+      keyId,
+    });
+
+    // No repo brain id/slug in the result: this key does not reach the repo brain,
+    // and returning one invited exactly the misreading this rework is undoing.
+    return {
+      repo_slug: repoSlug,
+      shared_brain_id: sharedBrain.id,
+      shared_brain_slug: sharedBrain.slug,
+      // Surfaced because a cloud_bound agent key cannot read a private_local
+      // shared brain under egress enforce: the operator sees here whether the
+      // brain they marked shared is actually reachable by the agent.
+      shared_brain_egress_class: sharedBrain.egress_class,
+      principal_id: principalId,
+      principal_slug: principalSlug,
+      key: plaintext,
+      note: "Store this key now — it is returned once and only its sha256 hash is persisted. This key reaches the shared agent brain only; repo work uses the repo key from mint_repo_key.",
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// rotate_agent_key — REVOKE + REPLACE for the caged agent's COMMON key only. The
+// agent is the injection-exposed principal, so this is the credential most likely
+// to need burning in a hurry; it must not take the repo key down with it — pi
+// presents that one too, and revoking it would also cut off claude and codex.
+// The repo brain is looked up here for the same typo-guard reason as in mint.
+export async function handleRotateAgentKey(args, accessContext) {
+  requireMintCapability(accessContext);
+  const repoSlug = validateRepoSlug(args?.repo_slug);
+  const householdId = mintingHouseholdId(accessContext);
+  const brainSlug = `${BRAIN_SLUG_PREFIX}${repoSlug}`;
+  const principalSlug = `${AGENT_PRINCIPAL_SLUG_PREFIX}${repoSlug}`;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const brain = await lockRepoBrain(client, householdId, brainSlug);
+    if (!brain) {
+      throw new HttpError(404, `No repo brain for '${repoSlug}'`);
+    }
+    assertIsRepoBrain(brain, repoSlug);
+    const sharedBrain = await lockSharedAgentBrain(client, householdId);
+
+    // Rotation re-runs the membership check, not just the type check: a principal
+    // that gained reach since it was minted must not have that reach re-issued
+    // under a fresh key just because the slug still matches.
+    const principalId = await resolveCagedAgentPrincipal(client, {
+      householdId, principalSlug, sharedBrainId: sharedBrain.id,
+      repoSlug, createIfMissing: false,
+    });
+
+    // Scoped to the agent principal AND agent_key: never the repo key (a different
+    // principal on a different brain), never the minter's key (brain_id null).
+    const revoked = await client.query(
+      `update brain_access_keys
+       set is_active = false, updated_at = now()
+       where principal_id = $1::uuid and credential_type = $2 and is_active = true`,
+      [principalId, CREDENTIAL_TYPE_AGENT_KEY],
+    );
+
+    const { plaintext, keyId } = await insertAgentKey(client, {
+      principalId, brainId: sharedBrain.id, repoSlug,
+    });
+    await client.query("COMMIT");
+
+    auditCredentialEvent("agent_key.rotated", {
+      rotatedByPrincipalId: accessContext?.principalId ?? null,
+      repoSlug,
+      repoBrainSlug: brainSlug,
+      sharedBrainId: sharedBrain.id,
+      sharedBrainSlug: sharedBrain.slug,
+      principalId,
+      principalSlug,
+      keyId,
+      revokedKeyCount: revoked.rowCount,
+    });
+
+    return {
+      repo_slug: repoSlug,
+      shared_brain_id: sharedBrain.id,
+      shared_brain_slug: sharedBrain.slug,
+      shared_brain_egress_class: sharedBrain.egress_class,
+      principal_id: principalId,
+      principal_slug: principalSlug,
+      revoked_key_count: revoked.rowCount,
+      key: plaintext,
+      note: "Store this key now — it is returned once and only its sha256 hash is persisted. Previous agent keys for this repo are revoked; the repo key is untouched, so pi keeps its repo access.",
+    };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// ===========================================================================
+// ENUMERATION — list_brains / list_principals / list_keys
+// ===========================================================================
+//
+// WHY THESE EXIST. Withdrawing the shared admin key (docs/adr/0004) is
+// irreversible in practice, and until now the estate was write-only through
+// tooling: you could mint, but you could not ASK what exists. That produced two
+// concrete failure modes the operator hit:
+//
+//   A) Every OB1 client falls back to MCP_ACCESS_KEY when its scoped key is
+//      unset, so a MIS-PROVISIONED scoped key tests GREEN during rollout (it
+//      silently used the admin fallback) and only 401s after the admin key is
+//      withdrawn. The only question answerable today is "does some key work?",
+//      never "is this the key I think it is?". list_keys makes the estate's
+//      credential inventory checkable BEFORE the irreversible step.
+//   B) Rollout was neither auditable nor idempotent: a create-only 409 cannot
+//      distinguish "already done" from "half-done", and finding a stray active
+//      admin key needed hand-written SQL against the live database. The orphan
+//      bootstrap-admin key that sat in the database from March until 2026-06-13
+//      is exactly what list_keys is built to surface.
+//
+// GATED ON THE MINTING CAPABILITY, deliberately the SAME gate as mint/rotate
+// (requireMintCapability / brain_access_keys.can_mint_repo_keys). The minter is
+// the operator-held provisioning credential; taking inventory of what it
+// provisions is precisely its job. No agent key carries can_mint_repo_keys, so
+// no agent gains estate visibility from this. It is not gated on is_admin
+// because after ADR-0004 no agent-reachable admin exists, and pinning
+// enumeration to admin would make it unusable exactly when it is needed.
+//
+// SCOPED TO THE MINTER HOUSEHOLD, confined exactly like the mint handlers
+// (mintingHouseholdId). Cross-estate enumeration is not this credential's
+// business. The one deliberate exception is directional, not enumerative: reach
+// COUNTS in list_brains and foreign membership rows in list_principals count/name
+// brains-and-keys pointing INTO this household from elsewhere, because "who can
+// reach my brains" is unanswerable otherwise — and a leaked foreign key reaching
+// in is the exact hazard this tool exists to find. No foreign key's label,
+// principal or estate is ever enumerated.
+//
+// NEVER key_hash — not the value, not a prefix, not a length. auth.mjs
+// authenticates by looking up sha256(presented key) in brain_access_keys.key_hash
+// (unique index brain_access_keys_key_hash_idx): the stored hash IS the
+// authenticator for these keys, not a mere fingerprint of it. Anything holding
+// the hash can be granted... nothing, but anything that can WRITE it can mint a
+// key of its choosing, and any prefix shrinks the offline search for the
+// plaintext. So the column is never selected here at all — not selected-then-
+// dropped, so no future refactor can leak it by widening a returned object.
+//
+// READ-ONLY, AND DELIBERATELY WITHOUT A TRANSACTION. Each handler issues exactly
+// ONE statement, and a single statement in READ COMMITTED already runs against
+// one consistent snapshot, so a BEGIN/COMMIT would buy no extra atomicity — only
+// an open transaction held across the network round trip. The mint handlers need
+// a transaction because they do check-then-write across statements; these do not
+// write at all, so they use the pooled `query` helper rather than checking out a
+// client.
+
+// Optional boolean tool arguments. Strict rather than truthy: `include_inactive:
+// "false"` must not silently mean true and hide exactly the rows the operator is
+// hunting for. The zod schema in server.mjs guards the tool call; this guards
+// every other caller.
+function optionalBoolean(value, fallback, name) {
+  if (value === undefined || value === null) {
+    return fallback;
+  }
+  if (typeof value !== "boolean") {
+    throw new HttpError(400, `${name} must be a boolean`);
+  }
+  return value;
+}
+
+// Shared by all three handlers: same capability gate, same household confinement,
+// in that order — the 403 for a non-minter must not depend on whether the caller
+// happens to be homed in an estate.
+function enumerationHouseholdId(accessContext) {
+  requireMintCapability(accessContext);
+  return mintingHouseholdId(accessContext);
+}
+
+// list_brains — every brain in the minter household, with the two numbers that
+// say whether it matters: how much is in it, and how many live credentials can
+// get at it.
+//
+// REACH, not brain_id. A key's brain_id is a default-brain hint, never a clamp
+// (ADR-0003); reach comes from the PRINCIPAL's memberships. The three arms below
+// mirror auth.mjs fetchBrainCatalog exactly — brain membership (non-deny),
+// non-deny estate membership, or admin-in-home-estate — so this count means the
+// same thing the authorizer means. Counting k.brain_id instead would have
+// reported 0 reachable keys for a brain that half the estate can write to.
+//
+// The legacy MCP_ACCESS_KEY admin path is NOT counted and cannot be: it is a
+// config value with no row in this database (auth.mjs `key === config.accessKey`).
+// While that branch is reachable, every brain here is reachable by one more
+// credential than the count says. That is the whole point of ADR-0004.
+export async function handleListBrains(args, accessContext) {
+  const householdId = enumerationHouseholdId(accessContext);
+
+  // Shape note: the reach set is materialised as an explicit (brain, key) join in
+  // `reach` and only then aggregated, rather than as a correlated
+  // `cross join lateral (select count(*) ... where ... b.id ...)` per brain. The
+  // lateral spelling was written first and REJECTED because it returned
+  // plan-dependent WRONG counts on PostgreSQL 16.10: with the outer `brains` row
+  // referenced only from inside the EXISTS subqueries (two levels down), some
+  // plans counted keys that reach a different brain — reproducibly 2 instead of 1
+  // for a brain reachable by exactly one key, and flipping between runs of the
+  // same fixture as the row layout changed. An audit tool that undercounts or
+  // overcounts who can reach a brain is worse than no audit tool, so the
+  // correlation is kept one level deep where it demonstrably holds.
+  const result = await query(
+    `with household_brains as (
+       select id, household_id from brains where household_id = $1::uuid
+     ),
+     reach as (
+       select hb.id as brain_id, k.is_admin, p.household_id as principal_household_id
+       from household_brains hb
+       join brain_access_keys k on k.is_active = true
+       join brain_principals p on p.id = k.principal_id
+       -- A brain-level DENY vetoes every grant arm, including admin home-reach.
+       -- The authorizer is: NOT hasDenyBrain AND (grant OR adminHomeReach OR
+       -- estateOk), access-policy.mjs:300. Without the veto this CTE reports reach the read
+       -- path would refuse — and a tool whose whole purpose is answering "who can
+       -- reach this brain" is worse than useless if it over-reports.
+       where not exists (
+           select 1 from brain_memberships bd
+           where bd.principal_id = p.id and bd.brain_id = hb.id and bd.is_deny = true
+         )
+         and (
+           exists (
+             select 1 from brain_memberships bm
+             where bm.principal_id = p.id and bm.brain_id = hb.id and bm.is_deny = false
+           )
+           or exists (
+             select 1 from estate_memberships em
+             where em.principal_id = p.id and em.estate_id = hb.household_id and em.is_deny = false
+           )
+           or (k.is_admin and p.household_id = hb.household_id)
+         )
+     ),
+     reach_counts as (
+       select
+         brain_id,
+         count(*)::int as active_key_count,
+         count(*) filter (where is_admin)::int as active_admin_key_count,
+         count(*) filter (where principal_household_id <> $1::uuid)::int as external_principal_key_count
+       from reach
+       group by brain_id
+     ),
+     thought_counts as (
+       select t.brain_id,
+              count(*) filter (where t.deleted_at is null)::int as thought_count,
+              count(*) filter (where t.deleted_at is not null)::int as deleted_thought_count
+       from thoughts t
+       join household_brains hb on hb.id = t.brain_id
+       group by t.brain_id
+     )
+     select
+       b.id,
+       b.slug,
+       b.display_name,
+       b.kind,
+       b.egress_class,
+       b.is_default_shared,
+       b.is_shared_agent_brain,
+       b.created_at,
+       coalesce(tc.thought_count, 0) as thought_count,
+       coalesce(tc.deleted_thought_count, 0) as deleted_thought_count,
+       coalesce(rc.active_key_count, 0) as active_key_count,
+       coalesce(rc.active_admin_key_count, 0) as active_admin_key_count,
+       coalesce(rc.external_principal_key_count, 0) as external_principal_key_count
+     from brains b
+     left join reach_counts rc on rc.brain_id = b.id
+     left join thought_counts tc on tc.brain_id = b.id
+     where b.household_id = $1::uuid
+     order by b.slug asc`,
+    [householdId],
+  );
+
+  return {
+    household_id: householdId,
+    brain_count: result.rowCount,
+    brains: result.rows.map((row) => ({
+      brain_id: row.id,
+      slug: row.slug,
+      display_name: row.display_name,
+      kind: row.kind,
+      egress_class: row.egress_class,
+      is_default_shared: row.is_default_shared,
+      is_shared_agent_brain: row.is_shared_agent_brain,
+      thought_count: row.thought_count,
+      deleted_thought_count: row.deleted_thought_count,
+      active_key_count: row.active_key_count,
+      active_admin_key_count: row.active_admin_key_count,
+      // Live keys reaching this brain whose principal is homed in ANOTHER estate.
+      // Non-zero is not automatically wrong (ADR-0003 allows granted cross-estate
+      // reach) but it is always worth a second look, so it gets its own number
+      // rather than hiding inside active_key_count.
+      external_principal_key_count: row.external_principal_key_count,
+      created_at: row.created_at,
+    })),
+    note: "Key counts are by PRINCIPAL REACH (memberships/estate/admin), not by the key's default-brain hint. The legacy MCP_ACCESS_KEY admin path has no database row and is not counted.",
+  };
+}
+
+// list_principals — who exists, and what each one can reach. This is the table
+// that makes "is this the key I think it is?" answerable: a scoped key is only as
+// narrow as its principal's membership set, so a repo-service principal showing
+// two brains is a mis-provision even though its key looks perfect.
+//
+// Deny rows are shown, not filtered: an operator who denied a membership by hand
+// needs to see it is still there, and grantEditorMemberships deliberately does
+// not overwrite it.
+export async function handleListPrincipals(args, accessContext) {
+  const householdId = enumerationHouseholdId(accessContext);
+
+  const result = await query(
+    `select
+       p.id,
+       p.slug,
+       p.display_name,
+       p.principal_type,
+       p.created_at,
+       db.slug as default_brain_slug,
+       p.default_brain_id,
+       (select count(*)::int from brain_access_keys k
+         where k.principal_id = p.id and k.is_active = true) as active_key_count,
+       (select count(*)::int from brain_access_keys k
+         where k.principal_id = p.id and k.is_active = false) as inactive_key_count,
+       coalesce(
+         (select json_agg(json_build_object(
+             'brain_id', mb.id,
+             'brain_slug', mb.slug,
+             'role', m.role,
+             'is_deny', m.is_deny,
+             'egress_class', mb.egress_class,
+             'in_household', mb.household_id = p.household_id
+           ) order by mb.slug asc)
+          from brain_memberships m
+          join brains mb on mb.id = m.brain_id
+          where m.principal_id = p.id),
+         '[]'::json
+       ) as memberships,
+       coalesce(
+         (select json_agg(json_build_object('estate_id', em.estate_id, 'role', em.role, 'is_deny', em.is_deny)
+                          order by em.estate_id)
+          from estate_memberships em
+          where em.principal_id = p.id),
+         '[]'::json
+       ) as estate_memberships
+     from brain_principals p
+     left join brains db on db.id = p.default_brain_id
+     where p.household_id = $1::uuid
+     order by p.principal_type asc, p.slug asc`,
+    [householdId],
+  );
+
+  return {
+    household_id: householdId,
+    principal_count: result.rowCount,
+    principals: result.rows.map((row) => ({
+      principal_id: row.id,
+      slug: row.slug,
+      display_name: row.display_name,
+      principal_type: row.principal_type,
+      default_brain_id: row.default_brain_id,
+      default_brain_slug: row.default_brain_slug,
+      active_key_count: row.active_key_count,
+      inactive_key_count: row.inactive_key_count,
+      // A principal's reach IS this list (auth.mjs fetchBrainMemberships), plus
+      // any estate membership below. `in_household: false` is reach granted into
+      // another estate (ADR-0003).
+      memberships: row.memberships,
+      // Estate membership grants every brain in that estate at once, so a
+      // principal with an empty `memberships` list is not necessarily narrow.
+      estate_memberships: row.estate_memberships,
+    })),
+  };
+}
+
+// list_keys — the credential inventory, and the answer to the question the
+// operator actually has: "is there a stray ACTIVE admin key anywhere in this
+// estate?"
+//
+// Inactive keys are INCLUDED by default and marked, because "there is no admin
+// key" and "the admin key was revoked on 2026-06-13" are different facts and only
+// the second one is evidence. is_admin / can_mint_repo_keys lead every row and are
+// summarised at the top level, so a stray does not have to be spotted by eye in a
+// long list.
+//
+// key_hash is NEVER selected (see the section header): the stored hash is the
+// authenticator, so exposing it — or any prefix of it — is equivalent to exposing
+// the key.
+export async function handleListKeys(args, accessContext) {
+  const householdId = enumerationHouseholdId(accessContext);
+  const includeInactive = optionalBoolean(args?.include_inactive, true, "include_inactive");
+  const onlyAdmin = optionalBoolean(args?.only_admin, false, "only_admin");
+
+  // Scoped to principals homed in the minter household. A foreign principal's key
+  // reaching into these brains is reported as a COUNT by list_brains
+  // (external_principal_key_count) rather than enumerated here — naming another
+  // estate's credentials is not this key's business.
+  const result = await query(
+    `select
+       k.id,
+       k.label,
+       k.credential_type,
+       k.is_admin,
+       k.can_mint_repo_keys,
+       k.read_egress_class,
+       k.is_active,
+       k.created_at,
+       k.last_used_at,
+       k.principal_id,
+       p.slug as principal_slug,
+       p.principal_type,
+       k.brain_id,
+       b.slug as brain_slug
+     from brain_access_keys k
+     join brain_principals p on p.id = k.principal_id
+     left join brains b on b.id = k.brain_id
+     where p.household_id = $1::uuid
+       and ($2::boolean or k.is_active = true)
+       and ($3::boolean = false or k.is_admin = true)
+     order by k.is_admin desc, k.can_mint_repo_keys desc, k.is_active desc,
+              p.slug asc, k.created_at asc`,
+    [householdId, includeInactive, onlyAdmin],
+  );
+
+  const keys = result.rows.map((row) => ({
+    key_id: row.id,
+    // Privilege first: these three are what makes a key dangerous.
+    is_admin: row.is_admin,
+    can_mint_repo_keys: row.can_mint_repo_keys,
+    is_active: row.is_active,
+    label: row.label,
+    credential_type: row.credential_type,
+    // null => cloud_bound (fail-closed, docs/45 §6.2). Surfaced raw, not
+    // defaulted, so an explicitly local_trusted key is distinguishable from an
+    // unset one.
+    read_egress_class: row.read_egress_class,
+    principal_id: row.principal_id,
+    principal_slug: row.principal_slug,
+    principal_type: row.principal_type,
+    // The key's default-brain HINT (ADR-0003), not a clamp: reach comes from the
+    // principal, which list_principals shows.
+    bound_brain_id: row.brain_id,
+    bound_brain_slug: row.brain_slug,
+    created_at: row.created_at,
+    last_used_at: row.last_used_at,
+  }));
+
+  const activeAdminKeys = keys.filter((k) => k.is_admin && k.is_active);
+  const activeMinterKeys = keys.filter((k) => k.can_mint_repo_keys && k.is_active);
+
+  return {
+    household_id: householdId,
+    include_inactive: includeInactive,
+    only_admin: onlyAdmin,
+    key_count: keys.length,
+    active_key_count: keys.filter((k) => k.is_active).length,
+    // The headline. Non-zero here after ADR-0004 withdrawal means the withdrawal
+    // is not done, whatever the env files say.
+    active_admin_key_count: activeAdminKeys.length,
+    active_admin_keys: activeAdminKeys.map((k) => ({
+      key_id: k.key_id,
+      label: k.label,
+      principal_slug: k.principal_slug,
+      created_at: k.created_at,
+      last_used_at: k.last_used_at,
+    })),
+    active_minting_key_count: activeMinterKeys.length,
+    keys,
+    note: "Key hashes are never returned: the stored hash is the authenticator, so exposing it (or a prefix) is equivalent to exposing the key. Scoped to principals homed in this household; a legacy MCP_ACCESS_KEY admin has no row here at all.",
+  };
+}
+
+// Exported for unit tests: the pure validation surface, without a DB.
+export const __testables = {
+  REPO_SLUG_PATTERN,
+  validateRepoSlug,
+  requireMintCapability,
+  sanitizeDisplayName,
+  DISPLAY_NAME_MAX,
+  BRAIN_SLUG_PREFIX,
+  PRINCIPAL_SLUG_PREFIX,
+  AGENT_PRINCIPAL_SLUG_PREFIX,
+  PRINCIPAL_TYPE_REPO_SERVICE,
+  PRINCIPAL_TYPE_CAGED_AGENT,
+  CREDENTIAL_TYPE_REPO_KEY,
+  CREDENTIAL_TYPE_AGENT_KEY,
+  assertManagedPrincipalType,
+  assertManagedCredentialType,
+  assertIsRepoBrain,
+  optionalBoolean,
+  enumerationHouseholdId,
+};

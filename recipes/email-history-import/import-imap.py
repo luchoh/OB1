@@ -895,14 +895,25 @@ def process_attachment(record, attachment, *, docling_base_url, chunker, args, d
         dedupe_seed = f"{record['dedupe_key']}:attachment:{attachment['sha256']}"
 
         ingested_chunks = 0
+        skipped_duplicate_chunks = 0
+        seen_chunk_texts = set()
         for chunk in chunks:
+            chunk_text = chunk.get("text", "").strip()
+            # 2026-03-15 incident guard: the dedupe key is position-based
+            # (seed:chunk:{index}), so identical chunk TEXTS land as distinct
+            # thoughts — a looping extractor once produced 278 copies of one
+            # header line. Collapse identical/empty texts within an attachment.
+            if not chunk_text or sha256_text(chunk_text) in seen_chunk_texts:
+                skipped_duplicate_chunks += 1
+                continue
+            seen_chunk_texts.add(sha256_text(chunk_text))
             headings = chunk.get("headings") or []
             origin = (chunk.get("metadata") or {}).get("origin") or {}
             metadata = {
                 **shared_metadata,
                 "type": "document_chunk",
                 "retrieval_role": "source",
-                "summary": truncate_text(chunk.get("text", "").strip(), 280),
+                "summary": truncate_text(chunk_text, 280),
                 "topics": headings,
                 "document_chunk_index": chunk.get("chunk_index"),
                 "document_chunk_count": len(chunks),
@@ -917,7 +928,7 @@ def process_attachment(record, attachment, *, docling_base_url, chunker, args, d
                 "docling_origin": origin,
             }
             ingest_thought(
-                chunk.get("text", "").strip(),
+                chunk_text,
                 metadata,
                 dedupe_key=sha256_text(f"{dedupe_seed}:chunk:{chunk.get('chunk_index')}"),
                 thought_type="document_chunk",
@@ -926,6 +937,8 @@ def process_attachment(record, attachment, *, docling_base_url, chunker, args, d
                 extract_metadata=False,
             )
             ingested_chunks += 1
+        if verbose and skipped_duplicate_chunks:
+            print(f"    attachment_skipped_duplicate_chunks={skipped_duplicate_chunks}")
 
         ingested_summaries = 0
         for idx, thought in enumerate(summary_thoughts):

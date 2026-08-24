@@ -9,14 +9,12 @@ brains, principals, and memberships.
 ## Language
 
 **Estate**:
-A top-level container that groups principals and brains. Models
-either a human grouping (a household, a family) or a non-human
-grouping (a fleet of repo-scoped agents). Ownership / governance
-boundary — and an enforced one: cross-estate reach is membership-
-granted, never ambient (ADR-0003). No key shape except the legacy
-admin env key sees past an estate without an explicit membership row.
-_Avoid_: Household (legacy term, schema column is still `household_id`
-until rename), workspace, tenant, account.
+A top-level container grouping principals and brains — either a human
+grouping such as a household, or a fleet of repo-scoped agents. It is
+the ownership boundary, and an enforced one: reaching into another
+estate requires an explicit membership (ADR-0003).
+_Avoid_: Household (the legacy word, still the column name), workspace,
+tenant, account.
 
 **Brain**:
 A logical knowledge store: a set of thoughts, embeddings, and
@@ -26,139 +24,139 @@ _Avoid_: Database (the brain is a logical view, not a Postgres database),
 project, vault, workspace.
 
 **Thought**:
-A single captured note in a brain. Has content, embedding, metadata,
-optional structured columns (type, source_type, sensitivity_tier,
-importance, quality_score, enriched, status). Lives in `thoughts`,
-scoped to a brain via `brain_id`.
+A single captured note in a brain, with its content, its embedding and
+whatever the enrichment pipeline has worked out about it.
 _Avoid_: Note, memo, document, chunk, item.
 
 **Principal**:
 An identity that can hold access keys and memberships on brains.
-Belongs to exactly one estate. `principal_type` is one of `person`
-(today's only value) or `agent` (per ADR-0001).
+Belongs to exactly one estate. Kinds in use: a person, a repo service,
+the superseded per-repo agents from June 2026, and the minter (which
+holds no memberships and reaches no data).
 _Avoid_: User, account, identity, role.
 
 **Repo principal**:
-A principal of `principal_type='agent'` whose slug matches a code
-repository's name (e.g., `ob1`, `system-config`). All AI tools
-running in that repo authenticate as this single principal. The
-workspace is the identity, not the tool.
+A principal named after a code repository. Every AI tool working in
+that repo authenticates as this one identity — the workspace is the
+identity, not the tool.
 _Avoid_: Bot, service account, automation, workflow.
 
+**Caged agent principal**:
+The identity the caged agent uses to reach a person's personal brain.
+There is one for the whole fleet, not one per repo. For ordinary repo
+work the caged agent uses the repo principal like any other tool.
+_Avoid_: pi principal (pi is the tool, this is the identity), common
+principal.
+
 **Brain membership**:
-A row granting one principal access to one brain (`brain_memberships`
-table). Specific access. With ADR-0001, brain memberships also support
-DENY rows that override estate memberships. Roles form a monotone
-ladder: `viewer` (read) ⊂ `editor` (read + write) ⊂ `owner` (read +
-write + delete/restore). Purge is outside the ladder entirely — it
-requires a named admin service key, never a role.
+A grant of access to one specific brain for one principal. Roles are a
+ladder: viewer reads, editor also writes, owner also deletes and
+restores. A membership can instead be a DENY, which overrides any
+estate-level grant. Purge sits outside the ladder and no role confers
+it.
 _Avoid_: Permission, ACL, grant.
 
-**Estate membership** (ADR-0001, migration 009):
-A row granting one principal access to **all brains in an estate**
-(`estate_memberships` table). Broad access. Subject to brain-level
-DENY override. A row with `is_deny=true` is treated as **absent
-membership** (fail-closed): estate-level DENY is not a granted
-semantic — per ADR-0001, absence is denial — and the column exists
-only for schema parity. (Migration 009's comment says the flag is
-"not consulted"; the resolver does consult it, with exactly this
-absent-membership meaning.) Roles: `member` (read all estate brains)
-⊂ `admin` (read + write + delete/restore on all estate brains),
-always subject to brain-level DENY override.
+**Estate membership** (ADR-0001):
+A grant of access to every brain in an estate, for one principal.
+Roles: member reads, admin also writes, deletes and restores. Always
+overridden by a brain-level DENY. There is no such thing as an
+estate-level DENY — absence is denial.
 
-**Common brain** (forthcoming, ADR-0001):
-A specific brain in the agent estate, with brain memberships granted
-to every repo principal. The "shared knowledge" destination for
-cross-cutting agent observations.
-_Avoid_: Global brain (suggests no estate ownership; common brain
-does live in an estate), shared brain (overlaps with `kind='shared_household'`).
+**Personal brain**:
+The brain holding one person's own thoughts. It lives in that person's
+estate, not the agent estate, so an agent reaches it only through an
+explicit membership — never automatically.
+_Avoid_: Common brain (retired, see below), private brain, owner brain.
 
 **Access policy**:
-The pure rules deciding what a principal may do: which brains are in
-scope, which are nameable (and whether a failed naming reads as
-not-found, denied, or ambiguous), and which actions — read, write,
-delete, restore, purge — are allowed. Inputs: brain memberships,
-estate memberships, the role ladder (ADR-0002), estate reach
-(ADR-0003), and caller shape. Pure decision; fetching facts and
-speaking HTTP are adapters' jobs.
-_Avoid_: Authz (vague), ACL, permissions (the rows are memberships;
-the rules are the policy).
+The rules deciding what a principal may do: which brains it can reach,
+which it can name, and which of read, write, delete, restore and purge
+are allowed. It only decides — looking facts up and speaking HTTP are
+someone else's job.
+_Avoid_: Authz (vague), ACL, permissions (the rows are memberships; the
+rules are the policy).
 
 **Access key**:
-A credential identifying a principal (`brain_access_keys`, hashed).
-A key is identity plus a default-brain hint — never a permission
-clamp: capability comes from membership roles (ADR-0002), reach from
-memberships and estates (ADR-0003). The bare legacy env key is the
-one exception (global admin, unattributable, documented blast
-radius) pending retirement.
+A credential identifying a principal. It says who you are and which
+brain to use by default — it never limits what you may do. Capability
+comes from membership roles, reach from memberships and estates. The
+legacy shared key is the one exception, and it is being retired.
 _Avoid_: Token (overloaded with human JWTs), API key.
 
 **Capture**:
-The act of writing a thought. Today: ingest path goes through
-`capture_thought` MCP tool or Telegram bridge → MCP `/ingest/thought`
-→ Postgres. Per ADR-0001, capture will accept an explicit `brain`
-parameter (default = principal's default brain).
+The act of writing a thought. The caller may name a brain; otherwise it
+lands in the principal's default brain.
 
 **Default brain**:
-A column on `brain_principals` (`default_brain_id`). The brain that
-receives a capture if the caller does not specify one. For repo
-principals: the repo brain.
+The brain a capture lands in when the caller does not name one. For a
+repo principal, that is its repo's brain.
+
+**Revision**:
+The prior state of a thought, kept when that thought is changed in
+place. Deleting or restoring a thought is not a revision — those change
+whether it exists, not what it says.
+_Avoid_: Version, history, snapshot, backup.
+
+**Writer**:
+The principal a thought belongs to.
+_Avoid_: Owner (that is a membership role), author (ambiguous — see the
+note under Relationships).
+
+**Audit actor**:
+The principal that made one particular change. Every change must name
+one, and a change that cannot is refused rather than recorded
+anonymously (ADR-0009).
+_Avoid_: Author (ambiguous), user, caller.
 
 **Author session**:
-A free-form identifier (`metadata.author_session_id`) stamped on
-each write to identify *which run of which writer* produced it (e.g.,
-`telegram_bridge:<chat>:<msg>`, `claude_code:<session_uuid>`,
-`mcp:<conn_id>`). Per ADR-27, every audit row copies this. Distinct
-from the principal — a principal is durable identity, an author
-session is a single execution.
+An identifier for a single run of a single writer, stamped on each
+write — one execution, not a durable identity.
 
 **Projection / Projector**:
-The graph in Neo4j is a *projection*: a derived, rebuildable copy of
-the canonical Thoughts in Postgres, reshaped into nodes and edges
-(Thought ↔ Conversation / Email / Document / Concept / Person / …)
-for relationship-flavored retrieval. The *projector* is the runtime's
-background loop that keeps it in sync: each tick it scans for new or
-changed Thoughts (per-thought revision bookkeeping), turns each into a
-plan via the pure projection planner, and applies the plan to Neo4j —
-tombstones project as node deletions, restores re-project. Postgres is
-always the source of truth; the graph trails capture by roughly one
-tick and can always be rebuilt.
-_Avoid_: Sync (hides the one-way, derived nature), index, mirror.
+The graph in Neo4j is a projection: a derived, rebuildable view of the
+thoughts in Postgres, reshaped into nodes and edges for
+relationship-flavoured retrieval. The projector is the background loop
+that keeps it current. Postgres is always the source of truth, and the
+graph can always be rebuilt from it.
+_Avoid_: Sync (hides that it is one-way and derived), index, mirror.
 
 **Enriched / Enrichment**:
-A boolean column on `thoughts` and the verb form. A thought is
-"enriched" when an LLM has classified it into the structured columns
-(`type`, `importance`, `source_type`, plus a metadata bundle). The
-enrichment pipeline lives in `scripts/thought_enrichment/`.
+A thought is enriched once an LLM has worked out what kind of thing it
+is and how much it matters, and recorded that alongside it.
 _Avoid_: Tagged, classified (overloaded), labeled.
 
 **Distilled vs source**:
-A `metadata.retrieval_role` value. `distilled` = LLM-summarized
-content fit for retrieval. `source` = raw source content (email body,
-document chunk) preserved for provenance. Search prefers `distilled`
-and falls back to `source` only when distilled doesn't yield enough.
+Distilled content is an LLM summary written for retrieval; source
+content is the raw original, kept for provenance. Search prefers
+distilled and falls back to source.
 _Avoid_: Original, processed, refined.
 
 ## Relationships
 
-- An **Estate** contains many **Brains** (FK `brains.household_id`,
-  to be renamed `estate_id`).
-- An **Estate** contains many **Principals** (FK
-  `brain_principals.household_id`, to be renamed).
-- A **Brain** has many **Brain memberships**, each pointing at a
-  **Principal**. A principal can be from a different estate than the
-  brain (cross-estate access).
-- An **Estate** has many **Estate memberships** (per ADR-0001), each
-  pointing at a **Principal** (possibly from another estate).
+- An **Estate** contains many **Brains** and many **Principals**.
 - A **Brain** contains many **Thoughts**.
-- A **Thought** has one author at write time, recorded as
-  `metadata.author_session_id` (string, not a FK).
+- A **Brain** has many **Brain memberships**, each naming a
+  **Principal** — which may belong to a different estate.
+- An **Estate** has many **Estate memberships**, likewise.
+- A **Thought** has a **Writer** (whose thought it is), every change to
+  it has an **Audit actor** (who made that change), and every write
+  records an **Author session** (which run did it). Three different
+  questions. When one principal overwrites another's thought the writer
+  changes and the audit actor says who changed it — which is the case
+  the distinction exists for. "Author" on its own is ambiguous between
+  all three; avoid it.
 
 ## Flagged ambiguities
 
 - "household" vs "estate" — schema still says `household` everywhere;
   language is moving to "estate" per ADR-0001. Rename pending.
-- "shared" vs "common" — `brains.kind = 'shared_household'` is the
-  legacy term for cross-principal-within-an-estate access. The new
-  "common brain" is a brain in the agent estate with explicit
-  cross-principal memberships. Different mechanism, similar intent.
+- "common brain" — RETIRED 2026-08-23. ADR-0001 forecast a brain in the
+  agent estate with memberships for every repo principal, as a
+  cross-cutting agent scratchpad; it was built as `common-public` and
+  then dropped without ever being used. What replaced it is narrower and
+  differently shaped: one agent (pi) reaching the human's **personal
+  brain** by a single cross-estate membership. Do not revive the word for
+  that — it is common to nobody.
+- "shared" vs "common" — `brains.kind = 'shared_household'` remains the
+  legacy term for cross-principal-within-an-estate access. Unrelated to
+  the retired "common brain".

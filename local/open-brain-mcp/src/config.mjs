@@ -17,7 +17,20 @@ function parsedEnv(filepath) {
 
 function loadRepoEnv() {
   const localEnv = parsedEnv(path.join(repoRoot, ".env.open-brain-local"));
+  const devRuntimeEnvFileLoaded = process.env.OB1_DEV_RUNTIME_ENV_FILE_LOADED === "1";
+  const devDatabaseCredentialNames = new Set([
+    "PGPASSWORD",
+    "POSTGRES_PASSWORD",
+    "OPEN_BRAIN_DATABASE_URL",
+    "DATABASE_URL",
+  ]);
   for (const [key, value] of Object.entries(localEnv)) {
+    // The developer-owned devenv launcher has already selected the isolated
+    // ob1_dev profile and loaded its runtime env file. Do not let this
+    // convenience dotenv reload replace its DB credentials with repo-local ones.
+    if (devRuntimeEnvFileLoaded && devDatabaseCredentialNames.has(key)) {
+      continue;
+    }
     if (process.env[key] === undefined) {
       process.env[key] = value;
     }
@@ -203,8 +216,20 @@ async function pgConfig(consul) {
   const connectionString =
     process.env.OPEN_BRAIN_DATABASE_URL ?? process.env.DATABASE_URL ?? undefined;
 
+  // pool.connect() waits FOREVER by default. One caller holding every connection
+  // therefore hangs every tool for every other caller with no error and no log —
+  // a burst of minting calls stretched an unrelated stats call from ~1s to 29s.
+  // A bounded acquire turns that indefinite hang into a fast, visible failure.
+  function poolLimits() {
+    return {
+      max: envNumber("PG_POOL_MAX", 20),
+      connectionTimeoutMillis: envNumber("PG_POOL_CONNECTION_TIMEOUT_MS", 5000),
+      idleTimeoutMillis: envNumber("PG_POOL_IDLE_TIMEOUT_MS", 30000),
+    };
+  }
+
   if (connectionString) {
-    return { connectionString };
+    return { connectionString, ...poolLimits() };
   }
 
   let host = envOptionalString("PGHOST");
@@ -217,6 +242,7 @@ async function pgConfig(consul) {
       database: envString("PGDATABASE", process.env.POSTGRES_DB ?? "ob1"),
       user: envString("PGUSER", process.env.POSTGRES_USER ?? "ob1"),
       password: envString("PGPASSWORD", process.env.POSTGRES_PASSWORD),
+      ...poolLimits(),
     };
   }
 
@@ -232,6 +258,7 @@ async function pgConfig(consul) {
     database: envString("PGDATABASE", process.env.POSTGRES_DB ?? "ob1"),
     user: envString("PGUSER", process.env.POSTGRES_USER ?? "ob1"),
     password: envString("PGPASSWORD", process.env.POSTGRES_PASSWORD),
+    ...poolLimits(),
   };
 }
 
@@ -341,6 +368,26 @@ async function loadConfig() {
     "truncated",
   );
 
+  // Layer-A read egress enforcement staging (docs/45 §6.13/§6.2/§9). Default
+  // OBSERVE: deriveScope reports what WOULD be excluded for a cloud-bound caller
+  // but does not alter scope — zero behaviour change. 'enforce' actually strips
+  // local-only brains for cloud-bound callers; 'off' disables the rule entirely.
+  // Unknown values fail SAFE for behaviour (no silent enforcement): fall back to
+  // 'observe' and log, so an operator typo never accidentally restricts reads.
+  const egressEnforceRaw = envOptionalString("OB1_EGRESS_ENFORCE");
+  let egressEnforce = egressEnforceRaw ?? "observe";
+  if (!["off", "observe", "enforce"].includes(egressEnforce)) {
+    console.warn(
+      JSON.stringify({
+        event: "config.egress_enforce.invalid",
+        provided: egressEnforceRaw,
+        fallback: "observe",
+        allowed: ["off", "observe", "enforce"],
+      }),
+    );
+    egressEnforce = "observe";
+  }
+
   return {
     serviceName: process.env.OPEN_BRAIN_SERVICE_NAME ?? "open-brain-local",
     runtimeRole,
@@ -356,8 +403,15 @@ async function loadConfig() {
     embeddingModel: envString("EMBEDDING_MODEL", "mlx-community/Qwen3-Embedding-8B-mxfp8"),
     embeddingDimensions: envOptionalNumber("EMBEDDING_DIMENSIONS_PARAMETER", 1536) ?? 1536,
     expectedEmbeddingDimension: envOptionalNumber("EMBEDDING_STORE_DIMENSION", 1536) ?? 1536,
+    // docs/45 §6.5: hosts the operator declares local-trusted for processing
+    // restricted/personal content (loopback is always trusted). When empty, only
+    // loopback processors may handle restricted content — restricted capture is
+    // refused for any non-loopback processor (fail-closed).
+    restrictedProcessorHosts: (envOptionalString("OB1_RESTRICTED_PROCESSOR_HOSTS") ?? "")
+      .split(",").map((h) => h.trim()).filter(Boolean),
     metadataMaxTokens: envOptionalNumber("OPEN_BRAIN_METADATA_MAX_TOKENS", 400) ?? 400,
     answerMaxTokens: envOptionalNumber("OPEN_BRAIN_ANSWER_MAX_TOKENS", 600) ?? 600,
+    egressEnforce,
     auth: {
       humanTokenAuth: {
         enabled: humanTokenAuthEnabled,

@@ -3,16 +3,22 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPTransport } from "@hono/mcp";
 import * as z from "zod/v3";
 import { HttpError, authorizeWrite, authorizeDestructive, authorizePurge, resolveAccessContext, resolveRequestBrain, resolveReadBrains } from "./auth.mjs";
+import { deriveCaptureStamp, isLocalTrustedProcessor, CALLER_EGRESS_CLASS, CALLER_KINDS, effectiveEgress } from "./access-policy.mjs";
 import { config } from "./config.mjs";
 import { closePool, healthcheckDatabase, query } from "./db.mjs";
+import crypto from "node:crypto";
 import {
   captureThought,
+  peekCaptureConflictTier,
+  peekBrainEgressClass,
+  fetchRowEgressById,
   patchThoughtMetadata,
   softDeleteThought,
   restoreThought,
   purgeThought,
   brainStats,
   ThoughtStoreError,
+  STORE_ERROR,
 } from "./thought-store.mjs";
 import {
   graphNeighbors,
@@ -30,6 +36,15 @@ import {
   healthcheckUpstreams,
   normalizeMetadata,
 } from "./models.mjs";
+import {
+  handleListBrains,
+  handleListKeys,
+  handleListPrincipals,
+  handleMintAgentKey,
+  handleMintRepoKey,
+  handleRotateAgentKey,
+  handleRotateRepoKey,
+} from "./repo-key-minting.mjs";
 import { appendRetrievalTelemetry } from "./observability.mjs";
 import {
   expandContextRows,
@@ -47,6 +62,7 @@ const captureThoughtSchema = {
   occurred_at: z.string().optional().describe("Optional source timestamp in ISO 8601 format."),
   dedupe_key: z.string().min(1).optional().describe("Optional stable key for idempotent imports."),
   extract_metadata: z.boolean().optional().describe("Whether to run LLM metadata extraction before storing."),
+  sensitivity_tier: z.enum(["standard", "restricted"]).optional().describe("Egress tier at creation (docs/45 §6.8). Defaults to 'standard'. 'restricted' is local-on-box-only and may only be captured into a private_local/quarantine_review brain."),
 };
 const captureThoughtInput = z.object(captureThoughtSchema);
 
@@ -84,7 +100,9 @@ const updateThoughtMetadataSchema = {
   metadata_patch: z.record(z.any()).optional().describe("Metadata patch merged into the thought metadata without changing content or embeddings."),
   type: z.string().min(1).max(64).optional().describe("Structured type column. Free-form; consumers may constrain to a known taxonomy."),
   source_type: z.string().min(1).max(64).optional().describe("Structured source_type column."),
-  sensitivity_tier: z.enum(["standard", "personal", "restricted"]).optional().describe("Structured sensitivity_tier column."),
+  // sensitivity_tier is intentionally NOT patchable here (docs/45 §6.7): this
+  // generic route must not be a declassification path. Tier transitions go
+  // through a dedicated local-trusted capability (a later slice).
   importance: z.number().int().min(0).max(100).optional().describe("Structured importance column (0-100)."),
   quality_score: z.number().min(0).max(100).optional().describe("Structured quality_score column (0-100)."),
   enriched: z.boolean().optional().describe("Mark the thought as enriched (or not)."),
@@ -97,7 +115,6 @@ const updateThoughtMetadataInput = z
       v.metadata_patch !== undefined
       || v.type !== undefined
       || v.source_type !== undefined
-      || v.sensitivity_tier !== undefined
       || v.importance !== undefined
       || v.quality_score !== undefined
       || v.enriched !== undefined
@@ -178,6 +195,45 @@ const expandContextSchema = {
   filter: z.record(z.any()).optional().describe("Optional JSONB containment filter applied to expanded thought rows."),
   max_hops: z.number().int().min(1).max(3).optional().describe("Maximum graph hop count."),
   limit: z.number().int().min(1).max(24).optional().describe("Maximum number of expanded thought rows to return."),
+};
+
+// docs/53. Note what is NOT here: no is_admin, no egress_class, no brain kind, no
+// capability flag. Those are literals in repo-key-minting.mjs. A minting caller
+// chooses a repo name and a label, nothing that affects authority.
+const mintRepoKeySchema = {
+  repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier (lowercase letters, digits, hyphens). Becomes brain slug 'repo:<repo_slug>'."),
+  display_name: z.string().min(1).max(128).optional().describe("Optional human-readable brain name, max 128 chars. Defaults to 'Repo brain: <repo_slug>'."),
+};
+
+const rotateRepoKeySchema = {
+  repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier whose key should be revoked and replaced."),
+};
+
+// The agent-key pair mints a SECOND, wider credential for the same repo: the
+// caged agent's principal is a member of the repo brain AND of the shared
+// cross-repo agent brain. Same rule as above — the caller picks a repo name and
+// nothing that affects authority; the brains, roles and principal_type are
+// literals in repo-key-minting.mjs. No display_name, unlike mint_repo_key:
+// neither brain is created here — the repo brain must already exist and the
+// shared agent brain is an operator decision.
+const mintAgentKeySchema = {
+  repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier (lowercase letters, digits, hyphens) the caged agent works in. Grants brain 'repo:<repo_slug>' plus the shared agent brain."),
+};
+
+const rotateAgentKeySchema = {
+  repo_slug: z.string().min(1).max(63).describe("DNS-safe repo identifier whose caged-agent key should be revoked and replaced."),
+};
+
+// docs/adr/0004 (amendment 2026-08-07): the read side of minting. list_brains and
+// list_principals take NO arguments — the handlers implement no filters, and
+// declaring one here would be accepted and silently ignored, handing an auditor a
+// narrower answer than they asked for. Only the two filters handleListKeys
+// actually reads are declared, with the handler's own defaults.
+const listBrainsSchema = {};
+const listPrincipalsSchema = {};
+const listKeysSchema = {
+  include_inactive: z.boolean().optional().describe("Include revoked keys. Defaults to true — revoked keys are part of the audit trail."),
+  only_admin: z.boolean().optional().describe("Return only keys with is_admin=true. Defaults to false. Set true to answer 'does any stored admin key still exist' directly."),
 };
 
 function jsonToolResult(value) {
@@ -307,13 +363,69 @@ function hasExplicitSearchRole(filter) {
       || Object.prototype.hasOwnProperty.call(filter, "retrieval_role"));
 }
 
-async function handleCaptureThought(args, accessContext) {
+async function handleCaptureThought(args, accessContext, { externalIngest = false } = {}) {
   const { brainId } = await resolveRequestBrain(accessContext, args.brain);
   // ADR-0002 write ladder: capture is a WRITE. Authorize before doing any work.
   // (Pre-ADR-0002 the runtime had no write gate — any reachable brain was
   // writable; this is the call site that enforcement was missing.)
-  await authorizeWrite(accessContext, brainId);
+  // The verdict carries the audit actor descriptor {auth_source, principal_id,
+  // is_admin}. It used to be discarded here; the revision trigger (022) needs it
+  // to attribute an overwrite, so it is threaded to the store.
+  const writeActor = await authorizeWrite(accessContext, brainId);
+  const callerReadEgressClass = accessContext._policy.caller.readEgressClass;
+  const caller = accessContext._policy?.caller;
   const content = args.content.trim();
+  const requestedTier = args.sensitivity_tier ?? "standard";
+
+  // PREFLIGHT — runs BEFORE any embedding/LLM processor call so restricted
+  // content never reaches an external processor on a path that will be rejected
+  // (docs/45 §6.5/§6.10; Codex v4 F3; review #5/#6).
+  //
+  // (a) A restricted capture must target a brain that can hold restricted
+  //     content (private_local / quarantine_review). The
+  //     enforce_restricted_brain_isolation trigger also rejects a mismatch, but
+  //     only AFTER createEmbedding/extractMetadata have seen the content.
+  if (requestedTier !== "standard") {
+    const brainClass = await peekBrainEgressClass({ brainId });
+    if (brainClass !== "private_local" && brainClass !== "quarantine_review") {
+      throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, "Cannot capture restricted content into this brain");
+    }
+    // §6.5: restricted content may only be processed by a local-trusted
+    // embedding/LLM endpoint. Refuse BEFORE any processor call, else the content
+    // egresses through OB1 itself. Fail-closed: only loopback (or operator-
+    // allowlisted hosts) qualify; a non-loopback https endpoint with global TLS
+    // verification disabled does not.
+    const procOpts = {
+      allowlistHosts: config.restrictedProcessorHosts,
+      globalTlsDisabled: process.env.NODE_TLS_REJECT_UNAUTHORIZED === "0",
+    };
+    const willExtract = args.extract_metadata ?? true;
+    if (!isLocalTrustedProcessor(config.embeddingBaseUrl, procOpts)
+        || (willExtract && !isLocalTrustedProcessor(config.llmBaseUrl, procOpts))) {
+      throw new HttpError(403, "Restricted-tier capture refused: embedding/LLM processor is not a local-trusted endpoint (docs/45 §6.5)");
+    }
+  }
+
+  // (b) A cloud_bound caller may not upsert OVER an existing restricted row.
+  //     dedupe_key defaults to sha256(content) in SQL, so the EFFECTIVE key
+  //     (explicit OR content-hash) is what the upsert conflicts on — peeking with
+  //     only an explicit key would miss an implicit-dedupe collision and let the
+  //     content reach the processors before the conflict guard denies it.
+  const effectiveDedupeKey = args.dedupe_key ?? crypto.createHash("sha256").update(content, "utf8").digest("hex");
+  // The peek MUST use the same principal the capture will, or on a shared agent
+  // brain it looks up the bare key while the capture conflicts on the namespaced
+  // one — leaving the §6.10 restricted-tier preflight blind on exactly the brain
+  // where two principals collide.
+  const writerPrincipalId = accessContext.principalId ?? accessContext._policy?.caller?.principalId ?? null;
+  const existingTier = await peekCaptureConflictTier({
+    brainId,
+    dedupeKey: effectiveDedupeKey,
+    writtenByPrincipalId: writerPrincipalId,
+  });
+  if (existingTier !== undefined && existingTier !== "standard" && callerReadEgressClass !== "local_trusted") {
+    throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, "Thought not found");
+  }
+
   const metadata = args.metadata ?? {};
   const shouldExtractMetadata = args.extract_metadata ?? true;
   const extractionPromise = shouldExtractMetadata
@@ -344,6 +456,15 @@ async function handleCaptureThought(args, accessContext) {
       : null,
   });
 
+  // Stamp the egress-boundary columns from the caller's egress class (docs/45
+  // §6.8/§6.11). A cloud-bound (or unknown) writer is cloud_origin; a cloud_origin
+  // restricted capture is quarantined (unreviewed) at creation.
+  const stamp = deriveCaptureStamp({
+    caller,
+    sensitivityTier: args.sensitivity_tier,
+    externalIngest,
+  });
+
   const thought = await captureThought({
     brainId,
     content,
@@ -351,13 +472,31 @@ async function handleCaptureThought(args, accessContext) {
     embeddingModel: config.embeddingModel,
     metadata: normalizedMetadata,
     dedupeKey: args.dedupe_key,
+    sensitivityTier: args.sensitivity_tier,
+    originEgressClass: stamp.originEgressClass,
+    sourceTrustClass: stamp.sourceTrustClass,
+    reviewState: stamp.reviewState,
+    callerReadEgressClass,
+    // Writer attribution (migration 021). Without it a bad write on a SHARED
+    // brain is unattributable after the fact — the row says which brain, never
+    // which principal. Both may be null (legacy admin secret): the store records
+    // unattributed rather than guessing, and its shared-brain overwrite guard
+    // reads NULL as "not the same writer".
+    writtenByPrincipalId: accessContext.principalId ?? caller?.principalId ?? null,
+    writtenByKeyId: accessContext.accessKeyId ?? caller?.accessKeyId ?? null,
+    actor: writeActor,
   });
 
+  // Never hand back the internal namespaced dedupe key. On a shared agent brain
+  // the stored key is `<principal>:<key>`, and a client following the documented
+  // idempotent-import pattern — feed the returned dedupe_key back in — would get
+  // it prefixed again on every round, inserting a fresh duplicate each time.
+  // Echo what the caller actually supplied.
   return {
     success: true,
     message: "Thought captured",
     metadata_extraction_enabled: shouldExtractMetadata,
-    thought,
+    thought: { ...thought, dedupe_key: args.dedupe_key ?? null },
   };
 }
 
@@ -388,9 +527,13 @@ export async function handleSearchThoughts(args, accessContext) {
       })),
     );
 
-    const results = perBrain
+    const tagged = perBrain
       .flatMap(({ brain, retrieval }) =>
-        retrieval.results.map((row) => ({ ...row, brain_id: brain.brainId, brain_slug: brain.brainSlug })))
+        retrieval.results.map((row) => ({ ...row, brain_id: brain.brainId, brain_slug: brain.brainSlug })));
+    // Layer-B per-row clamp before ranking/truncation so a dropped row never
+    // consumes a result slot (no-op off the enforce + cloud_bound path).
+    const clamped = await clampReadRowsByEgress(tagged, accessContext);
+    const results = clamped
       .sort((a, b) => (b.similarity ?? 0) - (a.similarity ?? 0))
       .slice(0, matchCount);
 
@@ -399,7 +542,9 @@ export async function handleSearchThoughts(args, accessContext) {
       success: true,
       query: args.query,
       brains_searched: brains.length,
-      retrieval_strategy: multi ? "multi-brain-merge" : perBrain[0].retrieval.retrieval_strategy,
+      // brains can be EMPTY (a cloud_bound caller whose every brain is
+      // egress-excluded under enforce): return an empty result, never deref [0].
+      retrieval_strategy: multi ? "multi-brain-merge" : (perBrain[0]?.retrieval.retrieval_strategy ?? "none"),
       fallback_used: perBrain.some((p) => p.retrieval.fallback_used),
       recency_weight: recencyWeight,
       half_life_days: recencyWeight > 0 ? halfLifeDays : null,
@@ -480,6 +625,9 @@ async function handleAskBrain(args, accessContext) {
       graphMaxHops: args.graph_max_hops ?? 2,
       graphNeighborLimit: args.graph_neighbor_limit ?? matchCount,
     }));
+    // Layer-B per-row clamp on the evidence set (incl. graph-expanded rows)
+    // before it is cited or fed to the answerer (no-op off enforce + cloud_bound).
+    evidenceRows = await clampReadRowsByEgress(evidenceRows, accessContext);
     const evidence = evidenceRows.map(evidenceCitation);
 
     if (evidence.length === 0) {
@@ -639,16 +787,22 @@ export async function handleListThoughts(args, accessContext) {
   // v24 D4/D6: fan out, tag rows with origin, merge newest-first, truncate.
   const perBrain = await Promise.all(
     brains.map(async (b) => {
+      // Writer joined on rather than added to the function's return shape — see
+      // the note on WRITER_JOIN in retrieval.mjs for why.
       const result = await query(
-        "select * from list_recent_thoughts($1::uuid, $2, $3::jsonb)",
+        `select m.*, wp.slug as written_by
+         from list_recent_thoughts($1::uuid, $2, $3::jsonb) m
+         left join thoughts wt on wt.id = m.id
+         left join brain_principals wp on wp.id = wt.written_by_principal_id`,
         [b.brainId, limit, filter],
       );
       return result.rows.map((row) => ({ ...row, brain_id: b.brainId, brain_slug: b.brainSlug }));
     }),
   );
 
-  const thoughts = perBrain
-    .flat()
+  // Layer-B per-row clamp before merge/truncate (no-op off enforce + cloud_bound).
+  const clamped = await clampReadRowsByEgress(perBrain.flat(), accessContext);
+  const thoughts = clamped
     .sort((a, b) => {
       const ta = a.created_at ? new Date(a.created_at).getTime() : 0;
       const tb = b.created_at ? new Date(b.created_at).getTime() : 0;
@@ -727,10 +881,293 @@ export async function handleStats(args, accessContext) {
   return stats;
 }
 
+// ---------------------------------------------------------------------------
+// whoami — credential self-description (docs/adr/0004-0007 rollout support)
+// ---------------------------------------------------------------------------
+//
+// WHY THIS EXISTS. Every OB1 client falls back to the shared admin key when its
+// scoped key is unset, so a MIS-PROVISIONED scoped key tests GREEN during the
+// rollout (the fallback silently carried the request) and only starts 401-ing
+// after the admin key is withdrawn — i.e. after the irreversible step. Until now
+// the only question a caller could ask was "does SOME key work?". whoami turns
+// that into "is this the key I THINK it is?", which is the check that actually
+// catches the masking: a repo agent that expects `repo-service:ob1` / editor on
+// `repo:ob1` and instead sees `auth_source: legacy_admin_key` (or an is_admin
+// stored key, or the wrong principal, or an empty brain list) fails loudly BEFORE
+// withdrawal rather than after it.
+//
+// WHY IT IS SAFE TO EXPOSE TO EVERY CALLER — the whole design is "a mirror, never
+// a window":
+//
+//  1. It reveals NO secret. It never touches the presented key, its hash, or any
+//     prefix of either: the only credential fields returned are the row's label,
+//     credential_type, timestamps and its surrogate primary key — none of which
+//     is derived from the secret, and all of which the holder chose or already
+//     knows. There is deliberately no branch anywhere below that reads a key
+//     column other than those.
+//  2. It describes ONLY the presenting credential. The credential lookup is keyed
+//     by `accessContext.accessKeyId` — the exact row that authenticated THIS
+//     request — and the principal lookup by `accessContext.principalId`. Neither
+//     takes an argument, so there is nothing to point at another key/principal;
+//     the tool takes no arguments at all, which is what makes that structural
+//     rather than a validation rule. It never enumerates keys or principals.
+//  3. It is not an existence oracle. The brain list is built from
+//     `scope.accessible` / `scope.egressExcluded`, i.e. brains this caller ALREADY
+//     resolves and reads today, and the egress-class lookup is filtered to exactly
+//     those ids. Nothing outside the caller's own scope is queried or named, so a
+//     caller learns nothing it could not learn by calling `stats` with no selector.
+//     (The legacy admin path has no derived scope; it reports an empty list and
+//     says so, rather than enumerating the whole estate.)
+//  4. It has no side effects and grants nothing: pure reads, no authorization
+//     decision is taken on its output, and the values it echoes are the same ones
+//     already governing every other call this credential makes.
+//  5. It is honest for degenerate callers instead of crashing. The legacy admin
+//     path has no principal (`principalId` null) and no accessible set
+//     (`accessibleBrains` undefined) — both are handled explicitly. And it is
+//     reachable by a BRAIN-LESS caller (the minter key, docs/53, holds no
+//     membership at all): a credential with no usable brain is precisely the case
+//     where you most need to ask what you are, so the tool must not require one.
+async function whoamiIdentity(accessContext) {
+  // The principal behind the presenting credential. Null for the bare legacy
+  // admin key, which has no principal row by construction (auth.mjs
+  // resolveLegacyAdminContext) — report that honestly rather than inventing one.
+  if (accessContext.principalId) {
+    const r = await query(
+      `select p.slug as principal_slug, p.principal_type, h.slug as estate_slug
+         from brain_principals p
+         left join households h on h.id = p.household_id
+        where p.id = $1::uuid`,
+      [accessContext.principalId],
+    );
+    const row = r.rows[0];
+    return {
+      principal: {
+        id: accessContext.principalId,
+        slug: row?.principal_slug ?? null,
+        principal_type: row?.principal_type ?? accessContext.principalType ?? null,
+      },
+      estate: { id: accessContext.householdId ?? null, slug: row?.estate_slug ?? null },
+    };
+  }
+
+  let estateSlug = null;
+  if (accessContext.householdId) {
+    const r = await query("select slug from households where id = $1::uuid", [accessContext.householdId]);
+    estateSlug = r.rows[0]?.slug ?? null;
+  }
+  return {
+    principal: null,
+    estate: { id: accessContext.householdId ?? null, slug: estateSlug },
+  };
+}
+
+// Label/type of the exact key row that authenticated this request. Null for a
+// human token and for the bare legacy key — neither is a stored credential.
+// NOTE the selected columns: label, credential_type, flags, timestamps. Never
+// key_hash, and never anything derived from it.
+async function whoamiCredential(accessContext) {
+  if (!accessContext.accessKeyId) {
+    return null;
+  }
+  const r = await query(
+    `select id, label, credential_type, is_active, created_at, last_used_at
+       from brain_access_keys where id = $1::uuid`,
+    [accessContext.accessKeyId],
+  );
+  const row = r.rows[0];
+  if (!row) {
+    return null;
+  }
+  return {
+    id: row.id,
+    label: row.label,
+    credential_type: row.credential_type,
+    is_active: row.is_active,
+    created_at: row.created_at,
+    last_used_at: row.last_used_at,
+  };
+}
+
+// How this credential reaches a given brain, from the membership rows the
+// request already fetched (accessContext._policy) — no extra queries, and the
+// same rows every authorization decision on this request is made from.
+function whoamiRoleForBrain(accessContext, brainId) {
+  const { caller, brainMembershipById, estateMembershipByEstate, brainEstateById } = accessContext._policy;
+  const brainMembership = brainMembershipById.get(brainId);
+  if (brainMembership && !brainMembership.isDeny) {
+    return { role: brainMembership.role, role_source: "brain_membership" };
+  }
+  const estateId = brainEstateById.get(brainId) ?? null;
+  const estateMembership = estateId ? estateMembershipByEstate.get(estateId) : null;
+  if (estateMembership && !estateMembership.isDeny) {
+    return { role: estateMembership.role, role_source: "estate_membership" };
+  }
+  // ADR-0003: a stored admin key reaches every brain in its home estate with no
+  // membership row at all. Name that reach explicitly so it cannot be mistaken
+  // for a provisioned membership during the rollout audit.
+  if (caller.isAdmin && estateId && estateId === caller.homeEstateId) {
+    return { role: null, role_source: "admin_estate_reach" };
+  }
+  return { role: null, role_source: null };
+}
+
+export async function handleWhoami(accessContext) {
+  const { caller, scope, egressMode } = accessContext._policy;
+
+  const [identity, credential] = await Promise.all([
+    whoamiIdentity(accessContext),
+    whoamiCredential(accessContext),
+  ]);
+
+  const accessible = scope.accessible ?? [];
+  const excluded = scope.egressExcluded ?? [];
+  // Egress class is an authorization input the context does not carry per-brain,
+  // so it needs one lookup — scoped to exactly the ids already in this caller's
+  // own scope, which is what keeps this from becoming an existence oracle.
+  const ids = [...new Set([...accessible, ...excluded].map((b) => b.brainId).filter(Boolean))];
+  const egressBySlugId = new Map();
+  if (ids.length > 0) {
+    const r = await query("select id, slug, egress_class from brains where id = any($1::uuid[])", [ids]);
+    for (const row of r.rows) {
+      egressBySlugId.set(row.id, { slug: row.slug, egressClass: row.egress_class ?? null });
+    }
+  }
+
+  const describeBrain = async (b, { egressExcluded }) => {
+    const meta = egressBySlugId.get(b.brainId);
+    const { role, role_source } = whoamiRoleForBrain(accessContext, b.brainId);
+    // The single most rollout-relevant fact ("can this key actually WRITE to
+    // repo:x?"), taken from the real ladder rather than re-derived here.
+    let canWrite = false;
+    try {
+      await authorizeWrite(accessContext, b.brainId);
+      canWrite = true;
+    } catch (error) {
+      if (!(error instanceof HttpError)) {
+        throw error;
+      }
+    }
+    return {
+      brain_id: b.brainId,
+      slug: b.brainSlug ?? meta?.slug ?? null,
+      role,
+      role_source,
+      egress_class: meta?.egressClass ?? null,
+      can_write: canWrite,
+      ...(egressExcluded ? { egress_excluded: true } : {}),
+    };
+  };
+
+  // The legacy admin path derives no scope, so auth.mjs leaves its default brain
+  // un-named (effectiveBrainSlug null) when no selector was given. "You default
+  // to <uuid>" is useless for a rollout check, so name the caller's OWN default
+  // brain — never anything else.
+  let effectiveBrainSlug = accessContext.effectiveBrainSlug ?? null;
+  if (accessContext.effectiveBrainId && !effectiveBrainSlug) {
+    const r = await query("select slug from brains where id = $1::uuid", [accessContext.effectiveBrainId]);
+    effectiveBrainSlug = r.rows[0]?.slug ?? null;
+  }
+
+  const brains = await Promise.all(accessible.map((b) => describeBrain(b, { egressExcluded: false })));
+  // Brains this credential HAS a membership on but cannot use because the caller
+  // is cloud-bound and the brain is local-only (docs/45 §6.13). Reported so a
+  // "my key sees nothing" report is diagnosable; these are the caller's own
+  // memberships, so naming them leaks nothing it did not already grant.
+  const egressExcludedBrains = egressMode === "enforce"
+    ? await Promise.all(excluded.map((b) => describeBrain(b, { egressExcluded: true })))
+    : [];
+
+  brains.sort((a, b) => String(a.slug).localeCompare(String(b.slug)));
+  egressExcludedBrains.sort((a, b) => String(a.slug).localeCompare(String(b.slug)));
+
+  return {
+    success: true,
+    auth_source: accessContext.authSource,
+    principal: identity.principal,
+    estate: identity.estate,
+    credential,
+    is_admin: Boolean(accessContext.isAdmin),
+    // docs/53: the minting capability, defaulted false for every caller shape
+    // that does not explicitly carry it (incl. the legacy admin secret).
+    can_mint_repo_keys: Boolean(caller.canMintRepoKeys),
+    // The EFFECTIVE class auth.mjs resolved (fail-closed to cloud_bound), not the
+    // raw column — that is the value every read decision on this request uses.
+    read_egress_class: caller.readEgressClass ?? null,
+    egress_mode: egressMode ?? "off",
+    effective_brain: {
+      brain_id: accessContext.effectiveBrainId ?? null,
+      slug: effectiveBrainSlug,
+    },
+    // Membership-derived reach. The legacy admin key derives no scope at all
+    // (it resolves brains globally, per request), so it reports an empty list
+    // and says so rather than enumerating every brain in the database.
+    reach: caller.kind === CALLER_KINDS.LEGACY_ADMIN_KEY
+      ? "global_unscoped_legacy_admin"
+      : "membership_derived",
+    brain_count: brains.length,
+    brains,
+    egress_excluded_brains: egressExcludedBrains,
+  };
+}
+
 function ensureGraphAdmin(accessContext) {
   if (!accessContext.isAdmin) {
     throw new HttpError(403, "Graph endpoints are disabled for non-admin multitenant requests");
   }
+}
+
+// docs/45 §8.3 (runbook §10 graph-plane gap): the graph reads traverse all of
+// Neo4j and are not brain-scoped, so admin alone is not an egress decision —
+// `read_egress_class` is a read attribute independent of authority, and a
+// cloud_bound admin (e.g. the legacy key) must not pull local-only/restricted
+// nodes. This descriptor lets the scrub clamp such a caller's result to readable
+// nodes; local_trusted or non-enforce callers get the full graph.
+function callerReadEgress(accessContext) {
+  const { caller, egressMode } = accessContext._policy;
+  return {
+    enforce: egressMode === "enforce",
+    cloudBound: caller.readEgressClass !== CALLER_EGRESS_CLASS.LOCAL_TRUSTED,
+  };
+}
+
+// docs/45 Layer-B per-row clamp (runbook §10): a defense-in-depth row filter for
+// the materialized read surface (search / list / ask_brain evidence). Brain-level
+// confinement already removes local-only brains from a cloud_bound caller's scope,
+// and the 016/018 triggers keep restricted rows out of cloud-readable brains — so
+// under correct provisioning this NEVER drops a row. It exists for the case those
+// invariants are bypassed (e.g. a restricted row injected by direct SQL into a
+// repo brain): each row is run through `effectiveEgress` and dropped unless it may
+// materialize for the caller. Gated to the confined path (enforce + cloud_bound):
+// every other caller returns unchanged with zero extra DB work, so observe / off /
+// local_trusted reads are byte-identical.
+async function clampReadRowsByEgress(rows, accessContext) {
+  const { caller, egressMode } = accessContext._policy;
+  if (
+    egressMode !== "enforce" ||
+    caller.readEgressClass === CALLER_EGRESS_CLASS.LOCAL_TRUSTED ||
+    !Array.isArray(rows) ||
+    rows.length === 0
+  ) {
+    return rows;
+  }
+  const egressById = await fetchRowEgressById(rows.map((r) => r?.id));
+  return rows.filter((row) => {
+    const e = egressById.get(String(row?.id).toLowerCase());
+    if (!e) {
+      return false; // vanished between retrieval and clamp → fail-closed drop
+    }
+    return effectiveEgress({
+      brain: { egressClass: e.brain_egress_class },
+      row: {
+        sensitivityTier: e.sensitivity_tier,
+        reviewState: e.review_state,
+        originEgressClass: e.origin_egress_class,
+        sourceTrustClass: e.source_trust_class,
+      },
+      caller: { readEgressClass: caller.readEgressClass },
+      sink: null,
+    }).canMaterialize;
+  });
 }
 
 async function handleGraphNeighbors(args, accessContext) {
@@ -743,6 +1180,7 @@ async function handleGraphNeighbors(args, accessContext) {
     canonicalId: args.canonical_id,
     maxHops: args.max_hops ?? 2,
     limit: args.limit ?? 10,
+    readEgress: callerReadEgress(accessContext),
   });
 }
 
@@ -756,6 +1194,7 @@ async function handleSourceLineage(args, accessContext) {
     canonicalId: args.canonical_id,
     maxDepth: args.max_depth ?? 4,
     limit: args.limit ?? 12,
+    readEgress: callerReadEgress(accessContext),
   });
 }
 
@@ -774,6 +1213,7 @@ async function handleWhyConnected(args, accessContext) {
     toCanonicalId: args.to_canonical_id,
     maxHops: args.max_hops ?? 4,
     limit: args.limit ?? 3,
+    readEgress: callerReadEgress(accessContext),
   });
 }
 
@@ -787,8 +1227,12 @@ async function handleExpandContext(args, accessContext) {
   const requestedLimit = args.limit ?? 6;
 
   try {
+    // §6.13 (audit H1): route the brain through resolveRequestBrain so the
+    // default/effective brain is egress-checked under enforce (a cloud_bound
+    // admin's private_local default must not leak via graph expansion).
+    const { brainId } = await resolveRequestBrain(accessContext, args.brain);
     const result = await expandContextRows({
-      brainId: accessContext.effectiveBrainId,
+      brainId,
       thoughtId: args.thought_id,
       canonicalId: args.canonical_id,
       questionText: args.question ?? "",
@@ -966,6 +1410,132 @@ function buildMcpServer(accessContext) {
     },
   );
 
+  // Ungated on purpose — see the safety argument on handleWhoami. It is a
+  // mirror, not a window: no arguments, describes only the presenting
+  // credential, reveals no secret material, and names no brain the caller
+  // cannot already resolve. Every caller shape may ask it, including a
+  // brain-less minter key and the legacy admin path.
+  server.tool(
+    "whoami",
+    "Describe the credential presenting this request: which auth path resolved it, its principal and estate, whether it is admin, its egress class, and the full list of brains it can reach with role and egress class. Takes no arguments and never returns key material. Use it to verify a scoped key is the key you think it is — a green call from some other tool only proves SOME credential worked.",
+    {},
+    async () => {
+      try {
+        return jsonToolResult(await handleWhoami(accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  // docs/53: minting tools. Gated server-side by the can_mint_repo_keys
+  // capability, which only the operator-provisioned minter key holds — every
+  // other caller, including the legacy admin secret, gets a 403 from the handler.
+  // system-config deliberately keeps these OFF every harness allowlist; that is
+  // ergonomics, the capability check is the actual control.
+  server.tool(
+    "mint_repo_key",
+    "Provision a per-repo brain and issue its cloud-bound repo access key. Create-only; returns the key once.",
+    mintRepoKeySchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleMintRepoKey(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "rotate_repo_key",
+    "Revoke the repo brain's active REPO key and issue a replacement. Leaves any agent key on the same brain untouched. Returns the new key once.",
+    rotateRepoKeySchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleRotateRepoKey(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  // An agent key is not a wider repo key: it is a SECOND, DISJOINT credential for
+  // the caged agent (docs/adr/0006), reaching the shared cross-repo brain and no
+  // repo brain at all. pi does repo work with the repo key, exactly like claude and
+  // codex. Both facts go in the description rather than being left for an operator
+  // to infer from the name.
+  server.tool(
+    "mint_agent_key",
+    "Issue the caged agent (pi) its per-repo COMMON key, a second credential alongside the repo key. Its principal 'pi-common:<repo_slug>' is an editor on the estate's ONE shared cross-repo agent brain and on NOTHING else — it does not reach the repo brain, so pi still presents the repo key from mint_repo_key for repo work. Anything written with it is readable from every other repo. The repo brain must already exist (typo guard) and the estate must have a brain marked is_shared_agent_brain. Create-only; returns the key once.",
+    mintAgentKeySchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleMintAgentKey(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "rotate_agent_key",
+    "Revoke every active caged-agent COMMON key for a repo and issue a replacement with the same single-brain reach: editor on the estate's shared cross-repo agent brain, and no repo brain. Returns the new key once. Does not touch the repo key issued by mint_repo_key — pi presents that one too, so revoking it would cut off claude and codex as well.",
+    rotateAgentKeySchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleRotateAgentKey(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  // Read-side inventory tools. Same gate as the mint tools — they require the
+  // can_mint_repo_keys capability, so only the operator-provisioned minter key
+  // can call them; every other caller, the legacy admin secret included, gets a
+  // 403 from the handler. These are OPERATOR tools, not agent tools: they exist so
+  // a key rollout is auditable and idempotent (docs/adr/0004 amendment) rather
+  // than inferred from create-only 409s, and so a stray active admin key can be
+  // found without hand-written SQL. No key material is ever returned.
+  server.tool(
+    "list_brains",
+    "OPERATOR TOOL, NOT AN AGENT TOOL. Requires the can_mint_repo_keys capability; every other caller gets 403. Enumerates the minter household's brains — slug, id, kind, egress class, shared/shared-agent flags, thought counts, and how many live keys REACH each brain by principal membership. Use it to confirm a repo brain exists before or after minting, and to spot a brain more credentials can reach than intended. Takes no arguments and returns no key material.",
+    listBrainsSchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleListBrains(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "list_principals",
+    "OPERATOR TOOL, NOT AN AGENT TOOL. Requires the can_mint_repo_keys capability; every other caller gets 403. Enumerates the household's principals with their brain memberships and roles — the reach a key actually grants, since a key inherits its PRINCIPAL's memberships (ADR-0003). Use it to confirm 'repo-service:<slug>' and 'pi-common:<slug>' were provisioned with the intended membership set. Takes no arguments and returns no key material.",
+    listPrincipalsSchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleListPrincipals(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
+  server.tool(
+    "list_keys",
+    "OPERATOR TOOL, NOT AN AGENT TOOL. Requires the can_mint_repo_keys capability; every other caller gets 403. Enumerates stored access keys as METADATA ONLY — principal, default brain, label, type, admin flag, created/revoked timestamps. Never returns a key value, prefix or hash, so it cannot answer 'is this my key'; it answers 'which keys exist, and is any admin key still active'. include_inactive defaults to true (revoked keys are audit trail); only_admin=true answers the withdrawal question directly.",
+    listKeysSchema,
+    async (args) => {
+      try {
+        return jsonToolResult(await handleListKeys(args, accessContext));
+      } catch (error) {
+        return errorToolResult(error);
+      }
+    },
+  );
+
   return server;
 }
 
@@ -1017,11 +1587,28 @@ app.get("/health", async (c) => {
   }
 });
 
+// GET because it is a pure, side-effect-free read of the caller's own identity
+// and takes no body — the same `app.get` registration `/` and `/health` already
+// use, with the authenticate-then-handle + errorMessage/errorStatus shape every
+// authenticated route uses. Authenticated like everything else (`x-access-key`
+// header / `Authorization: Bearer`), so an unauthenticated probe still gets 401
+// and learns nothing. Reachable from a shell during rollout, which is the point:
+// the check must be runnable against a key BEFORE that key is wired into a
+// client's MCP config.
+app.get("/whoami", async (c) => {
+  try {
+    const accessContext = await resolveAccessContext(c);
+    return c.json(await handleWhoami(accessContext));
+  } catch (error) {
+    return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
+  }
+});
+
 app.post("/ingest/thought", async (c) => {
   try {
     const accessContext = await resolveAccessContext(c);
     const payload = captureThoughtInput.parse(await c.req.json());
-    const result = await handleCaptureThought(payload, accessContext);
+    const result = await handleCaptureThought(payload, accessContext, { externalIngest: true });
     return c.json(result, 201);
   } catch (error) {
     return c.json({ success: false, error: errorMessage(error) }, errorStatus(error));
@@ -1066,18 +1653,20 @@ app.post("/admin/thought/metadata", async (c) => {
     // it like capture so the ladder has no inconsistent seam (a viewer must not
     // mutate via the metadata path). Runs before the thought lookup, so an
     // unauthorized caller gets 403, not a 404 leak.
-    await authorizeWrite(accessContext, brainId);
+    const patchActor = await authorizeWrite(accessContext, brainId);
     const row = await patchThoughtMetadata({
       brainId,
       thoughtId: payload.thought_id,
       metadataPatch: payload.metadata_patch,
       type: payload.type,
       sourceType: payload.source_type,
-      sensitivityTier: payload.sensitivity_tier,
       importance: payload.importance,
       qualityScore: payload.quality_score,
       enriched: payload.enriched,
       status: payload.status,
+      // §6.10: a cloud_bound caller cannot mutate a restricted row.
+      callerReadEgressClass: accessContext._policy.caller.readEgressClass,
+      actor: patchActor,
     });
     return c.json({
       success: true,
@@ -1111,6 +1700,7 @@ app.post("/admin/thought/delete", async (c) => {
       brainId,
       thoughtId: payload.thought_id,
       actor,
+      callerReadEgressClass: accessContext._policy.caller.readEgressClass,
     });
     return c.json(deleteResponse(result));
   } catch (error) {
@@ -1128,6 +1718,7 @@ app.post("/admin/thought/restore", async (c) => {
       brainId,
       thoughtId: payload.thought_id,
       actor,
+      callerReadEgressClass: accessContext._policy.caller.readEgressClass,
     });
     return c.json(restoreResponse(result));
   } catch (error) {

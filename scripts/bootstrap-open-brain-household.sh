@@ -20,7 +20,14 @@ Usage:
     [--shared-brain-name "Shared Household Brain"] \
     [--keycloak-sub <sub>] \
     [--preferred-username <username>] \
-    [--email <email>]
+    [--email <email>] \
+    [--register-admin-key]
+
+  --register-admin-key  Register MCP_ACCESS_KEY as a stored global admin key.
+                        OFF by default (ADR-0004): MCP_ACCESS_KEY is the server's own
+                        boot secret, not an operator credential. Issue admin
+                        credentials with local/open-brain-mcp/scripts/mint-named-admin.mjs
+                        instead. Also settable via OB1_BOOTSTRAP_REGISTER_ADMIN_KEY=true.
 EOF
 }
 
@@ -48,6 +55,9 @@ SHARED_BRAIN_NAME=""
 KEYCLOAK_SUB=""
 PREFERRED_USERNAME=""
 EMAIL=""
+# Read before .env.open-brain-local is sourced, so an env file cannot silently
+# re-enable admin registration; only an operator flag or an already-exported var can.
+REGISTER_ADMIN_KEY="${OB1_BOOTSTRAP_REGISTER_ADMIN_KEY:-false}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -94,6 +104,10 @@ while [[ $# -gt 0 ]]; do
     --email)
       EMAIL="$2"
       shift 2
+      ;;
+    --register-admin-key)
+      REGISTER_ADMIN_KEY="true"
+      shift 1
       ;;
     -h|--help)
       usage
@@ -265,7 +279,19 @@ do update set
 SQL
 fi
 
-if [[ -n "${MCP_ACCESS_KEY:-}" ]]; then
+# Opt-in, and deliberately not "on whenever MCP_ACCESS_KEY happens to be set" (ADR-0004).
+# After the secret split MCP_ACCESS_KEY is the server's *own boot secret* — a required
+# boot var that ob1-stable holds and distributes to nothing — so registering it here
+# would hand a globally reachable stored admin key to whatever presents that value.
+# That is strictly worse than the legacy path it was meant to mirror: a stored admin key
+# can purge, the legacy branch cannot. Because the upsert forces is_active/is_admin back
+# to true, a single unthinking re-run would silently undo the withdrawal.
+# Admin credentials are now issued one at a time, attributably, by mint-named-admin.mjs.
+if consul_bool_is_true "$REGISTER_ADMIN_KEY"; then
+  if [[ -z "${MCP_ACCESS_KEY:-}" ]]; then
+    echo "--register-admin-key was given but MCP_ACCESS_KEY is not set." >&2
+    exit 1
+  fi
   "${PSQL[@]}" -v ON_ERROR_STOP=1 <<SQL
 insert into brain_access_keys (
   principal_id,
@@ -298,6 +324,15 @@ do update set
   last_used_at = now(),
   updated_at = now();
 SQL
+  echo "Registered stored admin key 'bootstrap-admin' from MCP_ACCESS_KEY (--register-admin-key)."
+else
+  echo "SKIPPED registering an admin key from MCP_ACCESS_KEY (default since ADR-0004)."
+  echo "  MCP_ACCESS_KEY is the server's own boot secret; storing it as an admin key would"
+  echo "  grant purge to anyone holding it and undo the global-admin withdrawal."
+  echo "  Supported route to an admin credential:"
+  echo "    node local/open-brain-mcp/scripts/mint-named-admin.mjs"
+  echo "  Scoped, non-admin keys: scripts/provision-ingest-key.sh, scripts/agent_estate/provision.sh."
+  echo "  Pass --register-admin-key only for a legacy single-secret estate."
 fi
 
 "${PSQL[@]}" -v ON_ERROR_STOP=1 <<SQL

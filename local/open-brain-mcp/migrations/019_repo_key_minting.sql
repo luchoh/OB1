@@ -1,0 +1,32 @@
+-- 019_repo_key_minting.sql
+-- Least-privilege repo-key minting (docs/53; system-config harness-keys design).
+--
+-- system-config is moving its interactive harnesses (claude-code, codex, pi) off
+-- the single shared MCP_ACCESS_KEY — which resolves to GLOBAL ADMIN via auth.mjs
+-- `key === config.accessKey` — onto per-repo cloud_bound keys. This migration adds
+-- the one capability that lets a non-admin key mint those, and nothing else.
+--
+-- SCHEMA ONLY — NO SEED, DELIBERATELY. An earlier draft seeded the
+-- 'system:minter' principal into "the earliest person principal's household".
+-- That is a guess, and on a multi-household estate it is the WRONG guess: the
+-- personal household holds the person principal while every agent/repo brain
+-- lives in another household. A minter homed in the wrong estate cannot see any
+-- existing repo brain (repo-key-minting.mjs confines minting to the minter's own
+-- household), so every mint would quietly create a new empty brain beside the
+-- personal one — the exact opposite of the rollout's purpose, with no error.
+-- A migration runs unattended and has no way to ask which estate was meant, so it
+-- must not choose one. Principal creation moved to
+-- scripts/mint-authority-init.mjs, which is run by hand, detects the household
+-- owning the repo brains, prints it, and refuses when the answer is ambiguous.
+--
+-- ADDITIVE AND FAIL-CLOSED, deliberately: the column defaults to false, so every
+-- existing key — including the admin path — is unchanged. The legacy admin secret
+-- must NEVER gain this capability implicitly (docs/53 "Residuals"); it does not,
+-- because the legacy path builds its caller inline and never reads this column.
+--
+-- can_mint_repo_keys is orthogonal to is_admin and to the read/write/delete/purge
+-- policy: a key holding it can create repo brains + repo keys and NOTHING else.
+-- It is not authority over content.
+
+alter table brain_access_keys
+  add column if not exists can_mint_repo_keys boolean not null default false;

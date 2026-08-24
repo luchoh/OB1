@@ -24,7 +24,24 @@
 // infers scope). The store is DB-coupled by design — its tests are DB-backed
 // against the dev database; this module's logic IS the SQL.
 
-import { query, formatVector } from "./db.mjs";
+import { query, withAuditActor, formatVector } from "./db.mjs";
+
+// Pick the executor for a mutation that the revision trigger (migration 022)
+// may fire on. With an actor we run inside a transaction that announces it to
+// Postgres so the trigger can attribute the revision.
+//
+// Without one the statement runs on a plain pooled connection where the setting
+// does not exist, and the trigger REFUSES the mutation — 022 fails closed. That
+// is deliberate: an unattributed edit is permanent, whereas a refused write is
+// loud and fixed in minutes. A fresh INSERT is unaffected (the trigger is AFTER
+// UPDATE), which is why this stays a runner choice rather than a hard argument
+// check here — only an actual mutation demands an actor.
+function auditedRunner(actor) {
+  if (!actor) {
+    return query;
+  }
+  return (text, values) => withAuditActor(actor, (run) => run(text, values));
+}
 
 // Refusals the store surfaces as data (the transport adapter maps kind -> HTTP).
 // Not thrown for control flow elsewhere — these mark the three outcomes a caller
@@ -44,6 +61,56 @@ export class ThoughtStoreError extends Error {
   }
 }
 
+// The Layer C write-guard predicate (docs/45 §6.10), the single source of the
+// rule used by every mutation path (capture upsert, metadata patch, soft-delete,
+// restore): a cloud_bound caller may mutate a row ONLY when its tier is the
+// literal 'standard'; a restricted/personal (or unknown-tier, fail-closed) row
+// is invisible to it. `paramIndex` is the bind position of the caller's egress
+// class; `column` lets the ON CONFLICT path qualify it as `thoughts.<col>`.
+function tierGuardSql(paramIndex, column = "sensitivity_tier") {
+  return `(${column} is not distinct from 'standard' or $${paramIndex} = 'local_trusted')`;
+}
+
+// The shared-agent-brain dedupe namespace (0.8.0).
+//
+// WHY: dedupe_key defaults to sha256(content), so any principal that can
+// READ a row can recompute its key — and the capture upsert would then rewrite
+// that row IN PLACE (same id, same created_at, only updated_at moves). On a
+// single-tenant brain that is the intended idempotent-import behaviour. On a
+// brain shared by mutually-distrusting agents (pi runs inside an injection-
+// exposed cage) it is a silent cross-principal overwrite: one agent can put
+// words in another's row and the id/created_at say nothing happened.
+//
+// The fix is structural rather than a check: on `brains.is_shared_agent_brain`,
+// each writer gets its OWN dedupe namespace, `<principal_uuid>:<key>`. Two
+// principals capturing identical content can no longer collide at all, so the
+// "must insert a separate row instead of overwriting" outcome falls out of the
+// unique index itself — no read-then-write race, no extra round trip. The same
+// principal re-capturing derives the same namespaced key, so legitimate
+// idempotent re-import still upserts its own row.
+//
+// Cost: one PK lookup on `brains` inside the SAME statement. Non-shared brains
+// (every brain today) keep the exact key they have always had.
+//
+// Both statements that use this CTE bind the brain id as $1.
+const SHARED_BRAIN_CTE = `
+      brain as (
+        select coalesce(b.is_shared_agent_brain, false) as shared
+        from brains b where b.id = $1::uuid
+      )`;
+
+// The effective dedupe key: caller-supplied key, else sha256(content), namespaced
+// by the writing principal on a shared agent brain. `principalParam` is the bind
+// position of the writer's principal id.
+function dedupeKeySql(keyParam, contentParam, principalParam) {
+  const raw = `coalesce($${keyParam}, encode(digest($${contentParam}, 'sha256'), 'hex'))`;
+  return `case
+          when (select shared from brain) and $${principalParam}::uuid is not null
+            then $${principalParam}::uuid::text || ':' || ${raw}
+          else ${raw}
+        end`;
+}
+
 // ---------------------------------------------------------------------------
 // Capture / upsert
 // ---------------------------------------------------------------------------
@@ -55,13 +122,48 @@ export class ThoughtStoreError extends Error {
 // `do update` deliberately never clears `deleted_at`. The embedding vector and
 // its model/dimension are computed by the caller (embedding service is I/O) and
 // passed in; content_hash defaults to sha256(content) in SQL when no dedupe key.
-export async function captureThought({ brainId, content, embedding, embeddingModel, metadata, dedupeKey }) {
+export async function captureThought({
+  brainId,
+  content,
+  embedding,
+  embeddingModel,
+  metadata,
+  dedupeKey,
+  // Egress-boundary stamp (docs/45 §6.8/§6.11), derived by deriveCaptureStamp in
+  // the handler. sensitivityTier defaults to 'standard'; origin/source/review may
+  // be null (= unknown = fail-closed at read time) for non-stamping callers.
+  sensitivityTier = null,
+  originEgressClass = null,
+  sourceTrustClass = null,
+  reviewState = null,
+  // §6.10: a cloud_bound caller may not upsert-OVER an existing restricted row.
+  // Fail-closed: absent/unknown egress class is cloud_bound.
+  callerReadEgressClass = "cloud_bound",
+  // Writer attribution (migration 021). Nullable on purpose: a caller with no
+  // principal (legacy admin key) writes NULL rather than failing. NULL means
+  // "unattributed", never "mine" — see the shared-brain guard below.
+  writtenByPrincipalId = null,
+  writtenByKeyId = null,
+  // Audit actor for the revision trigger (022). Distinct from the writtenBy*
+  // fields above: those describe who OWNS the row, this describes who performed
+  // THIS mutation, and the two differ precisely in the case versioning exists
+  // for — one principal overwriting another's row.
+  actor = null,
+}) {
   const typeValue = typeof metadata?.type === "string" && metadata.type.trim()
     ? metadata.type.trim()
     : null;
 
-  const result = await query(
+  // On a dedupe re-capture, the security labels move only toward MORE
+  // restrictive (monotone): cloud_origin / untrusted stick, an existing
+  // quarantine is never cleared, and the tier is preserved (a re-capture must
+  // not declassify). The monotonic-taint trigger (016) also backstops origin.
+  // The DO UPDATE is additionally guarded (§6.10): a cloud_bound re-capture over
+  // an existing restricted row matches no conflict-update row → 0 rows → the
+  // handler's preflight (or this fail-closed backstop) denies it as NOT_FOUND.
+  const result = await auditedRunner(actor)(
     `
+      with ${SHARED_BRAIN_CTE}
       insert into thoughts (
         brain_id,
         content,
@@ -70,18 +172,30 @@ export async function captureThought({ brainId, content, embedding, embeddingMod
         embedding_dimension,
         dedupe_key,
         metadata,
-        type
+        type,
+        sensitivity_tier,
+        origin_egress_class,
+        source_trust_class,
+        review_state,
+        written_by_principal_id,
+        written_by_key_id
       )
-      values (
+      select
         $1::uuid,
         $2,
         $3::vector,
         $4,
         $5,
-        coalesce($6, encode(digest($2, 'sha256'), 'hex')),
+        ${dedupeKeySql(6, 2, 14)},
         $7::jsonb,
-        $8
-      )
+        $8,
+        coalesce($9, 'standard'),
+        $10,
+        $11,
+        $12,
+        $14::uuid,
+        $15::uuid
+      from brain
       on conflict (brain_id, dedupe_key) where deleted_at is null
       do update set
         content = excluded.content,
@@ -90,7 +204,42 @@ export async function captureThought({ brainId, content, embedding, embeddingMod
         embedding_dimension = excluded.embedding_dimension,
         metadata = thoughts.metadata || excluded.metadata,
         type = coalesce(excluded.type, thoughts.type),
+        -- tier preserved (no declassification via re-capture)
+        sensitivity_tier = thoughts.sensitivity_tier,
+        -- origin/source taint = worst-of (monotone; never washes)
+        origin_egress_class = case
+          when thoughts.origin_egress_class = 'cloud_origin'
+            or excluded.origin_egress_class = 'cloud_origin' then 'cloud_origin'
+          else coalesce(excluded.origin_egress_class, thoughts.origin_egress_class)
+        end,
+        source_trust_class = case
+          when thoughts.source_trust_class = 'untrusted'
+            or excluded.source_trust_class = 'untrusted' then 'untrusted'
+          else coalesce(excluded.source_trust_class, thoughts.source_trust_class)
+        end,
+        -- an existing quarantine is never cleared by a re-capture (worst-of:
+        -- 'unreviewed' is sticky, so a re-capture can never un-quarantine a row)
+        review_state = case
+          when thoughts.review_state = 'unreviewed' or excluded.review_state = 'unreviewed' then 'unreviewed'
+          else coalesce(thoughts.review_state, excluded.review_state)
+        end,
+        -- attribution follows the LAST writer, but coalesce so an unattributed
+        -- re-capture (legacy admin) never ERASES a known writer.
+        written_by_principal_id = coalesce(excluded.written_by_principal_id, thoughts.written_by_principal_id),
+        written_by_key_id = coalesce(excluded.written_by_key_id, thoughts.written_by_key_id),
         updated_at = now()
+      where ${tierGuardSql(13, "thoughts.sensitivity_tier")}
+        -- Shared-brain ownership backstop. The namespaced dedupe key above
+        -- already makes a cross-principal collision unreachable; this makes the
+        -- rule explicit and covers the residual cases — a row written before the
+        -- namespace existed, and an unattributed writer (NULL principal), which
+        -- owns nothing and so may overwrite nothing. 0 rows ⇒ NOT_FOUND below,
+        -- the same fail-closed shape the tier guard uses (no existence oracle).
+        and (
+          not (select shared from brain)
+          or (thoughts.written_by_principal_id is not null
+              and thoughts.written_by_principal_id = excluded.written_by_principal_id)
+        )
       returning
         id,
         brain_id,
@@ -101,6 +250,12 @@ export async function captureThought({ brainId, content, embedding, embeddingMod
         embedding_dimension,
         metadata,
         type,
+        sensitivity_tier,
+        origin_egress_class,
+        source_trust_class,
+        review_state,
+        written_by_principal_id,
+        written_by_key_id,
         created_at,
         updated_at
     `,
@@ -113,10 +268,97 @@ export async function captureThought({ brainId, content, embedding, embeddingMod
       dedupeKey ?? null,
       JSON.stringify(metadata),
       typeValue,
+      sensitivityTier,
+      originEgressClass,
+      sourceTrustClass,
+      reviewState,
+      callerReadEgressClass,
+      writtenByPrincipalId,
+      writtenByKeyId,
     ],
   );
 
+  // 0 rows ⇒ one of three things, none of which we distinguish for the caller:
+  // the conflict targeted an existing restricted row and the tier guard blocked
+  // the DO UPDATE for a cloud_bound caller; the shared-brain ownership backstop
+  // refused to overwrite another (or an unattributed) principal's row; or the
+  // brain id does not exist (the `from brain` CTE yields no row). Deny without
+  // confirming what exists (§6.10: no existence oracle). The handler's preflight
+  // normally catches the tier case before any processor call; this is the atomic,
+  // TOCTOU-safe backstop.
+  if (result.rows.length === 0) {
+    throw new ThoughtStoreError(STORE_ERROR.NOT_FOUND, `Thought not found: ${dedupeKey ?? "(no dedupe key)"}`);
+  }
+
   return result.rows[0];
+}
+
+// Preflight (docs/45 §6.10 + Codex v3 F1 / v4 F3): the sensitivity tier of the
+// existing LIVE row a capture with this dedupe_key would upsert OVER, or
+// `undefined` when there is no such row (a fresh insert). The handler calls this
+// BEFORE the embedding/LLM processors so a cloud_bound upsert over a restricted
+// row is denied before any content leaves the box. Returns `null` for an
+// existing row whose tier is NULL (fail-closed → treat as non-standard).
+// `writtenByPrincipalId` must be the SAME principal the capture will pass, or the
+// peek looks at a different key than the capture will conflict on for a shared
+// agent brain (see SHARED_BRAIN_CTE).
+export async function peekCaptureConflictTier({ brainId, dedupeKey, writtenByPrincipalId = null }) {
+  if (!dedupeKey) {
+    return undefined;
+  }
+  const r = await query(
+    `with ${SHARED_BRAIN_CTE}
+     select t.sensitivity_tier from brain, thoughts t
+       where t.brain_id = $1::uuid
+         and t.dedupe_key = case
+           when (select shared from brain) and $3::uuid is not null
+             then $3::uuid::text || ':' || $2
+           else $2
+         end
+         and t.deleted_at is null`,
+    [brainId, dedupeKey, writtenByPrincipalId],
+  );
+  return r.rowCount === 0 ? undefined : (r.rows[0].sensitivity_tier ?? null);
+}
+
+// The egress_class of a brain, or `null` if unknown (fail-closed). The capture
+// handler calls this BEFORE the processors so a restricted capture into a brain
+// that cannot hold restricted content (anything but private_local /
+// quarantine_review) is rejected before any content reaches the embedding/LLM
+// services (docs/45 §6.5; the enforce_restricted_brain_isolation trigger would
+// also reject it, but only AFTER the content egressed).
+export async function peekBrainEgressClass({ brainId }) {
+  const r = await query(`select egress_class from brains where id = $1::uuid`, [brainId]);
+  return r.rowCount === 0 ? null : (r.rows[0].egress_class ?? null);
+}
+
+// docs/45 Layer-B (runbook §10 per-row clamp): resolve the per-row egress facts a
+// read handler needs to run `effectiveEgress` over retrieved rows — the row's
+// tier/taint columns plus its owning brain's egress_class, keyed by id. Returns a
+// Map<lowercased-uuid, {sensitivity_tier, origin_egress_class, source_trust_class,
+// review_state, brain_egress_class}>. A row absent from the map (vanished between
+// retrieval and this lookup) is the caller's cue to drop it fail-closed. Only the
+// confined read path (enforce + cloud_bound) calls this, so it costs one indexed
+// round-trip and nothing on the unconfined path.
+export async function fetchRowEgressById(ids) {
+  const list = [...new Set((ids ?? []).filter(Boolean).map((x) => String(x)))];
+  if (list.length === 0) {
+    return new Map();
+  }
+  const { rows } = await query(
+    `select t.id,
+            t.sensitivity_tier,
+            t.origin_egress_class,
+            t.source_trust_class,
+            t.review_state,
+            b.egress_class as brain_egress_class
+       from thoughts t
+       join brains b on b.id = t.brain_id
+      where t.id = any($1::uuid[])
+        and t.deleted_at is null`,
+    [list],
+  );
+  return new Map(rows.map((r) => [String(r.id).toLowerCase(), r]));
 }
 
 // ---------------------------------------------------------------------------
@@ -133,11 +375,16 @@ export async function patchThoughtMetadata({
   metadataPatch,
   type,
   sourceType,
-  sensitivityTier,
   importance,
   qualityScore,
   enriched,
   status,
+  // docs/45 §6.10: a cloud-bound caller may not mutate an existing restricted
+  // row. Fail-closed: absent/unknown egress class is treated as cloud_bound.
+  callerReadEgressClass = "cloud_bound",
+  // Audit actor for the revision trigger (022). Before this, the metadata route
+  // was the only mutation path in the store that left no trace at all.
+  actor = null,
 }) {
   const setClauses = [];
   const params = [thoughtId, brainId];
@@ -160,10 +407,12 @@ export async function patchThoughtMetadata({
     paramIndex++;
   }
 
+  // sensitivity_tier is NOT patchable here (docs/45 §6.7): the generic metadata
+  // route is not a declassification path. Tier transitions go through a dedicated
+  // local-trusted capability (a later slice).
   const structured = [
     ["type", type, "text"],
     ["source_type", sourceType, "text"],
-    ["sensitivity_tier", sensitivityTier, "text"],
     ["importance", importance, "smallint"],
     ["quality_score", qualityScore, "numeric(5,2)"],
     ["enriched", enriched, "boolean"],
@@ -184,13 +433,19 @@ export async function patchThoughtMetadata({
   }
   setClauses.push("updated_at = now()");
 
-  const result = await query(
+  params.push(callerReadEgressClass);
+  const egressIdx = params.length;
+
+  const result = await auditedRunner(actor)(
     `
       update thoughts
       set ${setClauses.join(",\n        ")}
       where id = $1::uuid
         and brain_id = $2::uuid
         and deleted_at is null
+        -- §6.10 Layer C: a cloud_bound caller mutates only a 'standard' row;
+        -- a restricted (or unknown-tier, fail-closed) row matches 0 rows → NOT_FOUND
+        and ${tierGuardSql(egressIdx)}
       returning
         id,
         metadata,
@@ -222,16 +477,21 @@ export async function patchThoughtMetadata({
 // tombstone + a live row may share a key). Idempotent: a second delete returns
 // `already_deleted` and writes NO new audit row. Audit emission is internal and
 // invariant-checked (one audit row per state change).
-export async function softDeleteThought({ brainId, thoughtId, actor }) {
+export async function softDeleteThought({ brainId, thoughtId, actor, callerReadEgressClass = "cloud_bound" }) {
+  // §6.10 Layer C: a cloud_bound caller cannot delete a restricted row. The
+  // guard scopes BOTH `target` (existence) and `upd` (mutation), so a restricted
+  // row reads as NOT_FOUND to a cloud_bound caller — no existence oracle.
   const result = await query(
     `
       with target as (
         select id, deleted_at from thoughts
         where id = $1::uuid and brain_id = $2::uuid
+          and ${tierGuardSql(4)}
       ),
       upd as (
         update thoughts set deleted_at = now(), updated_at = now()
         where id = $1::uuid and brain_id = $2::uuid and deleted_at is null
+          and ${tierGuardSql(4)}
         returning id
       ),
       aud as (
@@ -245,7 +505,7 @@ export async function softDeleteThought({ brainId, thoughtId, actor }) {
         (select count(*) from upd) as changed,
         (select count(*) from aud) as audited
     `,
-    [thoughtId, brainId, JSON.stringify(actor)],
+    [thoughtId, brainId, JSON.stringify(actor), callerReadEgressClass],
   );
 
   const { existed, changed, audited } = result.rows[0];
@@ -267,16 +527,20 @@ export async function softDeleteThought({ brainId, thoughtId, actor }) {
 // docs/32 D7: restore is the symmetric atomic CTE — clears `deleted_at`,
 // snapshots the prior tombstone time into old_state, writes an action='restore'
 // audit row. Idempotent: restoring a live thought is `already_live`, no audit row.
-export async function restoreThought({ brainId, thoughtId, actor }) {
+export async function restoreThought({ brainId, thoughtId, actor, callerReadEgressClass = "cloud_bound" }) {
+  // §6.10 Layer C: a cloud_bound caller cannot restore a restricted row (it
+  // reads as NOT_FOUND). Guard scopes both `target` and `upd`.
   const result = await query(
     `
       with target as (
         select id, deleted_at from thoughts
         where id = $1::uuid and brain_id = $2::uuid
+          and ${tierGuardSql(4)}
       ),
       upd as (
         update thoughts set deleted_at = null, updated_at = now()
         where id = $1::uuid and brain_id = $2::uuid and deleted_at is not null
+          and ${tierGuardSql(4)}
         returning id
       ),
       aud as (
@@ -291,7 +555,7 @@ export async function restoreThought({ brainId, thoughtId, actor }) {
         (select count(*) from upd) as changed,
         (select count(*) from aud) as audited
     `,
-    [thoughtId, brainId, JSON.stringify(actor)],
+    [thoughtId, brainId, JSON.stringify(actor), callerReadEgressClass],
   );
 
   const { existed, changed, audited } = result.rows[0];
