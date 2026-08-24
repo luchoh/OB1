@@ -2,7 +2,7 @@
   "name": "open-brain-local-mcp",
   "private": true,
   "type": "module",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "Local-network-only Open Brain MCP server",
   "engines": {
     "node": ">=20"
