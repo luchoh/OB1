@@ -109,9 +109,11 @@ Each thought must:
 - include concrete names or context when available
 - be 1-3 sentences
 
-Return a JSON object with exactly one key: "thoughts".
-The value must be an array of 0-3 real thought strings.
-If the document does not contain durable content worth storing, return {"thoughts": []}.
+Return your answer by calling the submit_thoughts tool exactly once.
+The "thoughts" argument must be an array of 0-3 real thought strings.
+If the document does not contain durable content worth storing, call
+submit_thoughts with an empty array.
+Do not answer in prose.
 """
 
 
@@ -139,7 +141,12 @@ def http_post_with_retry(url, *, headers=None, json_body=None, files=None, data=
     return None
 
 
-def extract_json_payload(text):
+def extract_json_payload(text, *, allow_embedded=True):
+    """Parse a JSON object out of model output.
+
+    allow_embedded controls only the last-resort scrape from the first "{" to
+    the last "}", which discards everything outside those braces.
+    """
     trimmed = text.strip()
     if trimmed.startswith("```json"):
         trimmed = trimmed[7:].strip()
@@ -151,6 +158,8 @@ def extract_json_payload(text):
     try:
         return json.loads(trimmed)
     except json.JSONDecodeError:
+        if not allow_embedded:
+            raise
         start = trimmed.find("{")
         end = trimmed.rfind("}")
         if start == -1 or end == -1 or end <= start:
@@ -202,35 +211,96 @@ def extract_inline_tool_arguments(content, expected_name):
     return params or None
 
 
-def extract_tool_arguments(response_json, expected_name):
-    message = response_json.get("choices", [{}])[0].get("message", {})
+def chat_message(response_json):
+    """The assistant message, or {} for any envelope shape we cannot read.
+
+    Unguarded, response_json["choices"][0]["message"] reaches an operator as a
+    raw IndexError or AttributeError. Returning {} funnels every unreadable
+    envelope into the caller's own ValueError instead.
+    """
     try:
-        tool_calls = message["tool_calls"]
-    except (KeyError, IndexError, TypeError) as exc:
-        inline_tool_args = extract_inline_tool_arguments(message.get("content"), expected_name)
+        message = response_json["choices"][0]["message"]
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return {}
+    return message if isinstance(message, dict) else {}
+
+
+def chat_finish_reason(response_json):
+    """finish_reason for the first choice, or None if the envelope lacks it."""
+    try:
+        return response_json["choices"][0].get("finish_reason")
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return None
+
+
+def _tool_arguments_from_content(message, expected_name, *, scrape_content):
+    if scrape_content:
+        # extract_inline_tool_arguments regex-searches the whole string, so it
+        # finds <function=...> markup with arbitrary prose around it. That is
+        # the same "payload lifted out of text" shape the JSON scrape below
+        # performs, through a different syntax, and it is skipped for the same
+        # reason when the caller's verdict is irreversible.
+        inline_tool_args = extract_inline_tool_arguments(
+            message.get("content"), expected_name
+        )
         if inline_tool_args:
             return inline_tool_args
 
-        content = normalize_chat_content(message.get("content"))
-        if content:
-            try:
-                return extract_json_payload(content)
-            except (TypeError, json.JSONDecodeError, ValueError):
-                pass
+    content = normalize_chat_content(message.get("content"))
+    if content:
+        try:
+            return extract_json_payload(content, allow_embedded=scrape_content)
+        except (TypeError, json.JSONDecodeError, ValueError):
+            pass
 
-        raise ValueError("Model did not return a tool call") from exc
+    return None
+
+
+def extract_tool_arguments(response_json, expected_name, *, scrape_content=True):
+    """Parse a tool call, or fall back to content when the server ignored tool_choice.
+
+    The content fallback is not a nicety: on 2026-08-11 this server was
+    measured answering finish_reason=stop with no tool_calls at all, despite
+    tool_choice "required". A parser that assumes a tool call arrived is a
+    parser that raises on a perfectly good answer.
+
+    scrape_content=False hardens only that fallback, for callers whose verdict
+    is IRREVERSIBLE: content must be JSON end to end, inline <function=> markup
+    is not lifted out of prose either, and the response must actually have
+    finished (finish_reason "stop"). Scraping an object out of prose turns "I could not read this
+    email, {"thoughts": []}" into a successful empty result: the model's stated
+    reason is discarded and the message is retired for good. For a caller that
+    can simply try again, the scrape is worth having and stays on by default.
+
+    What this never does is judge whether the parsed object means what the
+    model intended. Callers making an irreversible decision should also run the
+    result through a shape gate — see validate_thoughts_payload.
+    """
+    message = chat_message(response_json)
+    tool_calls = message.get("tool_calls")
 
     if not isinstance(tool_calls, list) or not tool_calls:
-        inline_tool_args = extract_inline_tool_arguments(message.get("content"), expected_name)
-        if inline_tool_args:
-            return inline_tool_args
+        if not scrape_content:
+            # No shape check can see this: a response cut off mid-generation,
+            # or refused by a filter, can still carry a complete and perfectly
+            # well-formed object. finish_reason is the only field that says
+            # what actually happened, so it is an ALLOWLIST — an unknown or
+            # absent value is refused rather than assumed benign.
+            #
+            # Only the fallback is gated. A real tool call is the contract
+            # working and is left alone.
+            finish_reason = chat_finish_reason(response_json)
+            if finish_reason != "stop":
+                raise ValueError(
+                    "Model did not return a tool call "
+                    f"(finish_reason={finish_reason!r})"
+                )
 
-        content = normalize_chat_content(message.get("content"))
-        if content:
-            try:
-                return extract_json_payload(content)
-            except (TypeError, json.JSONDecodeError, ValueError):
-                pass
+        from_content = _tool_arguments_from_content(
+            message, expected_name, scrape_content=scrape_content
+        )
+        if from_content is not None:
+            return from_content
 
         raise ValueError("Model did not return a tool call")
 
@@ -247,6 +317,48 @@ def extract_tool_arguments(response_json, expected_name):
         raise ValueError("Tool call arguments were empty")
 
     return extract_json_payload(arguments)
+
+
+def validate_thoughts_payload(payload):
+    """Shape gate for submit_thoughts results — opt-in, per caller.
+
+    Parsing only proves the response was JSON. It can still be {} or
+    {"thoughts": "a string"}, both of which .get("thoughts", []) quietly turns
+    into "no durable content". Callers that must not silently drop thoughts
+    run the parsed payload through here instead.
+
+    This is a SHAPE gate only. It cannot tell a genuine empty answer from a
+    well-shaped one the model did not mean; nothing in the response
+    distinguishes those. It catches the shapes that are wrong on their face.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected a thoughts object, got {type(payload).__name__}")
+
+    if "thoughts" not in payload:
+        raise ValueError('Response object is missing the "thoughts" key')
+
+    # THOUGHTS_TOOL declares exactly one property, so anything else means the
+    # model answered something other than the tool it was given — typically a
+    # refusal carried beside an empty list, {"thoughts": [], "error": "..."},
+    # which a key-blind gate records as "no durable content" and retires
+    # permanently. The rule is the declared schema rather than a blacklist,
+    # which would only move to the next key the model invents.
+    extra = sorted(set(payload) - {"thoughts"})
+    if extra:
+        raise ValueError(
+            'Response object carries keys outside the declared schema: '
+            + ", ".join(repr(k) for k in extra)
+        )
+
+    thoughts = payload["thoughts"]
+    if not isinstance(thoughts, list):
+        raise ValueError(f'"thoughts" must be a list, got {type(thoughts).__name__}')
+
+    for index, item in enumerate(thoughts):
+        if not isinstance(item, str):
+            raise ValueError(f'"thoughts"[{index}] must be a string, got {type(item).__name__}')
+
+    return thoughts
 
 
 def truncate_text(text, limit=280):
@@ -633,6 +745,10 @@ def summarize_document(title, document_text):
                 "enable_thinking": LOCAL_LLM_ENABLE_THINKING,
             },
             "tools": [THOUGHTS_TOOL],
+            # Same contract as distill_email_thoughts in the imap recipe (both
+            # run in the same daemon): "required" plus a prompt that also asks
+            # for the tool call, never a prompt that asks for a bare JSON
+            # object while the request demands a tool call.
             "tool_choice": "required",
             "messages": [
                 {"role": "system", "content": DOCUMENT_SUMMARY_PROMPT},
@@ -649,9 +765,15 @@ def summarize_document(title, document_text):
         status = resp.status_code if resp else "no response"
         raise RuntimeError(f"Local document summarization failed ({status})")
 
+    # Same shape gate as the email body. An earlier revision skipped it here on
+    # the belief that raising would mark the whole message failed and re-Docling
+    # it forever — that was a misreading: process_attachment in import-imap.py
+    # catches this, stores summary_error and carries on with chunk ingest, so
+    # message_failed is never set. Without the gate a malformed response
+    # silently became zero attachment thoughts.
     result = extract_tool_arguments(resp.json(), "submit_thoughts")
-    thoughts = result.get("thoughts", [])
-    return [t.strip() for t in thoughts if isinstance(t, str) and t.strip()][:3]
+    thoughts = validate_thoughts_payload(result)
+    return [t.strip() for t in thoughts if t.strip()][:3]
 
 
 def ingest_thought(content, metadata_dict, *, dedupe_key, thought_type, source="document", tags=None, extract_metadata=False):
