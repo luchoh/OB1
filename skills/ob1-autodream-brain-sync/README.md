@@ -4,7 +4,7 @@
 
 ## What It Does
 
-Whenever Claude Code saves a memory (via dreaming, autodream, or explicit requests), this skill also captures it to Open Brain via `mcp__open-brain__capture_thought`. This ensures memories aren't siloed in one machine's local files — they're available from ChatGPT, Claude Desktop, Codex, and any other MCP-connected client.
+Whenever Claude Code saves a memory (via dreaming, autodream, or explicit requests), this skill also captures it to Open Brain via `mcp__ob1__capture_thought`. This ensures memories aren't siloed in one machine's local files — they're available from ChatGPT, Claude Desktop, Codex, and any other MCP-connected client.
 
 ## Supported Clients
 
@@ -40,7 +40,7 @@ The Open Brain capture is prefixed with the memory type (e.g., `[feedback]`, `[u
 ## Troubleshooting
 
 **Issue: Open Brain capture fails but local memory saves fine**
-Solution: Check that your MCP server is running (`supabase functions list` should show `open-brain-mcp` as ACTIVE). The skill is designed to not block local saves if the capture fails.
+Solution: Check that your MCP server is running (`supabase functions list` should show `open-brain-mcp` as ACTIVE). The skill does not block local saves if the capture fails, but it does report the failure in the session output — if you never see such a report and thoughts still aren't appearing, the tool name may not be resolving at all. The canonical tool is `mcp__ob1__capture_thought`, matching the `ob1` MCP server registration.
 
 **Issue: Duplicate thoughts in Open Brain**
 Solution: Open Brain uses embedding-based dedup. If you update an existing memory, the new capture may coexist with the old one. This is expected — semantic search will surface the most relevant version.
