@@ -17,7 +17,7 @@ import re
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
@@ -39,6 +39,17 @@ except ImportError:
 RECIPE_DIR = Path(__file__).resolve().parent
 SYNC_LOG_PATH = RECIPE_DIR / "imap-sync-log.json"
 SYNC_SCHEMA_VERSION = 2
+
+# A message that keeps failing is retried a bounded number of times and then
+# dead-lettered. Before this existed, ANY exception left the message unrecorded
+# and it was reprocessed every cycle forever — one bad response on 2026-08-11
+# produced ~1,800 identical failed cycles over fourteen days.
+MAX_MESSAGE_ATTEMPTS = int(os.environ.get("IMAP_MAX_ATTEMPTS", "5"))
+# Cycles take roughly seven minutes, so the first backoff deliberately outlasts
+# one cycle: a failing message must not burn a Docling+LLM round trip on every
+# pass while it waits.
+FAILURE_BACKOFF_BASE_MINUTES = int(os.environ.get("IMAP_FAILURE_BACKOFF_MINUTES", "15"))
+FAILURE_BACKOFF_CAP_MINUTES = 24 * 60
 
 LOCAL_INGEST_URL = os.environ.get("OPEN_BRAIN_INGEST_URL") or "http://localhost:8787/ingest/thought"
 LOCAL_INGEST_KEY = os.environ.get("OPEN_BRAIN_INGEST_KEY") or os.environ.get("MCP_ACCESS_KEY", "")
@@ -186,14 +197,112 @@ class HtmlToText(HTMLParser):
 def load_sync_log():
     try:
         with open(SYNC_LOG_PATH) as f:
-            return json.load(f)
+            log = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"ingested_ids": {}, "last_sync": ""}
+        log = {}
+    log.setdefault("ingested_ids", {})
+    # failed_ids is a SIBLING of ingested_ids, never a member of it. A message
+    # that could not be processed and a message that was processed and had
+    # nothing durable in it are different facts, and should_skip must be able to
+    # tell them apart — conflating them is how a failure becomes a silent
+    # success.
+    log.setdefault("failed_ids", {})
+    log.setdefault("last_sync", "")
+    return log
 
 
 def save_sync_log(log):
     with open(SYNC_LOG_PATH, "w") as f:
         json.dump(log, f, indent=2)
+
+
+def failure_backoff_minutes(attempts):
+    """Exponential, so a persistent failure stops costing a Docling+LLM round
+    trip every cycle. Cycles run ~7 minutes; the first retry waits longer than
+    that on purpose."""
+    span = FAILURE_BACKOFF_BASE_MINUTES * (2 ** max(0, attempts - 1))
+    return min(span, FAILURE_BACKOFF_CAP_MINUTES)
+
+
+def note_failure(sync_log, record, stage, error_text, max_attempts):
+    """Record that this message failed, and dead-letter it once it has failed
+    enough times.
+
+    Returns the entry. The caller reports it; this function does not print, so
+    the four failure sites keep their own wording.
+    """
+    now = datetime.now(tz=timezone.utc)
+    entry = sync_log["failed_ids"].get(record["dedupe_key"])
+    if not isinstance(entry, dict):
+        entry = {"attempts": 0, "first_failed_at": now.isoformat()}
+
+    entry["attempts"] = int(entry.get("attempts", 0)) + 1
+    entry["uid"] = record.get("uid")
+    entry["subject"] = truncate_text(record.get("subject") or "", 120)
+    entry["date_iso"] = record.get("date_iso") or ""
+    entry["stage"] = stage
+    entry["last_error"] = truncate_text(str(error_text), 500)
+    entry["last_failed_at"] = now.isoformat()
+    entry["schema_version"] = SYNC_SCHEMA_VERSION
+
+    if entry["attempts"] >= max_attempts:
+        entry["dead_lettered"] = True
+        entry["next_attempt_at"] = None
+    else:
+        entry["dead_lettered"] = False
+        entry["next_attempt_at"] = (
+            now + timedelta(minutes=failure_backoff_minutes(entry["attempts"]))
+        ).isoformat()
+
+    sync_log["failed_ids"][record["dedupe_key"]] = entry
+    return entry
+
+
+def clear_failure(sync_log, dedupe_key):
+    """A message that succeeds is no longer failing. Without this, one transient
+    error would count against a message forever."""
+    return sync_log["failed_ids"].pop(dedupe_key, None)
+
+
+def failure_is_waiting(entry, now=None):
+    if not isinstance(entry, dict) or entry.get("dead_lettered"):
+        return False
+    next_attempt = entry.get("next_attempt_at")
+    if not next_attempt:
+        return False
+    try:
+        due = datetime.fromisoformat(next_attempt)
+    except (TypeError, ValueError):
+        return False
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=timezone.utc)
+    return (now or datetime.now(tz=timezone.utc)) < due
+
+
+def describe_failure(entry):
+    """Suffix for the stderr line, so an operator sees the trajectory rather
+    than an undifferentiated error that looks the same on attempt 1 and 800."""
+    attempts = entry.get("attempts", 0)
+    if entry.get("dead_lettered"):
+        return f"[attempt {attempts} — DEAD-LETTERED, will not retry until requeued]"
+    return f"[attempt {attempts}, retrying after {entry.get('next_attempt_at')}]"
+
+
+def format_failure_line(dedupe_key, entry):
+    state = "dead-lettered" if entry.get("dead_lettered") else "retrying"
+    return (
+        f"{state}\tattempts={entry.get('attempts')}\tuid={entry.get('uid')}\t"
+        f"date={entry.get('date_iso') or '?'}\tkey={dedupe_key}\n"
+        f"    subject: {entry.get('subject') or '(none)'}\n"
+        f"    stage:   {entry.get('stage')}\n"
+        f"    error:   {entry.get('last_error')}"
+    )
+
+
+def summarize_failures(sync_log):
+    entries = [e for e in sync_log.get("failed_ids", {}).values() if isinstance(e, dict)]
+    dead = [e for e in entries if e.get("dead_lettered")]
+    return len(dead), len(entries) - len(dead)
 
 
 def sync_entry_version(entry):
@@ -965,6 +1074,18 @@ def should_skip(record, sync_log, args):
     if not args.ignore_sync_log and sync_entry_version(sync_entry) >= SYNC_SCHEMA_VERSION:
         return "already_imported"
 
+    # Checked AFTER already_imported, so a message that later succeeded is never
+    # held back by a stale failure record. Both reasons are counted in the
+    # skipped totals and printed at the end of the cycle, which is what makes a
+    # stuck message visible without reading stderr.
+    failure = sync_log.get("failed_ids", {}).get(record["dedupe_key"])
+    if isinstance(failure, dict) and not args.ignore_sync_log:
+        if failure.get("dead_lettered"):
+            if not args.retry_dead_lettered:
+                return "dead_lettered"
+        elif failure_is_waiting(failure):
+            return "failure_backoff"
+
     if args.since and record["date_iso"]:
         record_date = datetime.fromisoformat(record["date_iso"]).date()
         if record_date < args.since:
@@ -998,6 +1119,22 @@ def parse_args():
     parser.add_argument("--unseen", action="store_true", help="Only search unseen messages.")
     parser.add_argument("--limit", type=int, help="Maximum number of messages to process.")
     parser.add_argument("--dry-run", action="store_true", help="Fetch and parse, but do not ingest.")
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=MAX_MESSAGE_ATTEMPTS,
+        help="Dead-letter a message after this many failed attempts (env IMAP_MAX_ATTEMPTS).",
+    )
+    parser.add_argument(
+        "--retry-dead-lettered",
+        action="store_true",
+        help="Requeue dead-lettered messages for this run, once the cause is fixed.",
+    )
+    parser.add_argument(
+        "--list-failures",
+        action="store_true",
+        help="Print messages that are retrying or dead-lettered, then exit.",
+    )
     parser.add_argument("--strip-quotes", action="store_true", help="Trim quoted reply sections from message bodies.")
     parser.add_argument("--ignore-sync-log", action="store_true", help="Process messages even if they appear in imap-sync-log.json.")
     parser.add_argument("--skip-empty", action="store_true", help="Skip messages with no extracted body text.")
@@ -1065,6 +1202,24 @@ def main():
         return 1
 
     sync_log = load_sync_log()
+
+    if args.list_failures:
+        entries = sorted(
+            ((k, v) for k, v in sync_log["failed_ids"].items() if isinstance(v, dict)),
+            key=lambda kv: (not kv[1].get("dead_lettered"), kv[1].get("last_failed_at") or ""),
+        )
+        if not entries:
+            print("No failing or dead-lettered messages.")
+            return 0
+        for key, entry in entries:
+            print(format_failure_line(key, entry))
+            print()
+        dead, retrying = summarize_failures(sync_log)
+        print(f"dead_lettered={dead}")
+        print(f"retrying={retrying}")
+        print("\nRequeue with --retry-dead-lettered once the cause is fixed.")
+        return 0
+
     account_hash = sha256_text(f"{args.host}|{args.username}")[:16]
 
     print(f"host={args.host}")
@@ -1099,6 +1254,7 @@ def main():
     attachment_summaries = 0
     skipped = {}
     failures = 0
+    dead_lettered_now = 0
     attachment_name_filter = set(args.attachment_names or [])
 
     try:
@@ -1232,7 +1388,14 @@ def main():
                 result = ingest_email(record, dry_run=args.dry_run)
                 if not result["ok"]:
                     failures += 1
-                    print(f"ERROR UID {uid}: {result.get('error')}", file=sys.stderr)
+                    entry = note_failure(
+                        sync_log, record, "ingest", result.get("error"), args.max_attempts
+                    )
+                    dead_lettered_now += 1 if entry["dead_lettered"] else 0
+                    print(
+                        f"ERROR UID {uid}: {result.get('error')} {describe_failure(entry)}",
+                        file=sys.stderr,
+                    )
                     continue
 
                 message_failed = False
@@ -1311,30 +1474,42 @@ def main():
                         except Exception as exc:
                             message_failed = True
                             failures += 1
+                            entry = note_failure(
+                                sync_log, record, "attachment", exc, args.max_attempts
+                            )
+                            dead_lettered_now += 1 if entry["dead_lettered"] else 0
                             print(
-                                f"ERROR UID {uid}: attachment {attachment['filename']} processing failed: {exc}",
+                                f"ERROR UID {uid}: attachment {attachment['filename']} "
+                                f"processing failed: {exc} {describe_failure(entry)}",
                                 file=sys.stderr,
                             )
 
                 if args.no_distill:
                     if not message_failed:
                         sync_log["ingested_ids"][record["dedupe_key"]] = sync_entry_payload(record)
+                        clear_failure(sync_log, record["dedupe_key"])
                     continue
 
                 try:
                     thoughts = distill_email_thoughts(record)
                 except Exception as exc:
-                    # NOTE: this `continue` skips the sync-log write below, so
-                    # "fail loudly" here means "retry this message every cycle
-                    # forever", not "log it and move on" — that is what turned
-                    # the 2026-08-11 parser mismatch into 845 identical failed
-                    # cycles. distill_email_thoughts now rejects more shapes
-                    # than it used to, which widens this loop's trigger
-                    # surface. Retry limits / dead-lettering are the other half
-                    # of the fix and are tracked separately.
+                    # This `continue` still skips the sync-log write below —
+                    # deliberately, because a message that could not be processed
+                    # must never be recorded as one that was. What has changed is
+                    # that note_failure records the attempt, so "not ingested"
+                    # no longer means "invisible and retried forever". This is
+                    # the exact wire that turned one bad response on 2026-08-11
+                    # into ~1,800 identical cycles over fourteen days.
                     message_failed = True
                     failures += 1
-                    print(f"ERROR UID {uid}: distillation failed: {exc}", file=sys.stderr)
+                    entry = note_failure(
+                        sync_log, record, "distillation", exc, args.max_attempts
+                    )
+                    dead_lettered_now += 1 if entry["dead_lettered"] else 0
+                    print(
+                        f"ERROR UID {uid}: distillation failed: {exc} {describe_failure(entry)}",
+                        file=sys.stderr,
+                    )
                     continue
 
                 if args.verbose:
@@ -1347,12 +1522,26 @@ def main():
                     if not result["ok"]:
                         message_failed = True
                         failures += 1
-                        print(f"ERROR UID {uid}: thought ingest failed: {result.get('error')}", file=sys.stderr)
+                        entry = note_failure(
+                            sync_log, record, "thought_ingest", result.get("error"), args.max_attempts
+                        )
+                        dead_lettered_now += 1 if entry["dead_lettered"] else 0
+                        print(
+                            f"ERROR UID {uid}: thought ingest failed: {result.get('error')} "
+                            f"{describe_failure(entry)}",
+                            file=sys.stderr,
+                        )
                         continue
                     distilled += 1
 
                 if not message_failed:
+                    # An empty `thoughts` list reaches here as a SUCCESS. "The
+                    # model found nothing durable" and "the message could not be
+                    # processed" are different outcomes and must not share a
+                    # signal — conflating them is part of why the stall was
+                    # invisible for two weeks.
                     sync_log["ingested_ids"][record["dedupe_key"]] = sync_entry_payload(record)
+                    clear_failure(sync_log, record["dedupe_key"])
         finally:
             try:
                 client.logout()
@@ -1375,8 +1564,23 @@ def main():
     print(f"attachment_chunks={attachment_chunks}")
     print(f"attachment_summaries={attachment_summaries}")
     print(f"failures={failures}")
+    # Standing totals, printed every cycle even when zero, so a monitor can see
+    # a backlog accumulating rather than having to infer it from stderr. A
+    # dead-lettered message is invisible in `failures` on later cycles by
+    # design: it is no longer retried, which is the whole point.
+    dead_total, retrying_total = summarize_failures(sync_log)
+    print(f"dead_lettered_new={dead_lettered_now}")
+    print(f"dead_lettered_total={dead_total}")
+    print(f"retrying_total={retrying_total}")
     for key in sorted(skipped):
         print(f"skipped_{key}={skipped[key]}")
+
+    if dead_lettered_now:
+        print(
+            f"\n{dead_lettered_now} message(s) dead-lettered this cycle. "
+            "Inspect with --list-failures; requeue with --retry-dead-lettered.",
+            file=sys.stderr,
+        )
 
     return 1 if failures else 0
 
