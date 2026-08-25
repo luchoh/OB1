@@ -67,6 +67,25 @@ This works for:
 - ChatGPT thought extraction
 - local metadata extraction
 
+### Counter-Example: `tool_choice: "required"` Is Not Guaranteed (2026-08-11)
+
+"Reliably" above is not "always". On 2026-08-11 the same endpoint, sent the
+exact request shape recommended here, breached it:
+
+- request: `tool_choice: "required"`, single `submit_thoughts` tool, `temperature: 0`
+- response: `finish_reason: "stop"`, **no** `tool_calls`, `message.content` of
+  `{"thoughts": []}`, 6 completion tokens
+
+The email body that triggered it had no durable content. What the evidence
+shows is that the breach is input-dependent and reproducible for that message —
+it recurred on all 845 cycles. Whether the same server honours `required` for
+other inputs is not established here. It stalled `ob1-imap-watch` for those 845
+cycles because the caller's parser trusted the contract.
+
+So: keep `required` (it still buys constrained decoding when honoured), but
+never write a parser that assumes a tool call arrived. See recommendation 5
+below and `recipes/shared_docling.py:extract_tool_arguments`.
+
 ### What Does Not Work Reliably
 
 `response_format` on this `vllm-mlx` stack is not reliable for semantic array-of-string outputs.
@@ -94,6 +113,13 @@ For OB1 extraction tasks on the current oMLX endpoint registered as `mlx-server`
 3. Use `temperature: 0` for deterministic extraction
 4. Parse `message.tool_calls[*].function.arguments` as JSON
 5. Keep fallback parsing for known oMLX compatibility shapes, but do not rely on prompt-only JSON for critical extraction
+6. Accept a content-only answer when `tool_calls` is absent — the server does this — and validate the parsed object's shape before acting on it. Parsing only proves it was JSON, not that it means what you think
+
+Note on the scope of the evidence: the truncation measurements in "What Does
+Not Work Reliably" are about `response_format`, not about prompt-only
+contracts. Recommendation 5 rests on the general argument that a prompt is not
+enforced by the decoder, not on a measurement of prompt-only array-of-string
+extraction failing on this stack.
 
 Do not rely on:
 

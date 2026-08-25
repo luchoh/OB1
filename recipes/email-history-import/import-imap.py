@@ -54,12 +54,14 @@ from recipes.shared_docling import (
     discover_docling_base_url,
     docling_markdown_artifact,
     docling_chunk,
+    extract_tool_arguments,
     file_content_type,
     ingest_thought,
     local_llm_base_url,
     sha256_text as shared_sha256_text,
     summarize_document,
     truncate_text,
+    validate_thoughts_payload,
 )
 from recipes.shared_object_store import env_flag, first_env, optional_env_flag, upload_text
 
@@ -148,9 +150,10 @@ Each thought must:
 - mention people, projects, or artifacts when available
 - be 1-3 sentences
 
-Return a JSON object with exactly one key: "thoughts".
-The value must be an array of 0-3 real thought strings.
-If the email has no durable value, return {"thoughts": []}.
+Return your answer by calling the submit_thoughts tool exactly once.
+The "thoughts" argument must be an array of 0-3 real thought strings.
+If the email has no durable value, call submit_thoughts with an empty array.
+Do not answer in prose.
 """
 
 
@@ -224,49 +227,6 @@ def http_post_with_retry(url, headers, body, retries=2, timeout=120):
                 continue
             raise
     return None
-
-
-def extract_json_payload(text):
-    trimmed = text.strip()
-    if trimmed.startswith("```json"):
-        trimmed = trimmed[7:].strip()
-    elif trimmed.startswith("```"):
-        trimmed = trimmed[3:].strip()
-    if trimmed.endswith("```"):
-        trimmed = trimmed[:-3].strip()
-
-    try:
-        return json.loads(trimmed)
-    except json.JSONDecodeError:
-        start = trimmed.find("{")
-        end = trimmed.rfind("}")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        return json.loads(trimmed[start : end + 1])
-
-
-def extract_tool_arguments(response_json, expected_name):
-    try:
-        tool_calls = response_json["choices"][0]["message"]["tool_calls"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ValueError("Model did not return a tool call") from exc
-
-    if not isinstance(tool_calls, list) or not tool_calls:
-        raise ValueError("Model did not return a tool call")
-
-    call = None
-    for item in tool_calls:
-        if isinstance(item, dict) and item.get("function", {}).get("name") == expected_name:
-            call = item
-            break
-    if call is None:
-        call = tool_calls[0]
-
-    arguments = call.get("function", {}).get("arguments")
-    if not isinstance(arguments, str) or not arguments.strip():
-        raise ValueError("Tool call arguments were empty")
-
-    return extract_json_payload(arguments)
 
 
 def normalize_text(text):
@@ -682,6 +642,11 @@ def distill_email_thoughts(record):
                 "enable_thinking": LOCAL_LLM_ENABLE_THINKING,
             },
             "tools": [THOUGHTS_TOOL],
+            # "required" per docs/08-vllm-mlx-no-thinking.md, so
+            # EMAIL_THOUGHT_PROMPT now demands the tool call too rather than
+            # the two halves of the request disagreeing. The server has been
+            # measured violating it anyway (2026-08-11), so the parsing below
+            # must never assume a tool call arrived.
             "tool_choice": "required",
             "messages": [
                 {"role": "system", "content": EMAIL_THOUGHT_PROMPT},
@@ -707,9 +672,24 @@ def distill_email_thoughts(record):
         status = resp.status_code if resp else "no response"
         raise RuntimeError(f"Local email distillation failed ({status})")
 
-    result = extract_tool_arguments(resp.json(), "submit_thoughts")
-    thoughts = result.get("thoughts", [])
-    return [item.strip() for item in thoughts if isinstance(item, str) and item.strip()][:3]
+    # The shared parser replaces the divergent strict copy this recipe used to
+    # carry — that copy demanded a tool call, and raising when the server
+    # answered in content is what produced the 845-cycle stall.
+    #
+    # scrape_content=False because this caller's verdict is IRREVERSIBLE: main()
+    # writes the dedupe key to the sync log and should_skip never revisits it.
+    # Adopting the shared parser fixed the loop but, for three response shapes,
+    # replaced it with something quieter and worse — a refusal, a truncated
+    # answer or a self-correction wrapped around {"thoughts": []} was scraped
+    # down to a successful empty result. The loop was at least visible and lost
+    # nothing. Dropping the scrape here restores that ground without changing
+    # anything for import-dictation or import-documents, which can retry.
+    #
+    # validate_thoughts_payload is not decoration either: .get("thoughts", [])
+    # turned every malformed response into "no durable content".
+    result = extract_tool_arguments(resp.json(), "submit_thoughts", scrape_content=False)
+    thoughts = validate_thoughts_payload(result)
+    return [item.strip() for item in thoughts if item.strip()][:3]
 
 
 def ingest_email_thought(record, thought_text, index, dry_run=False):
@@ -1344,6 +1324,14 @@ def main():
                 try:
                     thoughts = distill_email_thoughts(record)
                 except Exception as exc:
+                    # NOTE: this `continue` skips the sync-log write below, so
+                    # "fail loudly" here means "retry this message every cycle
+                    # forever", not "log it and move on" — that is what turned
+                    # the 2026-08-11 parser mismatch into 845 identical failed
+                    # cycles. distill_email_thoughts now rejects more shapes
+                    # than it used to, which widens this loop's trigger
+                    # surface. Retry limits / dead-lettering are the other half
+                    # of the fix and are tracked separately.
                     message_failed = True
                     failures += 1
                     print(f"ERROR UID {uid}: distillation failed: {exc}", file=sys.stderr)
