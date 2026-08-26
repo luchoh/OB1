@@ -251,8 +251,20 @@ and contains every pattern in this table, since discussing them writes them. C2 
 therefore ingest transcripts *about* secrets alongside transcripts *containing* them,
 and cannot distinguish the two by pattern alone.
 
-The load-bearing rows are `OB1_MCP_ACCESS_KEY` (177) and `x-access-key` (169):
-unambiguous variable names, not discussion. T2 rests on those.
+The load-bearing rows are `OB1_MCP_ACCESS_KEY` (177) and `x-access-key` (169). They
+are **upper bounds that include mentions**, not counts of exposed values.
+
+The same self-referential mechanism contaminates them: this document's own authoring
+session matches `OB1_MCP_ACCESS_KEY` 16 times, entirely from discussing it, and is one
+of the 177. A variable *name* appears both where its value was echoed and where the
+name was merely typed, and grep cannot separate the two.
+
+These rows remain the table's best evidence for a reason the private-key row could not
+claim: **the direction of the error is known and bounded.** A bare credential variable
+name in a transcript is far more likely to sit beside its value than the words "private
+key" are to sit beside key material. The count overstates by an unknown but one-sided
+margin — never understates. That is a weaker claim than the previous wording and it is
+the one the evidence supports.
 
 `capture_thought` defaults to `sensitivity_tier=standard` and the egress flip is still
 ahead. **C2 distilling every session walks this corpus into standard-tier thoughts by
