@@ -1,8 +1,6 @@
 { pkgs, ... }:
 
 {
-  dotenv.enable = true;
-  dotenv.filename = ".env.open-brain-local";
 
   packages = with pkgs; [
     nodejs_22
@@ -73,6 +71,10 @@
     trap cleanup INT TERM EXIT
 
     (
+      # Service credentials cross the boundary only inside the service process.
+      # Loading this file through devenv's top-level dotenv option would export
+      # database, source, storage, and boot credentials into every interactive
+      # agent shell opened in the repository.
       set -a
       source .env.open-brain-local
       set +a

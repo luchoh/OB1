@@ -1,43 +1,8 @@
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import dotenv from "dotenv";
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
 export const serviceDir = path.resolve(currentDir, "..");
-export const repoRoot = path.resolve(serviceDir, "../..");
-
-function parsedEnv(filepath) {
-  try {
-    return dotenv.parse(fs.readFileSync(filepath));
-  } catch {
-    return {};
-  }
-}
-
-function loadRepoEnv() {
-  const localEnv = parsedEnv(path.join(repoRoot, ".env.open-brain-local"));
-  const devRuntimeEnvFileLoaded = process.env.OB1_DEV_RUNTIME_ENV_FILE_LOADED === "1";
-  const devDatabaseCredentialNames = new Set([
-    "PGPASSWORD",
-    "POSTGRES_PASSWORD",
-    "OPEN_BRAIN_DATABASE_URL",
-    "DATABASE_URL",
-  ]);
-  for (const [key, value] of Object.entries(localEnv)) {
-    // The developer-owned devenv launcher has already selected the isolated
-    // ob1_dev profile and loaded its runtime env file. Do not let this
-    // convenience dotenv reload replace its DB credentials with repo-local ones.
-    if (devRuntimeEnvFileLoaded && devDatabaseCredentialNames.has(key)) {
-      continue;
-    }
-    if (process.env[key] === undefined) {
-      process.env[key] = value;
-    }
-  }
-}
-
-loadRepoEnv();
 
 function envString(name, fallback) {
   const value = process.env[name] ?? fallback;

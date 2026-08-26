@@ -11,7 +11,8 @@ if [[ ! -d "$SERVICE_DIR/node_modules" ]]; then
   exit 1
 fi
 
-# Env loading is handled in local/open-brain-mcp/src/config.mjs so inherited
-# launchd environment can still override repo-local defaults.
+# The caller must provide the service environment explicitly. The repo config
+# module deliberately never opens dotenv files: importing runtime code from an
+# agent shell must not acquire service credentials as a side effect.
 cd "$SERVICE_DIR"
 exec node src/index.mjs
