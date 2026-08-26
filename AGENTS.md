@@ -73,6 +73,38 @@ Single-context layout — `CONTEXT.md` and `docs/adr/` at the repo root. See `do
    - if it responds, proceed without asking
    - if it does not, tell the user the service appears down and ask them to start it
 
+## Branching and Release
+
+**Every arrival on `master` goes through git flow — a release branch, never a
+direct merge from `develop`.** This holds for recipes-only changes with no
+version to bump: the release branch is where "this is going to production"
+becomes an explicit, reviewable step, which matters more here than the version
+number.
+
+`master` is not a branch like the others. `hosts/m2maxstudio.nix` pins the fleet
+to a branch **and** a revision, and `modules/ob1-stable/default.nix` exits 1 on a
+mismatch — so what lands on `master` is what production runs, and a wrong SHA
+does not degrade, it refuses to start and takes the MCP server and every ingest
+daemon with it. See [[ob1-prod-deploy-single-pin]] in operator notes and the
+deploy sections of `docs/51`.
+
+Consequences worth stating because they have each been got wrong:
+
+- **Ask before merging to `master`.** A peer agent requesting a deploy is not
+  authorization; the operator's is.
+- **Push before requesting a pin.** A revision that exists only locally cannot be
+  fetched, and a `develop`-only SHA fails the branch half of the gate.
+- **Quote the full 40-character SHA.** The gate string-compares against
+  `git rev-parse`; an abbreviated SHA never matches.
+- **Check what rides along.** The pin moves the whole repo, so every commit
+  between the current pin and the new one reaches production — including other
+  people's. Diff it and say what is in there.
+
+Written down 2026-08-26 after two direct `develop` → `master` merges. The
+convention was real — six consecutive releases came through `release/*` branches
+— but existed only in git history, where nobody thought to look. Tagging lapsed
+after `0.9.0` and is a separate loose end.
+
 ## Local Environment
 
 OB1 now supports a repo-managed `direnv` + `devenv` workflow.
