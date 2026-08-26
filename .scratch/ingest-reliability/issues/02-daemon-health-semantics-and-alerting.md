@@ -93,3 +93,26 @@ repo owns which half.
   inventing a parallel health channel.
 
 ## Comments
+
+
+## Comments
+
+**2026-08-26 — scoped by system-config, still the real gap.**
+
+`docs/prd/prd-ingest-daemon-liveness.md` in system-config. Not started.
+
+The measured state is worse than "no alerting", and worth recording here because
+it explains the fourteen days completely:
+
+- **Zero OB1 services are registered in Consul.** The catalog returns `[]` for
+  `ob1|imap|dictation|telegram`, including `ob1-stable`.
+- Prometheus and Grafana are deployed and **receiving nothing** from any of them.
+- `consul.addr` and `consul-service-token` are **already wired into every
+  daemon**.
+
+So the stack exists, the credential exists, and the fact worth reporting exists.
+Only the wiring between them is missing.
+
+Issue `01` shrank the blast radius of a stall. It did not make one visible, and
+nothing in this repo does. This remains the most valuable outstanding work in the
+ingest path.

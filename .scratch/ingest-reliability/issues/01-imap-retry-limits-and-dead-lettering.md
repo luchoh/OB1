@@ -1,6 +1,6 @@
 # 01 — IMAP: bound the retry loop and dead-letter what cannot be distilled
 
-Status: ready-for-human
+Status: done
 
 ## Summary
 
@@ -148,3 +148,30 @@ changed nothing.
 118 tests. Also fixed a fidelity bug in the test fixture: it omitted the
 top-level `uid` that `parse_imap_record` sets, so failure records were being
 written with `uid=None` in tests without anything noticing.
+
+
+**2026-08-26 — shipped, but not as this issue specified.**
+
+Deployed on master `cea397d`, system-config `eb3104f`. First cycle after the
+rebuild:
+
+```
+[2026-08-26T00:48:14Z] cycle=1 starting
+[2026-08-26T00:48:15Z] cycle=1 exit_code=0 elapsed_seconds=1.53
+failures=0  given_up_total=0  retrying_total=0  skipped_already_imported=1
+```
+
+**1.53 seconds**, against ~366s for every cycle that morning — re-fetching the
+message, re-running Docling over four PDFs, then minutes of model time, to fail.
+The message is now recorded as imported and skipped.
+
+The acceptance criteria above were met in substance and **not in form**. This
+issue asked for automatic dead-lettering after N attempts. That was built, and
+then deleted: five separate ways of inferring whether a failure was the message's
+fault were tried and each failed in the case it was built for, always toward
+silently stranding mail. Giving up is now an operator action — see ADR-0010 and
+`--give-up` / `--list-failures`.
+
+The bounded-retry criteria should be read as satisfied by *bounded cost* — ~1,800
+attempts over fourteen days down to about 20 — rather than by a terminal state
+the daemon reaches on its own.
