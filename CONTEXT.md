@@ -41,6 +41,18 @@ that repo authenticates as this one identity — the workspace is the
 identity, not the tool.
 _Avoid_: Bot, service account, automation, workflow.
 
+**Repo brain**:
+The working memory for one code repository. Agents working in that
+repository read and write it through the repo principal.
+_Avoid_: Project brain, repository brain, workspace brain.
+
+**Agent brain**:
+The curated cross-repository knowledge intended for agents across
+repositories. Its access and publication model is unsettled; see
+ADR-0012 (proposed).
+_Avoid_: Common brain, shared brain, public brain. `agent-common` is a
+legacy storage slug, not a domain term.
+
 **Caged agent principal**:
 The identity the caged agent uses to reach a person's personal brain.
 There is one for the whole fleet, not one per repo. For ordinary repo
@@ -66,7 +78,12 @@ estate-level DENY — absence is denial.
 The brain holding one person's own thoughts. It lives in that person's
 estate, not the agent estate, so an agent reaches it only through an
 explicit membership — never automatically.
-_Avoid_: Common brain (retired, see below), private brain, owner brain.
+_Avoid_: Common brain, private brain, owner brain, human brain.
+
+**Publication proposal**:
+An immutable request to publish one exact thought into the agent brain.
+The mechanism is not implemented; see ADR-0012 (proposed).
+_Avoid_: Pending thought, draft thought, promotion request.
 
 **Access policy**:
 The rules deciding what a principal may do: which brains it can reach,
@@ -177,10 +194,11 @@ it on its own authority — the exact claim this word denies).
 - "common brain" — RETIRED 2026-08-23. ADR-0001 forecast a brain in the
   agent estate with memberships for every repo principal, as a
   cross-cutting agent scratchpad; it was built as `common-public` and
-  then dropped without ever being used. What replaced it is narrower and
-  differently shaped: one agent (pi) reaching the human's **personal
-  brain** by a single cross-estate membership. Do not revive the word for
-  that — it is common to nobody.
+  then dropped without ever being used. What replaced it was narrower:
+  one caged agent reaching the human's **Personal brain** through one
+  cross-estate membership. **Repo brain**, **Agent brain**, and
+  **Personal brain** now name the three distinct concepts; do not revive
+  "common brain" for any of them.
 - "shared" vs "common" — `brains.kind = 'shared_household'` remains the
   legacy term for cross-principal-within-an-estate access. Unrelated to
   the retired "common brain".
