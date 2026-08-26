@@ -131,9 +131,28 @@ content is the raw original, kept for provenance. Search prefers
 distilled and falls back to source.
 _Avoid_: Original, processed, refined.
 
+**Stuck message**:
+An inbound item an ingest daemon has failed to process and keeps
+retrying — recorded with its stage, error and attempt count, backed off,
+and listed. Stuck is a description, not a verdict: nothing about it says
+whose fault the failure is, and a daemon is not entitled to decide
+(ADR-0010).
+_Avoid_: Failed (ambiguous between the attempt and the message), poisoned,
+bad message.
+
+**Given up**:
+An operator's decision to stop retrying a stuck message. Deliberately a
+human, slightly uncomfortable word: only a person sets it, and it can be
+undone. Nothing infers it — not an attempt count, not an error type, not
+silence in reply to a notification.
+_Avoid_: Dead-lettered, quarantined, retired (all imply the system sorted
+it on its own authority — the exact claim this word denies).
+
 ## Relationships
 
 - An **Estate** contains many **Brains** and many **Principals**.
+- A **Stuck message** may be **Given up** on — by a person, never by the
+  daemon that is stuck on it.
 - A **Brain** contains many **Thoughts**.
 - A **Brain** has many **Brain memberships**, each naming a
   **Principal** — which may belong to a different estate.
@@ -148,6 +167,11 @@ _Avoid_: Original, processed, refined.
 
 ## Flagged ambiguities
 
+- Egress vocabulary is missing entirely. `read_egress_class`,
+  `cloud_bound`, `local_trusted` and `private_local` are the axis the
+  access model turns on (docs/48, docs/49, ADR-0006) and none of them is
+  defined here. Noticed 2026-08-25 while deciding whether email subjects
+  may cross to Telegram — a question the glossary could not help answer.
 - "household" vs "estate" — schema still says `household` everywhere;
   language is moving to "estate" per ADR-0001. Rename pending.
 - "common brain" — RETIRED 2026-08-23. ADR-0001 forecast a brain in the

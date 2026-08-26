@@ -17,7 +17,7 @@ import re
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
@@ -40,9 +40,39 @@ RECIPE_DIR = Path(__file__).resolve().parent
 SYNC_LOG_PATH = RECIPE_DIR / "imap-sync-log.json"
 SYNC_SCHEMA_VERSION = 2
 
+# A message that keeps failing is recorded, slowed down, and listed — it is not
+# judged. Before this existed, ANY exception left the message unrecorded and it
+# was reprocessed every cycle forever: one bad response on 2026-08-11 produced
+# ~1,800 identical failed cycles over fourteen days. Backoff alone takes that
+# to roughly 20 attempts over the same period.
+#
+# Deciding whether a failure is the MESSAGE's fault or the WORLD's is
+# deliberately absent. A single cycle of a poller cannot tell "this file is
+# junk" from "the contract just changed for everyone" — the evidence is not
+# inside the process. Five attempts at a proxy for it (exception type, HTTP
+# status, historical stamps, same-cycle corroboration, "this stage is local")
+# each failed in the direction that strands mail. Termination is an operator
+# decision instead: see --give-up.
+FAILURE_BACKOFF_BASE_MINUTES = int(os.environ.get("IMAP_FAILURE_BACKOFF_MINUTES", "15"))
+FAILURE_BACKOFF_CAP_MINUTES = 24 * 60
+
 LOCAL_INGEST_URL = os.environ.get("OPEN_BRAIN_INGEST_URL") or "http://localhost:8787/ingest/thought"
 LOCAL_INGEST_KEY = os.environ.get("OPEN_BRAIN_INGEST_KEY") or os.environ.get("MCP_ACCESS_KEY", "")
 LOCAL_LLM_MODEL = os.environ.get("LLM_MODEL", "DeepSeek-V4-Flash-nvfp4")
+# The inference host holds several models and cannot fit them all at once. When
+# something large is resident, loading LOCAL_LLM_MODEL is refused with HTTP 507
+# and every distillation in the cycle fails until memory frees up. Distilling
+# three sentences out of an email does not need the largest model available, so
+# one retry against a smaller one turns an outage into a degraded pass.
+# Set to empty to disable and let 507 be a plain transport failure.
+# Empty by DEFAULT, on purpose. A 507 means the host refused to load this model
+# for want of memory — and the reason it will not fit is that something else is
+# resident. Naming a second model is how that occupant gets evicted, so a
+# fallback running every cycle is the harm it claims to avoid, on a timer and
+# with no operator in the loop. 507 is already an ordinary failure: the message
+# waits, backs off, and shows up in --list-failures. Set this only as a
+# deliberate, temporary opt-in.
+LLM_FALLBACK_MODEL = os.environ.get("LLM_FALLBACK_MODEL", "")
 LOCAL_LLM_ENABLE_THINKING = os.environ.get("LLM_ENABLE_THINKING", "false").strip().lower() in (
     "1",
     "true",
@@ -183,17 +213,220 @@ class HtmlToText(HTMLParser):
         return text.strip()
 
 
+class LlmHttpError(RuntimeError):
+    """A non-200 from the model server, carrying the status onto the failure record."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+class SyncLogCorrupt(RuntimeError):
+    """The sync log exists but cannot be read."""
+
+
 def load_sync_log():
     try:
         with open(SYNC_LOG_PATH) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {"ingested_ids": {}, "last_sync": ""}
+            log = json.load(f)
+    except FileNotFoundError:
+        log = {}
+    except json.JSONDecodeError as exc:
+        # Refuse, and leave the file exactly where it is. An earlier version
+        # renamed it aside for forensics — which meant the NEXT start found no
+        # sync log at all, treated it as a clean first run, and silently
+        # discarded every attempt count and give-up record. That is the
+        # precise failure this refusal exists to prevent, reintroduced by the
+        # refusal itself. The daemon stays wedged until an operator looks,
+        # which is the intended trade: a stuck importer is visible, silent
+        # state loss is not.
+        raise SyncLogCorrupt(
+            f"{SYNC_LOG_PATH} is not valid JSON ({exc}). Refusing to continue, and "
+            "refusing on every subsequent start until it is repaired or removed. "
+            "Treating it as empty would discard all retry and give-up state, "
+            "un-bound every retry, and re-ingest the mailbox. "
+            "Inspect it, then either repair the JSON or move it aside deliberately."
+        ) from exc
+    log.setdefault("ingested_ids", {})
+    # failed_ids is a SIBLING of ingested_ids, never a member of it. A message
+    # that could not be processed and a message that was processed and had
+    # nothing durable in it are different facts, and should_skip must be able to
+    # tell them apart — conflating them is how a failure becomes a silent
+    # success.
+    log.setdefault("failed_ids", {})
+    log.setdefault("last_sync", "")
+
+    # A cycle lock never outlives the process that took it.
+    for entry in log["failed_ids"].values():
+        if isinstance(entry, dict):
+            entry.pop("stage_locked_this_cycle", None)
+
+    return log
 
 
 def save_sync_log(log):
-    with open(SYNC_LOG_PATH, "w") as f:
+    """Atomic. The previous version truncated the live file and wrote in place,
+    so an interruption mid-write left a corrupt sync log — and a corrupt sync
+    log is indistinguishable from an empty one, which would silently un-bound
+    every retry and re-ingest the whole mailbox."""
+    tmp_path = SYNC_LOG_PATH.with_suffix(SYNC_LOG_PATH.suffix + ".tmp")
+    with open(tmp_path, "w") as f:
         json.dump(log, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, SYNC_LOG_PATH)
+
+
+def failure_backoff_minutes(attempts):
+    """Exponential, so a persistent failure stops costing a Docling+LLM round
+    trip every cycle. Cycles run ~7 minutes; the first retry waits longer than
+    that on purpose."""
+    span = FAILURE_BACKOFF_BASE_MINUTES * (2 ** max(0, attempts - 1))
+    return min(span, FAILURE_BACKOFF_CAP_MINUTES)
+
+
+def http_status_of(error):
+    """The HTTP status an exception carries, whatever it chose to call it.
+
+    Three different exception types reach the failure record and they do not agree:
+    LlmHttpError and DoclingHttpError expose `.status`, while CaptureError —
+    which predates both — exposes `.status_code`. Reading only `.status` meant
+    a chunk-ingest rejection reached --list-failures with no status at all, so
+    the operator deciding about it could not see what the server had said.
+    """
+    for attribute in ("status", "status_code"):
+        value = getattr(error, attribute, None)
+        if value is not None:
+            return value
+    return None
+
+
+def note_failure(sync_log, key, descriptor, stage, error, counted_this_cycle,
+                 status=None):
+    """Record that this message failed on this pass, and when to try again.
+
+    `counted_this_cycle` makes an attempt mean ONE CYCLE, not one error: a
+    message with five bad attachments raises five times in a single pass, and a
+    count that rises with raises is not a measure of anything.
+
+    The verdict used to be deferred to the end of the cycle so it could be
+    weighed against how other messages fared. There is no verdict now, so the
+    next attempt is scheduled where the failure happens.
+    """
+    now = datetime.now(tz=timezone.utc)
+    entry = sync_log["failed_ids"].get(key)
+    if not isinstance(entry, dict):
+        entry = {"attempts": 0, "first_failed_at": now.isoformat()}
+
+    if key not in counted_this_cycle:
+        entry["attempts"] = int(entry.get("attempts", 0)) + 1
+        counted_this_cycle.add(key)
+
+    # The FIRST failure of the pass is the one described. Processing does not
+    # stop at the first failure — an attachment loop keeps going — so later
+    # raises are often consequences of it.
+    if not entry.get("stage_locked_this_cycle"):
+        entry["stage"] = stage
+        entry["last_status"] = status if status is not None else http_status_of(error)
+        entry["last_error"] = truncate_text(str(error), 500)
+        entry["stage_locked_this_cycle"] = True
+
+    entry["uid"] = descriptor.get("uid")
+    entry["subject"] = truncate_text(descriptor.get("subject") or "", 120)
+    entry["date_iso"] = descriptor.get("date_iso") or ""
+    entry["last_failed_at"] = now.isoformat()
+    entry["schema_version"] = SYNC_SCHEMA_VERSION
+    entry["next_attempt_at"] = (
+        now + timedelta(minutes=failure_backoff_minutes(entry["attempts"]))
+    ).isoformat()
+
+    sync_log["failed_ids"][key] = entry
+    return entry
+
+
+def release_cycle_locks(sync_log):
+    """Let the next cycle describe its own first failure."""
+    for entry in sync_log.get("failed_ids", {}).values():
+        if isinstance(entry, dict):
+            entry.pop("stage_locked_this_cycle", None)
+
+
+def unparsed_key(account_hash, mailbox, uidvalidity, uid):
+    """A message that cannot be parsed has no dedupe_key — parse_imap_record is
+    what produces one, and it is the thing that failed. Without a key of its
+    own, an unparseable message is invisible to the whole mechanism and loops
+    forever, which is the original bug surviving inside its own fix."""
+    return f"imap:unparsed:{account_hash}:{mailbox}:{uidvalidity or '0'}:{uid}"
+
+
+def clear_failure(sync_log, dedupe_key):
+    """A message that succeeds is no longer failing. Without this, one transient
+    error would count against a message forever."""
+    return sync_log["failed_ids"].pop(dedupe_key, None)
+
+
+def failure_is_waiting(entry, now=None):
+    if not isinstance(entry, dict) or entry.get("given_up"):
+        return False
+    next_attempt = entry.get("next_attempt_at")
+    if not next_attempt:
+        return False
+    try:
+        due = datetime.fromisoformat(next_attempt)
+    except (TypeError, ValueError):
+        return False
+    if due.tzinfo is None:
+        due = due.replace(tzinfo=timezone.utc)
+    return (now or datetime.now(tz=timezone.utc)) < due
+
+
+def describe_failure(entry):
+    """Suffix for the stderr line. No verdict — the facts only."""
+    return (f"[attempt {entry.get('attempts', 0)}, "
+            f"next try {entry.get('next_attempt_at')}]")
+
+
+def format_failure_line(dedupe_key, entry):
+    state = "given-up" if entry.get("given_up") else "retrying"
+    return (
+        f"{state}\tattempts={entry.get('attempts')}\tuid={entry.get('uid')}\t"
+        f"date={entry.get('date_iso') or '?'}\tkey={dedupe_key}\n"
+        f"    subject: {entry.get('subject') or '(none)'}\n"
+        f"    stage:   {entry.get('stage')}"
+        + (f" (HTTP {entry.get('last_status')})" if entry.get("last_status") else "")
+        + f"\n    error:   {entry.get('last_error')}"
+        + (f"\n    given up: {entry.get('given_up_at')}" if entry.get("given_up") else "")
+    )
+
+
+def summarize_failures(sync_log):
+    """Returns (given_up, still_retrying).
+
+    Two numbers, both meaning exactly what they say. The previous three-way
+    split — given up on, retrying, waiting-on-dependency — reported a verdict
+    the code was not entitled to, and the middle number was frequently wrong
+    about which side a message belonged on.
+    """
+    entries = [e for e in sync_log.get("failed_ids", {}).values() if isinstance(e, dict)]
+    given_up = [e for e in entries if e.get("given_up")]
+    return len(given_up), len(entries) - len(given_up)
+
+
+def record_failure(ctx, key, descriptor, stage, error, status=None):
+    """One place that records and persists a failure.
+
+    The repeated note/save/count shape was open-coded at every failure site,
+    and a site that forgot a line failed silently — which is how two whole
+    wires were missed. There is one shape now.
+    """
+    entry = note_failure(
+        ctx["sync_log"], key, descriptor, stage, error,
+        ctx["counted_this_cycle"], status=status,
+    )
+    ctx["failures"] += 1
+    if not ctx["dry_run"]:
+        save_sync_log(ctx["sync_log"])
+    return entry
 
 
 def sync_entry_version(entry):
@@ -217,6 +450,12 @@ def http_post_with_retry(url, headers, body, retries=2, timeout=120):
     for attempt in range(retries + 1):
         try:
             resp = requests.post(url, headers=headers, json=body, timeout=timeout)
+            if resp.status_code == 507:
+                # "No memory for this model" does not become false a second
+                # later. Retrying just repeats the load attempt against a host
+                # that already said no — three times, before any fallback even
+                # sees it.
+                return resp
             if resp.status_code >= 500 and attempt < retries:
                 time.sleep(attempt + 1)
                 continue
@@ -614,7 +853,10 @@ def ingest_email(record, dry_run=False):
         timeout=240
     )
 
-    if not resp:
+    # `resp is None`, never `not resp`: requests.Response is FALSY for any
+    # status >= 400, so `not resp` turned every 4xx into "No response from
+    # local OB1" and threw away the status an operator needs to see.
+    if resp is None:
         return {"ok": False, "error": "No response from local OB1"}
 
     try:
@@ -628,49 +870,99 @@ def ingest_email(record, dry_run=False):
     return {"ok": True, "payload": payload}
 
 
+def distillation_models():
+    """The model to ask, then at most one smaller stand-in.
+
+    One retry, not a cascade: the point is to survive a memory squeeze on the
+    inference host, and anything longer would make a failing model server look
+    like a slow one.
+    """
+    models = [LOCAL_LLM_MODEL]
+    if LLM_FALLBACK_MODEL and LLM_FALLBACK_MODEL != LOCAL_LLM_MODEL:
+        models.append(LLM_FALLBACK_MODEL)
+    return models
+
+
 def distill_email_thoughts(record):
     body_preview = record["content"][:12000]
     attachment_names = record["metadata"].get("attachment_names") or []
-    resp = http_post_with_retry(
-        f"{local_llm_base_url()}/chat/completions",
-        headers={"Content-Type": "application/json"},
-        body={
-            "model": LOCAL_LLM_MODEL,
-            "temperature": 0,
-            "max_tokens": 700,
-            "chat_template_kwargs": {
-                "enable_thinking": LOCAL_LLM_ENABLE_THINKING,
-            },
-            "tools": [THOUGHTS_TOOL],
-            # "required" per docs/08-vllm-mlx-no-thinking.md, so
-            # EMAIL_THOUGHT_PROMPT now demands the tool call too rather than
-            # the two halves of the request disagreeing. The server has been
-            # measured violating it anyway (2026-08-11), so the parsing below
-            # must never assume a tool call arrived.
-            "tool_choice": "required",
-            "messages": [
-                {"role": "system", "content": EMAIL_THOUGHT_PROMPT},
-                {
-                    "role": "user",
-                    "content": "\n".join([
-                        f"Mailbox: {record['metadata'].get('mailbox') or '(unknown)'}",
-                        f"Sender: {record['metadata'].get('sender') or '(unknown)'}",
-                        f"Subject: {record['subject'] or '(no subject)'}",
-                        f"Date: {record['date_iso'] or '(unknown)'}",
-                        f"Attachments: {', '.join(attachment_names) if attachment_names else '(none)'}",
-                        "",
-                        "Email content:",
-                        body_preview,
-                    ]),
+    models = distillation_models()
+    for attempt, model in enumerate(models):
+        resp = http_post_with_retry(
+            f"{local_llm_base_url()}/chat/completions",
+            headers={"Content-Type": "application/json"},
+            body={
+                "model": model,
+                "temperature": 0,
+                "max_tokens": 700,
+                "chat_template_kwargs": {
+                    "enable_thinking": LOCAL_LLM_ENABLE_THINKING,
                 },
-            ],
-        },
-        timeout=240,
-    )
+                "tools": [THOUGHTS_TOOL],
+                # "required" per docs/08-vllm-mlx-no-thinking.md, so
+                # EMAIL_THOUGHT_PROMPT now demands the tool call too rather than
+                # the two halves of the request disagreeing. The server has been
+                # measured violating it anyway (2026-08-11), so the parsing below
+                # must never assume a tool call arrived.
+                "tool_choice": "required",
+                "messages": [
+                    {"role": "system", "content": EMAIL_THOUGHT_PROMPT},
+                    {
+                        "role": "user",
+                        "content": "\n".join([
+                            f"Mailbox: {record['metadata'].get('mailbox') or '(unknown)'}",
+                            f"Sender: {record['metadata'].get('sender') or '(unknown)'}",
+                            f"Subject: {record['subject'] or '(no subject)'}",
+                            f"Date: {record['date_iso'] or '(unknown)'}",
+                            f"Attachments: {', '.join(attachment_names) if attachment_names else '(none)'}",
+                            "",
+                            "Email content:",
+                            body_preview,
+                        ]),
+                    },
+                ],
+            },
+            timeout=240,
+        )
+        # 507 specifically: the server declining to LOAD this model for want of
+        # memory. Deliberately not any 5xx — a 500 or a timeout says nothing
+        # about which model was asked for, and retrying those against a second
+        # model would just double the load on an already unhealthy service.
+        if resp is not None and resp.status_code == 507 and attempt + 1 < len(models):
+            print(
+                f"NOTICE: {model} could not be loaded (507); "
+                f"retrying with {models[attempt + 1]}",
+                file=sys.stderr,
+            )
+            continue
+        break
 
-    if not resp or resp.status_code != 200:
-        status = resp.status_code if resp else "no response"
-        raise RuntimeError(f"Local email distillation failed ({status})")
+    # Which model actually produced these thoughts, recorded on the message so
+    # it reaches the stored memory. A fallback that silently changed what wrote
+    # a thought, leaving no trace of it, is the same shape as every other
+    # defect this file has been through.
+    record["metadata"]["distilled_by_model"] = model
+
+    if resp is None or resp.status_code != 200:
+        status = resp.status_code if resp is not None else None
+        # The status is carried as an attribute, not merely interpolated into
+        # the message. Embedded in text it never reached the failure record, so
+        # a permanent rejection from the model server read as a generic
+        # RuntimeError and retried forever.
+        raise LlmHttpError(
+            f"Local email distillation failed ({status if status is not None else 'no response'})",
+            status=status,
+        )
+
+    try:
+        payload = resp.json()
+    except ValueError as exc:
+        # NOT a content failure. A 200 carrying an HTML error page or an empty
+        # body is a proxy or gateway misbehaving, and json.JSONDecodeError is a
+        # subclass of ValueError — so left alone it would be read as "the model
+        # answered badly" rather than "the transport lied". Re-raised as a
+        # RuntimeError so the failure record says which it was.
+        raise RuntimeError(f"Local email distillation returned an undecodable body: {exc}") from exc
 
     # The shared parser replaces the divergent strict copy this recipe used to
     # carry — that copy demanded a tool call, and raising when the server
@@ -687,7 +979,7 @@ def distill_email_thoughts(record):
     #
     # validate_thoughts_payload is not decoration either: .get("thoughts", [])
     # turned every malformed response into "no durable content".
-    result = extract_tool_arguments(resp.json(), "submit_thoughts", scrape_content=False)
+    result = extract_tool_arguments(payload, "submit_thoughts", scrape_content=False)
     thoughts = validate_thoughts_payload(result)
     return [item.strip() for item in thoughts if item.strip()][:3]
 
@@ -715,6 +1007,9 @@ def ingest_email_thought(record, thought_text, index, dry_run=False):
                 "subject": record["metadata"].get("subject"),
                 "mailbox": record["metadata"].get("mailbox"),
                 "imap_uid": record["metadata"].get("imap_uid"),
+                # Provenance: which model actually wrote this memory. Without
+                # it a fallback silently changes what produced a thought.
+                "distilled_by_model": record["metadata"].get("distilled_by_model"),
                 "email_dedupe_key": record["dedupe_key"],
                 "thought_index": index,
             },
@@ -727,7 +1022,10 @@ def ingest_email_thought(record, thought_text, index, dry_run=False):
         timeout=240,
     )
 
-    if not resp:
+    # `resp is None`, never `not resp`: requests.Response is FALSY for any
+    # status >= 400, so `not resp` turned every 4xx into "No response from
+    # local OB1" and threw away the status an operator needs to see.
+    if resp is None:
         return {"ok": False, "error": "No response from local OB1"}
 
     try:
@@ -965,6 +1263,20 @@ def should_skip(record, sync_log, args):
     if not args.ignore_sync_log and sync_entry_version(sync_entry) >= SYNC_SCHEMA_VERSION:
         return "already_imported"
 
+    # Checked AFTER already_imported, so a message that later succeeded is never
+    # held back by a stale failure record. Both reasons are counted in the
+    # skipped totals and printed at the end of the cycle, which is what makes a
+    # stuck message visible without reading stderr.
+    failure = sync_log.get("failed_ids", {}).get(record["dedupe_key"])
+    if isinstance(failure, dict) and not args.ignore_sync_log:
+        if failure.get("given_up"):
+            # Set only by --give-up. Nothing infers it: a poller cannot tell a
+            # corrupt attachment from a Docling outage, and four attempts at a
+            # proxy for that judgement each failed toward stranding mail.
+            return "given_up"
+        if failure_is_waiting(failure):
+            return "failure_backoff"
+
     if args.since and record["date_iso"]:
         record_date = datetime.fromisoformat(record["date_iso"]).date()
         if record_date < args.since:
@@ -998,6 +1310,28 @@ def parse_args():
     parser.add_argument("--unseen", action="store_true", help="Only search unseen messages.")
     parser.add_argument("--limit", type=int, help="Maximum number of messages to process.")
     parser.add_argument("--dry-run", action="store_true", help="Fetch and parse, but do not ingest.")
+    parser.add_argument(
+        "--give-up", action="append", metavar="KEY",
+        help="Stop retrying this failure (repeatable). An operator decision: "
+             "nothing infers it. Keys come from --list-failures.",
+    )
+    parser.add_argument(
+        "--give-up-all", action="store_true",
+        help="Stop retrying every current failure. Look at --list-failures first.",
+    )
+    parser.add_argument(
+        "--requeue", action="append", metavar="KEY",
+        help="Undo --give-up for this key (repeatable) once the cause is fixed.",
+    )
+    parser.add_argument(
+        "--requeue-all", action="store_true",
+        help="Undo --give-up for every given-up message.",
+    )
+    parser.add_argument(
+        "--list-failures",
+        action="store_true",
+        help="Print messages that are retrying or given up on, then exit.",
+    )
     parser.add_argument("--strip-quotes", action="store_true", help="Trim quoted reply sections from message bodies.")
     parser.add_argument("--ignore-sync-log", action="store_true", help="Process messages even if they appear in imap-sync-log.json.")
     parser.add_argument("--skip-empty", action="store_true", help="Skip messages with no extracted body text.")
@@ -1049,6 +1383,62 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Inspecting local failure state must not require live credentials — the
+    # sync log is a file on disk, and being prompted for an IMAP password to
+    # read it is exactly the friction that stops an operator looking.
+    if args.list_failures:
+        sync_log = load_sync_log()
+        entries = sorted(
+            ((k, v) for k, v in sync_log["failed_ids"].items() if isinstance(v, dict)),
+            key=lambda kv: (not kv[1].get("given_up"), kv[1].get("last_failed_at") or ""),
+        )
+        if not entries:
+            print("No failing or given up on messages.")
+            return 0
+        for key, entry in entries:
+            print(format_failure_line(key, entry))
+            print()
+        given_up, retrying = summarize_failures(sync_log)
+        print(f"given_up={given_up}")
+        print(f"retrying={retrying}")
+        print("\nStop retrying one of these with --give-up <key>, or all of "
+              "them with --give-up-all. Undo with --requeue <key> / --requeue-all.")
+        return 0
+
+    # Terminal state is an OPERATOR decision, never an inference. A human can
+    # tell a corrupt PDF from a Docling outage by reading --list-failures; the
+    # code cannot, which is why the attempt to automate it was removed.
+    #
+    # Mutate and EXIT, like --list-failures above and for the same reason:
+    # these edit a local JSON file and have no business validating IMAP
+    # credentials, discovering Docling, opening a mailbox or running an import
+    # cycle. Placed lower down they did all four — the exact defect already
+    # fixed for --list-failures and reintroduced here.
+    if args.give_up or args.give_up_all or args.requeue or args.requeue_all:
+        sync_log = load_sync_log()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        changed = 0
+        for key, entry in sync_log["failed_ids"].items():
+            if not isinstance(entry, dict):
+                continue
+            if args.give_up_all or key in (args.give_up or []):
+                if not entry.get("given_up"):
+                    entry["given_up"] = True
+                    entry["given_up_at"] = now
+                    changed += 1
+            elif args.requeue_all or key in (args.requeue or []):
+                if entry.pop("given_up", None):
+                    entry.pop("given_up_at", None)
+                    entry["next_attempt_at"] = None
+                    changed += 1
+        if args.dry_run:
+            print(f"dry_run: would change {changed} failure record(s)")
+        else:
+            if changed:
+                save_sync_log(sync_log)
+            print(f"failure_records_changed={changed}")
+        return 0
+
     if not args.host:
         print("Error: IMAP host is required. Use --host or IMAP_HOST.", file=sys.stderr)
         return 1
@@ -1065,6 +1455,7 @@ def main():
         return 1
 
     sync_log = load_sync_log()
+
     account_hash = sha256_text(f"{args.host}|{args.username}")[:16]
 
     print(f"host={args.host}")
@@ -1098,7 +1489,16 @@ def main():
     attachment_chunks = 0
     attachment_summaries = 0
     skipped = {}
-    failures = 0
+    # An attempt is one CYCLE, not one error. Several failures inside a single
+    # message pass share the attempt they were counted under. Carried in a ctx
+    # so every failure site goes through record_failure and none can forget a
+    # step.
+    ctx = {
+        "sync_log": sync_log,
+        "counted_this_cycle": set(),
+        "failures": 0,
+        "dry_run": args.dry_run,
+    }
     attachment_name_filter = set(args.attachment_names or [])
 
     try:
@@ -1120,8 +1520,34 @@ def main():
 
             for uid in uids:
                 processed += 1
+                # A message that cannot be PARSED has no dedupe_key, because
+                # parse_imap_record is what mints one — so it was invisible to
+                # the retry mechanism and looped forever, the original bug
+                # surviving inside its own fix. It gets a key derived from the
+                # uid instead.
+                unparsed = unparsed_key(account_hash, args.mailbox, uidvalidity, uid)
+                prior = sync_log["failed_ids"].get(unparsed)
+                if isinstance(prior, dict) and not args.ignore_sync_log:
+                    if prior.get("given_up"):
+                        skipped["given_up"] = skipped.get("given_up", 0) + 1
+                        continue
+                    if failure_is_waiting(prior):
+                        skipped["failure_backoff"] = skipped.get("failure_backoff", 0) + 1
+                        continue
+
+                descriptor = {"uid": uid, "subject": "(unparsed)", "date_iso": ""}
                 try:
+                    # Split from the parse below: a fetch failure is the SERVER
+                    # being unreachable, while a
+                    # parse failure is the message itself and can.
                     raw_bytes, flags = fetch_message_bytes(client, uid)
+                except Exception as exc:
+                    entry = record_failure(ctx, unparsed, descriptor, "fetch", exc)
+                    print(f"ERROR UID {uid}: fetch failed: {exc} {describe_failure(entry)}",
+                          file=sys.stderr)
+                    continue
+
+                try:
                     record = parse_imap_record(
                         uid=uid,
                         raw_bytes=raw_bytes,
@@ -1132,9 +1558,17 @@ def main():
                         strip_quotes=args.strip_quotes
                     )
                 except Exception as exc:
-                    failures += 1
-                    print(f"ERROR UID {uid}: failed to parse message: {exc}", file=sys.stderr)
+                    entry = record_failure(ctx, unparsed, descriptor, "parse", exc)
+                    print(f"ERROR UID {uid}: failed to parse message: {exc} "
+                          f"{describe_failure(entry)}", file=sys.stderr)
                     continue
+
+
+                # Persist immediately: should_skip below may `continue`, and an
+                # unsaved clear would leave a stale unparsed record that could
+                # hold back a message which now parses perfectly well.
+                if clear_failure(sync_log, unparsed) is not None and not args.dry_run:
+                    save_sync_log(sync_log)
 
                 reason = should_skip(record, sync_log, args)
                 if reason:
@@ -1189,7 +1623,9 @@ def main():
                                 attachment_chunks += attachment_result["chunk_count"]
                                 attachment_summaries += attachment_result["summary_count"]
                             except Exception as exc:
-                                failures += 1
+                                # Dry run: counted for the exit code only. A dry run must never
+                                # mutate retry or give-up state.
+                                ctx["failures"] += 1
                                 print(
                                     f"ERROR UID {uid}: attachment {attachment['filename']} processing failed: {exc}",
                                     file=sys.stderr,
@@ -1197,6 +1633,7 @@ def main():
                         continue
 
                     attachment_only_messages += 1
+                    attachments_failed = False
                     for attachment in selected_attachments:
                         try:
                             if args.verbose:
@@ -1222,17 +1659,38 @@ def main():
                             attachment_chunks += attachment_result["chunk_count"]
                             attachment_summaries += attachment_result["summary_count"]
                         except Exception as exc:
-                            failures += 1
+                            entry = record_failure(
+                                ctx, record["dedupe_key"], record, "attachment", exc,
+                                status=http_status_of(exc),
+                            )
                             print(
-                                f"ERROR UID {uid}: attachment {attachment['filename']} processing failed: {exc}",
+                                f"ERROR UID {uid}: attachment {attachment['filename']} "
+                                f"processing failed: {exc} {describe_failure(entry)}",
                                 file=sys.stderr,
                             )
+                            attachments_failed = True
+                    # This branch used to `continue` straight out, so a message
+                    # that had failed before and now succeeded kept its failure
+                    # record forever — still counting down, possibly still
+                    # given up on, for work that had actually completed.
+                    if not args.dry_run and not attachments_failed:
+                        if clear_failure(sync_log, record["dedupe_key"]) is not None:
+                            save_sync_log(sync_log)
                     continue
 
                 result = ingest_email(record, dry_run=args.dry_run)
                 if not result["ok"]:
-                    failures += 1
-                    print(f"ERROR UID {uid}: {result.get('error')}", file=sys.stderr)
+                    # ingest_email returns the HTTP status on a rejection; a
+                    # permanent 4xx means this message will never be accepted,
+                    # and discarding it made every rejection retry forever.
+                    entry = record_failure(
+                        ctx, record["dedupe_key"], record, "ingest",
+                        result.get("error"), status=result.get("status"),
+                    )
+                    print(
+                        f"ERROR UID {uid}: {result.get('error')} {describe_failure(entry)}",
+                        file=sys.stderr,
+                    )
                     continue
 
                 message_failed = False
@@ -1264,7 +1722,9 @@ def main():
                                 attachment_chunks += attachment_result["chunk_count"]
                                 attachment_summaries += attachment_result["summary_count"]
                             except Exception as exc:
-                                failures += 1
+                                # Dry run: counted for the exit code only. A dry run must never
+                                # mutate retry or give-up state.
+                                ctx["failures"] += 1
                                 print(
                                     f"ERROR UID {uid}: attachment {attachment['filename']} processing failed: {exc}",
                                     file=sys.stderr,
@@ -1277,7 +1737,9 @@ def main():
                                 for index, thought in enumerate(thoughts):
                                     print(f"    thought[{index}] {thought}")
                         except Exception as exc:
-                            failures += 1
+                            # Dry run: counted for the exit code only. A dry run must never
+                            # mutate retry or give-up state.
+                            ctx["failures"] += 1
                             print(f"ERROR UID {uid}: distillation failed: {exc}", file=sys.stderr)
                     continue
 
@@ -1310,32 +1772,44 @@ def main():
                             attachment_summaries += attachment_result["summary_count"]
                         except Exception as exc:
                             message_failed = True
-                            failures += 1
+                            entry = record_failure(
+                                ctx, record["dedupe_key"], record, "attachment", exc,
+                                status=http_status_of(exc),
+                            )
                             print(
-                                f"ERROR UID {uid}: attachment {attachment['filename']} processing failed: {exc}",
+                                f"ERROR UID {uid}: attachment {attachment['filename']} "
+                                f"processing failed: {exc} {describe_failure(entry)}",
                                 file=sys.stderr,
                             )
 
                 if args.no_distill:
                     if not message_failed:
                         sync_log["ingested_ids"][record["dedupe_key"]] = sync_entry_payload(record)
+                        clear_failure(sync_log, record["dedupe_key"])
+                        save_sync_log(sync_log)
                     continue
 
                 try:
                     thoughts = distill_email_thoughts(record)
                 except Exception as exc:
-                    # NOTE: this `continue` skips the sync-log write below, so
-                    # "fail loudly" here means "retry this message every cycle
-                    # forever", not "log it and move on" — that is what turned
-                    # the 2026-08-11 parser mismatch into 845 identical failed
-                    # cycles. distill_email_thoughts now rejects more shapes
-                    # than it used to, which widens this loop's trigger
-                    # surface. Retry limits / dead-lettering are the other half
-                    # of the fix and are tracked separately.
+                    # This `continue` still skips the sync-log write below —
+                    # deliberately, because a message that could not be processed
+                    # must never be recorded as one that was. What has changed is
+                    # that note_failure records the attempt, so "not ingested"
+                    # no longer means "invisible and retried forever". This is
+                    # the exact wire that turned one bad response on 2026-08-11
+                    # into ~1,800 identical cycles over fourteen days.
                     message_failed = True
-                    failures += 1
-                    print(f"ERROR UID {uid}: distillation failed: {exc}", file=sys.stderr)
+                    entry = record_failure(
+                        ctx, record["dedupe_key"], record, "distillation", exc,
+                        status=http_status_of(exc),
+                    )
+                    print(
+                        f"ERROR UID {uid}: distillation failed: {exc} {describe_failure(entry)}",
+                        file=sys.stderr,
+                    )
                     continue
+
 
                 if args.verbose:
                     print(f"  distilled_thoughts={len(thoughts)}")
@@ -1346,13 +1820,31 @@ def main():
                     result = ingest_email_thought(record, thought, index, dry_run=False)
                     if not result["ok"]:
                         message_failed = True
-                        failures += 1
-                        print(f"ERROR UID {uid}: thought ingest failed: {result.get('error')}", file=sys.stderr)
+                        entry = record_failure(
+                            ctx, record["dedupe_key"], record, "thought_ingest",
+                            result.get("error"), status=result.get("status"),
+                        )
+                        print(
+                            f"ERROR UID {uid}: thought ingest failed: {result.get('error')} "
+                            f"{describe_failure(entry)}",
+                            file=sys.stderr,
+                        )
                         continue
                     distilled += 1
 
                 if not message_failed:
+                    # An empty `thoughts` list reaches here as a SUCCESS. "The
+                    # model found nothing durable" and "the message could not be
+                    # processed" are different outcomes and must not share a
+                    # signal — conflating them is part of why the stall was
+                    # invisible for two weeks.
                     sync_log["ingested_ids"][record["dedupe_key"]] = sync_entry_payload(record)
+                    clear_failure(sync_log, record["dedupe_key"])
+                    # Written per message, not once at the end of the mailbox
+                    # loop. A SIGTERM mid-cycle previously discarded every
+                    # attempt count recorded during it, which silently
+                    # un-bounded the retry the restart was supposed to bound.
+                    save_sync_log(sync_log)
         finally:
             try:
                 client.logout()
@@ -1363,6 +1855,7 @@ def main():
         return 1
 
     if not args.dry_run:
+        release_cycle_locks(sync_log)
         sync_log["last_sync"] = datetime.now(tz=timezone.utc).isoformat()
         save_sync_log(sync_log)
 
@@ -1374,11 +1867,18 @@ def main():
     print(f"attachment_files={attachment_files}")
     print(f"attachment_chunks={attachment_chunks}")
     print(f"attachment_summaries={attachment_summaries}")
-    print(f"failures={failures}")
+    print(f"failures={ctx['failures']}")
+    # Standing totals, printed every cycle even when zero, so a monitor can see
+    # a backlog accumulating rather than having to infer it from stderr. A
+    # given up on message is invisible in `failures` on later cycles by
+    # design: it is no longer retried, which is the whole point.
+    given_up_total, retrying_total = summarize_failures(sync_log)
+    print(f"given_up_total={given_up_total}")
+    print(f"retrying_total={retrying_total}")
     for key in sorted(skipped):
         print(f"skipped_{key}={skipped[key]}")
 
-    return 1 if failures else 0
+    return 1 if ctx["failures"] else 0
 
 
 if __name__ == "__main__":

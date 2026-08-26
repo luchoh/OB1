@@ -6,15 +6,15 @@
     "name": "rumbitopi",
     "github": "rumbitopi"
   },
-  "version": "1.0.0",
+  "version": "1.1.0",
   "requires": {
     "open_brain": true,
     "services": [],
-    "tools": ["mcp__open-brain__capture_thought"]
+    "tools": ["mcp__ob1__capture_thought"]
   },
   "tags": ["memory", "autodream", "sync", "multi-client"],
   "difficulty": "beginner",
   "estimated_time": "5 minutes",
   "created": "2026-03-31",
-  "updated": "2026-03-31"
+  "updated": "2026-08-24"
 }
