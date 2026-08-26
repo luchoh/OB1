@@ -104,14 +104,29 @@ repo owns which half.
 The measured state is worse than "no alerting", and worth recording here because
 it explains the fourteen days completely:
 
-- **Zero OB1 services are registered in Consul.** The catalog returns `[]` for
-  `ob1|imap|dictation|telegram`, including `ob1-stable`.
+- **The MCP server registers; the five ingest daemons do not.** Verified with
+  the service token on 2026-08-26 — the catalog holds 24 services and
+  `ob1-stable` is among them, while `ob1-imap-watch`, both telegram bridges and
+  both dictation imports are absent.
 - Prometheus and Grafana are deployed and **receiving nothing** from any of them.
 - `consul.addr` and `consul-service-token` are **already wired into every
   daemon**.
 
 So the stack exists, the credential exists, and the fact worth reporting exists.
 Only the wiring between them is missing.
+
+The gap is exactly inverted from where it would be useful: `ob1-stable` already
+answers `/health`, so it is the one component whose state was observable anyway.
+The five that fail-and-sleep — the ones whose silence is indistinguishable from
+idleness — are the five that register nothing.
+
+⚠️ **Correction, same day.** This section first said *zero* OB1 services were
+registered, including `ob1-stable`. That came from an **unauthenticated** catalog
+query. Consul runs default-deny, so an ACL-less read returns `200` with `[]` —
+which looks exactly like an empty catalog. With the token it returns 24 services.
+Recorded because the mistake is the same shape as several in the change this
+issue accompanies: a check that appears authoritative while measuring something
+else, and reads as evidence.
 
 Issue `01` shrank the blast radius of a stall. It did not make one visible, and
 nothing in this repo does. This remains the most valuable outstanding work in the
