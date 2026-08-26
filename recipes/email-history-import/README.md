@@ -9,7 +9,7 @@ Connects to a standard IMAP mailbox, fetches each RFC 822 message, parses it loc
 It also supports unattended mailbox watching:
 - run [watch-imap.py](/Users/luchoh/Dev/OB1/recipes/email-history-import/watch-imap.py#L1) as a background process
 - new mail sent to the inbox is imported automatically on the next poll cycle
-- failed message imports are retried automatically because the sync log only advances after a full successful message run
+- failed message imports are recorded, backed off and listed — never retired automatically; giving up is an operator action (see Failure Handling below and ADR-0010)
 
 Attachments are now first-class inputs:
 - attachment files are detected from the MIME message
@@ -34,6 +34,84 @@ The importer is idempotent:
 
 By default the importer also distills each email into up to 3 durable `email_thought` entries using the local oMLX endpoint.
 Use `--no-distill` if you want raw email records only.
+
+## Failure Handling
+
+A message that fails is **never** recorded as ingested. "The model found nothing
+durable in this email" and "we could not process this email" are different facts
+and are stored separately: successes in `ingested_ids`, failures in `failed_ids`.
+
+A failure is **recorded, slowed down, and listed. It is not judged.**
+
+The record holds the uid, subject, stage, HTTP status where there was one, the
+error text, an attempt count and timestamps. Retries back off exponentially from
+15 minutes (`IMAP_FAILURE_BACKOFF_MINUTES`) to a 24-hour cap, and a message
+waiting out its backoff is *skipped*, so cycles go green in between rather than
+staying red forever. An attempt means **one cycle**, not one error — a message
+with five bad attachments raises five times in a single pass.
+
+Measured against the 2026-08-11 stall: backoff alone takes ~1,800 attempts over
+fourteen days down to about 20.
+
+### Why nothing decides whose fault a failure is
+
+A single cycle of a mailbox poller cannot tell "this attachment is corrupt" from
+"Docling is down". The evidence is not inside the process. Five proxies for that
+judgement were built and each failed in the direction that strands mail:
+
+| Proxy | How it failed |
+| --- | --- |
+| exception type | the original incident *was* a `ValueError` |
+| HTTP status | 401/403 are mailbox-wide; Docling's real junk-file path is 200 with zero chunks, not a 4xx |
+| historical "this stage was healthy" stamps | one healthy hour licenses retiring the mailbox during the next outage |
+| same-cycle corroboration | leftovers never close, because comparators get skipped |
+| "this stage is local, so it must be the message" | our own parser bugs look local |
+
+Those are the available moves. A false positive strands mail silently; the cost
+avoided is one visible attempt per day. The asymmetry is not close.
+
+### Giving up is an operator decision
+
+```bash
+./import-imap.py --list-failures          # stage, status, error, attempts — no verdict
+./import-imap.py --give-up <key>          # stop retrying this one (repeatable)
+./import-imap.py --give-up-all            # ...after you have looked
+./import-imap.py --requeue <key>          # undo, once the cause is fixed
+./import-imap.py --requeue-all
+```
+
+Every cycle prints two numbers that mean exactly what they say:
+
+```
+given_up_total=     an operator stopped these
+retrying_total=     still being attempted
+```
+
+If `imap-sync-log.json` is ever unreadable, the importer **refuses to run — on
+every start — and leaves the file exactly where it is.** It does not fall back to
+an empty log and does not move the damaged file aside: either would turn the next
+start into a clean first run, silently discarding every attempt count and
+re-ingesting the mailbox.
+
+### When the model server is out of memory
+
+The inference host holds several models against a fixed ceiling and can keep
+roughly one large one resident. If `LLM_MODEL` will not fit, the request is
+refused with **HTTP 507** — observed 2026-08-25: `projected memory 534.49GB would
+exceed the memory ceiling 464.00GB`.
+
+That is an ordinary failure: the message waits, backs off, and appears in
+`--list-failures`. A 507 is **not** retried by the HTTP helper, because "no
+memory for this model" does not become false a second later.
+
+`LLM_FALLBACK_MODEL` is **empty by default** and should usually stay that way.
+Naming a second model is *how* the resident one gets evicted — so a fallback
+running every cycle is the harm it claims to avoid, on a timer, with no operator
+in the loop. Set it only as a deliberate, temporary opt-in; whichever model
+answered is recorded on the captured thought as `distilled_by_model`.
+
+**Known gap:** a daemon that fails and sleeps is indistinguishable from an idle
+one. Nothing here alerts. Detection is tracked separately.
 
 ## Prerequisites
 

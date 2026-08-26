@@ -624,6 +624,23 @@ def vlm_result_is_better(standard_signals, vlm_signals):
     return True
 
 
+class DoclingContentError(ValueError):
+    """This FILE cannot be turned into chunks — as opposed to Docling being
+    unavailable. A ValueError so callers classifying by cause see content,
+    not infrastructure."""
+
+
+class DoclingHttpError(RuntimeError):
+    """A non-200 from Docling, carrying the status so a caller can tell a file
+    Docling will never accept from Docling being unavailable. Subclasses
+    RuntimeError, so existing `except Exception` / `except RuntimeError`
+    handlers are unaffected."""
+
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
 def docling_request(base_url, path, chunker, *, pipeline="standard", force_ocr=None):
     path = Path(path)
     endpoint = {
@@ -660,9 +677,19 @@ def docling_request(base_url, path, chunker, *, pipeline="standard", force_ocr=N
             continue
         break
 
-    if not resp or resp.status_code != 200:
+    # `resp is None`, never `not resp`: requests.Response defines __bool__ as
+    # status_code < 400, so a real 4xx/5xx response is FALSY and `not resp`
+    # silently discards it along with the status we need to classify by.
+    if resp is None or resp.status_code != 200:
         body = resp.text[:500] if resp is not None else "no response"
-        raise RuntimeError(f"Docling chunking failed for {path.name}: {resp.status_code if resp else 'no response'} {body}")
+        # `is not None`, not truthiness — see the note above. This exact line
+        # is why the status arrived as None for every 4xx.
+        status = resp.status_code if resp is not None else None
+        raise DoclingHttpError(
+            f"Docling chunking failed for {path.name}: "
+            f"{status if status is not None else 'no response'} {body}",
+            status=status,
+        )
 
     return resp.json()
 
@@ -680,6 +707,7 @@ def docling_chunk(base_url, path, chunker, *, force_ocr=None):
     fallback_triggered = False
     fallback_attempted = False
     fallback_error = None
+    fallback_exception = None
     fallback_reasons = standard_signals["hard_fail_reasons"] + standard_signals["soft_fail_reasons"]
 
     if DOCLING_VLM_FALLBACK_ENABLED and should_run_vlm_fallback(standard_signals):
@@ -707,12 +735,41 @@ def docling_chunk(base_url, path, chunker, *, force_ocr=None):
                 final_signals = standard_signals
         except Exception as exc:
             fallback_error = str(exc)
+            fallback_exception = exc
             final_signals = standard_signals
     else:
         final_signals = standard_signals
 
     if not final_chunks:
-        raise RuntimeError(
+        # "Zero chunks" only means the FILE is unprocessable if we actually got
+        # a verdict from Docling. When the VLM fallback was attempted and blew
+        # up — service down, timeout, connection refused — its exception was
+        # swallowed into fallback_error above, and calling the empty result a
+        # content failure would retire a perfectly good attachment on the
+        # strength of an outage. Only these two markers mean the fallback ran
+        # and genuinely had nothing better to offer.
+        fallback_had_a_verdict = fallback_error in (
+            None, "vlm_returned_zero_chunks", "vlm_result_not_better",
+        )
+        if fallback_attempted and not fallback_had_a_verdict:
+            # The fallback raised. Stringifying it threw away the one thing
+            # that distinguishes "the VLM is down" from "the VLM looked at this
+            # file and refused it" — so a permanent 4xx about the file was
+            # laundered into a generic outage and retried forever. Re-raise the
+            # original so its status survives.
+            status = getattr(fallback_exception, "status", None)
+            if status is not None:
+                raise DoclingHttpError(
+                    f"Docling returned zero chunks for {Path(path).name} and the vlm "
+                    f"fallback rejected it: {fallback_error}",
+                    status=status,
+                ) from fallback_exception
+            raise RuntimeError(
+                f"Docling returned zero chunks for {Path(path).name} and the vlm "
+                f"fallback failed, so whether the file is processable is unknown: "
+                f"{fallback_error}"
+            ) from fallback_exception
+        raise DoclingContentError(
             f"Docling returned zero chunks for {Path(path).name} with chunker={chunker} pipeline={final_pipeline}"
         )
 
@@ -761,8 +818,8 @@ def summarize_document(title, document_text):
         timeout=240,
     )
 
-    if not resp or resp.status_code != 200:
-        status = resp.status_code if resp else "no response"
+    if resp is None or resp.status_code != 200:
+        status = resp.status_code if resp is not None else "no response"
         raise RuntimeError(f"Local document summarization failed ({status})")
 
     # Same shape gate as the email body. An earlier revision skipped it here on
