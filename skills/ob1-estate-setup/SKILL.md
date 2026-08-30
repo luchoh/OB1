@@ -1,6 +1,6 @@
 ---
 name: ob1-estate-setup
-description: Initialize OR update the CURRENT repo's OB1 agent identity — scope this repo's agents to a per-repo OB1 principal by setting OB1_MCP_ACCESS_KEY in the repo's gitignored env. Re-runnable: detects prior setup and asks whether to migrate, rotate, reset, or leave it. Asks before changing anything.
+description: "Initialize OR update the CURRENT repo's OB1 agent identity — scope this repo's agents to a per-repo OB1 principal by setting OB1_MCP_ACCESS_KEY in the repo's gitignored env. Re-runnable: detects prior setup and asks whether to migrate, rotate, reset, or leave it. Asks before changing anything."
 disable-model-invocation: true
 ---
 
